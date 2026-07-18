@@ -1,0 +1,15 @@
+[package]
+name = "jdrgb"
+version = "0.1.0"
+edition = "2021"
+description = "Minimal one-shot static-color setter for the ASUS Aura USB LED controller (0B05:19AF)"
+
+[dependencies]
+hidapi = "2"
+
+[profile.release]
+opt-level = "z"     # optimize for size
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
