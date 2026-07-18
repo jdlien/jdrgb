@@ -67,9 +67,15 @@ try {
     $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
     $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
                     -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
-    $startup   = New-ScheduledTaskTrigger -AtStartup
 
-    # Try startup + resume-from-sleep; if that's rejected, fall back to startup only.
+    # Startup fires before login; logon is a belt-and-suspenders re-apply that
+    # survives a late controller reset. Both run as SYSTEM.
+    $base = @(
+        (New-ScheduledTaskTrigger -AtStartup),
+        (New-ScheduledTaskTrigger -AtLogOn)
+    )
+
+    # Try base + resume-from-sleep; if the wake trigger is rejected, fall back.
     $registered = $false
     if (-not $NoWake) {
         try {
@@ -77,22 +83,22 @@ try {
             $wake = New-CimInstance -CimClass $evtClass -ClientOnly
             $wake.Enabled = $true
             $wake.Subscription = '<QueryList><Query Id="0" Path="System"><Select Path="System">*[System[Provider[@Name=''Microsoft-Windows-Power-Troubleshooter''] and (EventID=1)]]</Select></Query></QueryList>'
-            Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($startup, $wake) `
+            Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger ($base + $wake) `
                 -Principal $principal -Settings $settings -Force `
                 -Description "Set ASUS Aura LEDs to a static color at boot (jdrgb)." | Out-Null
-            Write-Host "Registered task '$TaskName' with startup + resume-from-sleep triggers."
+            Write-Host "Registered task '$TaskName' with startup + logon + resume-from-sleep triggers."
             $registered = $true
         } catch {
             Write-Warning "Could not register the resume-from-sleep trigger: $($_.Exception.Message)"
-            Write-Warning "Falling back to startup-only."
+            Write-Warning "Falling back to startup + logon."
         }
     }
 
     if (-not $registered) {
-        Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $startup `
+        Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $base `
             -Principal $principal -Settings $settings -Force `
             -Description "Set ASUS Aura LEDs to a static color at boot (jdrgb)." | Out-Null
-        Write-Host "Registered task '$TaskName' with startup trigger."
+        Write-Host "Registered task '$TaskName' with startup + logon triggers."
     }
 
     # Run it once now.

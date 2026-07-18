@@ -135,10 +135,10 @@ fn parse(args: &[&str]) -> Result<Command, String> {
     }
 }
 
-/// Run `f`, retrying for ~20s when `wait` is set (the controller may not be
-/// enumerated yet at boot). Otherwise fail fast.
+/// Run `f`, retrying for ~60s when `wait` is set (the controller may not be
+/// enumerated yet at boot). Exits the instant it succeeds; otherwise fail fast.
 fn with_retry(wait: bool, mut f: impl FnMut() -> Result<(), String>) -> Result<(), String> {
-    let tries = if wait { 40 } else { 1 };
+    let tries = if wait { 120 } else { 1 };
     let mut last = String::new();
     for attempt in 0..tries {
         match f() {

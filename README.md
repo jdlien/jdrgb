@@ -72,10 +72,14 @@ program exits.
 
 ## Run at boot (no login required)
 
-`install.ps1` registers a Scheduled Task that runs at **system startup** as the
-`SYSTEM` account — so the color is set during boot, before anyone logs in. It
-copies the binary to `C:\Program Files\jdrgb` and uses `--wait` to tolerate the
+`install.ps1` registers a Scheduled Task that runs as the `SYSTEM` account — so
+the color is set during boot, before anyone logs in. It copies the binary to
+`C:\Program Files\jdrgb` and uses `--wait` (retry up to ~60s) to tolerate the
 USB controller not being enumerated yet.
+
+Triggers, for reliability: **at startup** (the pre-login goal), **at logon** (a
+belt-and-suspenders re-apply that survives a late controller reset), and **on
+resume from sleep**.
 
 ```powershell
 # from an elevated PowerShell (the script self-elevates if needed)
