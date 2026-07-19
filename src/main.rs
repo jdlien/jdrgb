@@ -394,8 +394,8 @@ fn hsv(h: f32) -> (u8, u8, u8) {
 // Interactive tuner
 // ---------------------------------------------------------------------------
 
-const HUE_STEP: f32 = 4.0; // degrees per keypress
-const SL_STEP: f32 = 0.02; // saturation/lightness per keypress (2%)
+const HUE_STEP: f32 = 1.0; // degrees per keypress (hold a key to ramp)
+const SL_STEP: f32 = 0.01; // saturation/lightness per keypress (1%)
 
 /// Dial in a color live on the strip with single keypresses, in HSL.
 fn tune(start: (u8, u8, u8)) -> Result<(), String> {
@@ -413,13 +413,14 @@ fn tune(start: (u8, u8, u8)) -> Result<(), String> {
     println!("  h/H hue -/+    s/S sat -/+    l/L light -/+    q quit");
     println!();
 
-    let _raw = RawMode::enable();
+    let raw = RawMode::enable();
+    let color = raw.color;
     let mut stdin = std::io::stdin();
     let mut key = [0u8; 1];
 
     let mut rgb = hsl_to_rgb(h, s, l);
     apply_solid(&dev, headers, MODE_STATIC, rgb, false)?; // live preview, no flash-save
-    draw_status(h, s, l, rgb);
+    draw_status(h, s, l, rgb, color);
 
     loop {
         if stdin.read(&mut key).unwrap_or(0) == 0 {
@@ -437,7 +438,7 @@ fn tune(start: (u8, u8, u8)) -> Result<(), String> {
         }
         rgb = hsl_to_rgb(h, s, l);
         apply_solid(&dev, headers, MODE_STATIC, rgb, false)?;
-        draw_status(h, s, l, rgb);
+        draw_status(h, s, l, rgb, color);
     }
 
     apply_solid(&dev, headers, MODE_STATIC, rgb, true)?; // commit the chosen color
@@ -447,46 +448,73 @@ fn tune(start: (u8, u8, u8)) -> Result<(), String> {
     Ok(())
 }
 
-fn draw_status(h: f32, s: f32, l: f32, (r, g, b): (u8, u8, u8)) {
-    print!(
-        "\r  H {h:5.1}  S {:3.0}%  L {:3.0}%   rgb({r:3},{g:3},{b:3})  #{r:02X}{g:02X}{b:02X}    ",
-        s * 100.0,
-        l * 100.0
-    );
+fn draw_status(h: f32, s: f32, l: f32, (r, g, b): (u8, u8, u8), color: bool) {
+    if color {
+        // truecolor swatch + color-matched hex
+        print!(
+            "\r  \x1b[48;2;{r};{g};{b}m       \x1b[0m  H {h:5.1}  S {:3.0}%  L {:3.0}%  rgb({r:3},{g:3},{b:3})  \x1b[1;38;2;{r};{g};{b}m#{r:02X}{g:02X}{b:02X}\x1b[0m    ",
+            s * 100.0,
+            l * 100.0
+        );
+    } else {
+        print!(
+            "\r  H {h:5.1}  S {:3.0}%  L {:3.0}%  rgb({r:3},{g:3},{b:3})  #{r:02X}{g:02X}{b:02X}    ",
+            s * 100.0,
+            l * 100.0
+        );
+    }
     let _ = std::io::stdout().flush();
 }
 
-/// RAII guard: put the console into raw (unbuffered, no-echo) mode and restore
-/// the previous mode on drop.
+/// RAII guard: put the console input into raw (unbuffered, no-echo) mode and
+/// enable ANSI/truecolor output, restoring both on drop. `color` reports
+/// whether ANSI output is available (false when piped / not a console).
 struct RawMode {
-    handle: windows_sys::Win32::Foundation::HANDLE,
-    prev: u32,
+    in_handle: windows_sys::Win32::Foundation::HANDLE,
+    in_prev: u32,
+    out_handle: windows_sys::Win32::Foundation::HANDLE,
+    out_prev: u32,
     active: bool,
+    color: bool,
 }
 
 impl RawMode {
     fn enable() -> Self {
         use windows_sys::Win32::System::Console::{
             GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
-            ENABLE_PROCESSED_INPUT, STD_INPUT_HANDLE,
+            ENABLE_PROCESSED_INPUT, ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_INPUT_HANDLE,
+            STD_OUTPUT_HANDLE,
         };
         unsafe {
-            let handle = GetStdHandle(STD_INPUT_HANDLE);
-            let mut prev = 0u32;
-            if GetConsoleMode(handle, &mut prev) != 0 {
-                SetConsoleMode(handle, prev & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT));
-                RawMode { handle, prev, active: true }
-            } else {
-                RawMode { handle, prev, active: false }
+            let in_handle = GetStdHandle(STD_INPUT_HANDLE);
+            let out_handle = GetStdHandle(STD_OUTPUT_HANDLE);
+            let (mut in_prev, mut out_prev) = (0u32, 0u32);
+
+            let active = GetConsoleMode(in_handle, &mut in_prev) != 0;
+            if active {
+                SetConsoleMode(in_handle, in_prev & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT));
             }
+
+            let color = GetConsoleMode(out_handle, &mut out_prev) != 0;
+            if color {
+                SetConsoleMode(out_handle, out_prev | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            }
+
+            RawMode { in_handle, in_prev, out_handle, out_prev, active, color }
         }
     }
 }
 
 impl Drop for RawMode {
     fn drop(&mut self) {
-        if self.active {
-            unsafe { windows_sys::Win32::System::Console::SetConsoleMode(self.handle, self.prev) };
+        use windows_sys::Win32::System::Console::SetConsoleMode;
+        unsafe {
+            if self.active {
+                SetConsoleMode(self.in_handle, self.in_prev);
+            }
+            if self.color {
+                SetConsoleMode(self.out_handle, self.out_prev);
+            }
         }
     }
 }
