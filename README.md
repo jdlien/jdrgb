@@ -38,6 +38,7 @@ jdrgb load [file]     per-LED colors from a config file (default leds.conf)
 jdrgb template [file] write a starter config, one line per LED
 jdrgb rainbow [n]     per-LED rainbow across n LEDs (default 38, white end-caps)
 jdrgb tune [color]    dial in a color live (preset/hex, or the last-set color)
+jdrgb preview         slideshow all presets (+/- speed, n next, q quit)
 jdrgb probe           show firmware + config table (diagnostics)
 jdrgb --version
 jdrgb --help

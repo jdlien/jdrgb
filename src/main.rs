@@ -79,6 +79,7 @@ enum Command {
     Load(String),            // per-LED colors from a config file
     Template(String),        // write a starter config file
     Tune((u8, u8, u8)),      // interactively dial in a color
+    Preview,                 // cycle through all presets
     Presets,                 // list keyword presets
     Probe,                   // diagnostics
     Help,
@@ -112,6 +113,7 @@ fn main() -> ExitCode {
             println!("jdrgb {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
+        Command::Preview => preview(),
         Command::Presets => list_presets(),
         Command::Probe => probe(),
         Command::Solid(mode, color) => with_retry(wait, || set_solid(mode, color)).map(|()| {
@@ -149,6 +151,7 @@ fn parse(args: &[&str]) -> Result<Command, String> {
         "-h" | "--help" | "help" => Ok(Command::Help),
         "-V" | "--version" => Ok(Command::Version),
         "probe" => Ok(Command::Probe),
+        "preview" => Ok(Command::Preview),
         "presets" | "colors" => Ok(Command::Presets),
         "off" => Ok(Command::Solid(MODE_OFF, (0, 0, 0))),
         "rainbow" => {
@@ -628,6 +631,130 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
 }
 
 // ---------------------------------------------------------------------------
+// Preview (slideshow of all presets)
+// ---------------------------------------------------------------------------
+
+fn preview() -> Result<(), String> {
+    let api = HidApi::new().map_err(|e| format!("hidapi init failed: {e}"))?;
+    let dev = open(&api)?;
+    let cfg = read_config(&dev).ok_or("could not read config table")?;
+    let headers = header_count(&cfg);
+    if headers == 0 {
+        return Err("config table reported no addressable headers".into());
+    }
+
+    let raw = RawMode::enable();
+    let pal = Palette::new(raw.color);
+    let (k, r) = (pal.key, pal.reset);
+    println!("jdrgb preview - cycling {} presets, live on the strip.", PRESETS.len());
+    println!("  {k}+{r} faster    {k}-{r} slower    {k}n{r} next    {k}q{r} quit");
+    println!();
+
+    let total = PRESETS.len();
+    let tick_ms = 50u64;
+    let mut dwell_ms = 4000u64;
+    let mut idx = 0usize;
+    let mut elapsed = 0u64;
+
+    // Live preview (no flash-save) while cycling.
+    apply_solid(&dev, headers, MODE_STATIC, PRESETS[idx].1, false)?;
+    draw_preview(idx, total, dwell_ms, &pal);
+
+    let mut quit = false;
+    while !quit {
+        let mut refresh = false;
+        while let Some(c) = poll_key(raw.in_handle) {
+            match c {
+                'q' | '\u{3}' => quit = true, // q or Ctrl+C
+                '+' | '=' => {
+                    dwell_ms = dwell_ms.saturating_sub(500).max(500);
+                    refresh = true;
+                }
+                '-' | '_' => {
+                    dwell_ms = (dwell_ms + 500).min(20_000);
+                    refresh = true;
+                }
+                'n' | ' ' => {
+                    idx = (idx + 1) % total;
+                    apply_solid(&dev, headers, MODE_STATIC, PRESETS[idx].1, false)?;
+                    elapsed = 0;
+                    refresh = true;
+                }
+                _ => {}
+            }
+        }
+        if quit {
+            break;
+        }
+        if refresh {
+            draw_preview(idx, total, dwell_ms, &pal);
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(tick_ms));
+        elapsed += tick_ms;
+        if elapsed >= dwell_ms {
+            idx = (idx + 1) % total;
+            apply_solid(&dev, headers, MODE_STATIC, PRESETS[idx].1, false)?;
+            elapsed = 0;
+            draw_preview(idx, total, dwell_ms, &pal);
+        }
+    }
+
+    // Keep whatever's showing when you quit: commit and remember it.
+    let (name, rgb) = PRESETS[idx];
+    apply_solid(&dev, headers, MODE_STATIC, rgb, true)?;
+    save_state(Some(rgb));
+    let (cr, cg, cb) = rgb;
+    println!();
+    println!("jdrgb: kept {name} {}#{cr:02X}{cg:02X}{cb:02X}{}", pal.value, pal.reset);
+    Ok(())
+}
+
+fn draw_preview(idx: usize, total: usize, dwell_ms: u64, pal: &Palette) {
+    let (name, (r, g, b)) = PRESETS[idx];
+    let swatch = if pal.enabled {
+        format!("[\x1b[48;2;{r};{g};{b}m     \x1b[0m]  ")
+    } else {
+        String::new()
+    };
+    let (lab, val, rst) = (pal.label, pal.value, pal.reset);
+    let secs = dwell_ms as f64 / 1000.0;
+    print!(
+        "\r  {swatch}{val}{name:<10}{rst} {lab}#{r:02X}{g:02X}{b:02X}{rst}   {lab}({}/{}){rst}   {lab}dwell{rst} {val}{secs:.1}s{rst}    ",
+        idx + 1,
+        total,
+    );
+    let _ = std::io::stdout().flush();
+}
+
+/// Non-blocking: return the next key-down character if one is queued, else None.
+fn poll_key(handle: windows_sys::Win32::Foundation::HANDLE) -> Option<char> {
+    use windows_sys::Win32::System::Console::{
+        GetNumberOfConsoleInputEvents, ReadConsoleInputW, INPUT_RECORD, KEY_EVENT,
+    };
+    unsafe {
+        let mut pending = 0u32;
+        if GetNumberOfConsoleInputEvents(handle, &mut pending) == 0 || pending == 0 {
+            return None;
+        }
+        for _ in 0..pending {
+            let mut rec: INPUT_RECORD = std::mem::zeroed();
+            let mut read = 0u32;
+            if ReadConsoleInputW(handle, &mut rec, 1, &mut read) == 0 || read == 0 {
+                break;
+            }
+            if rec.EventType == KEY_EVENT as u16 {
+                let ev = rec.Event.KeyEvent;
+                if ev.bKeyDown != 0 && ev.uChar.UnicodeChar != 0 {
+                    return char::from_u32(ev.uChar.UnicodeChar as u32);
+                }
+            }
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Diagnostics
 // ---------------------------------------------------------------------------
 
@@ -773,6 +900,7 @@ fn print_help() {
          \x20 jdrgb template [file] write a starter config, one line per LED\n\
          \x20 jdrgb rainbow [n]     per-LED rainbow across n LEDs (default {STRIP_LEDS})\n\
          \x20 jdrgb tune [color]    dial in a color live (from a preset/hex, or the last set)\n\
+         \x20 jdrgb preview         slideshow all presets (+/- speed, n next, q quit)\n\
          \x20 jdrgb probe           show firmware + config (diagnostics)\n\
          \x20 jdrgb --version       print version\n\
          \x20 jdrgb --help          this message\n\
