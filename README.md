@@ -56,8 +56,8 @@ Notably `white` (`#FFFFFF`) reads greenish here, so the default is `coolwhite`
 warm tone.
 
 ```
-coolwhite  warmwhite  white  red  orange  amber  yellow  lime
-green  seagreen  teal  cyan  azure  blue  indigo  purple  magenta  hotpink  pink
+coolwhite  warmwhite  white  red  orange  amber  yellow  chartreuse  lime
+green  seagreen  teal  cyan  azure  blue  indigo  purple  violet  magenta  hotpink  pink
 ```
 
 ### Per-LED config file
