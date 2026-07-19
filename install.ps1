@@ -6,7 +6,8 @@
   boot (and, if possible, on resume-from-sleep), setting the LEDs to a static
   color. Writes a log to install.log next to this script.
 .PARAMETER Color
-  Optional RRGGBB hex color to set at boot. Defaults to jdrgb's warm-white preset.
+  Optional color to set at boot: a preset name (e.g. warmwhite) or RRGGBB hex.
+  Defaults to jdrgb's built-in default color (coolwhite).
 .PARAMETER InstallDir
   Where to place the binary. Defaults to "C:\Program Files\jdrgb".
 .PARAMETER NoWake

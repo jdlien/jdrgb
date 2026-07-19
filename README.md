@@ -29,18 +29,34 @@ cargo build --release
 ## Usage
 
 ```
-jdrgb                 warm-white preset (#FA9536)
-jdrgb RRGGBB          solid color, e.g. jdrgb ffcf9e
+jdrgb                 default color, coolwhite (#FFB0D0)
+jdrgb NAME            a named preset, e.g. jdrgb red   (see: jdrgb presets)
+jdrgb RRGGBB          a hex color, e.g. jdrgb ffcf9e
 jdrgb off             turn the LEDs off
+jdrgb presets         list the named color presets
 jdrgb load [file]     per-LED colors from a config file (default leds.conf)
 jdrgb template [file] write a starter config, one line per LED
 jdrgb rainbow [n]     per-LED rainbow across n LEDs (default 38, white end-caps)
-jdrgb tune [hex]      interactively dial in a color (live), prints the hex
+jdrgb tune [color]    dial in a color live (preset/hex, or the last-set color)
 jdrgb probe           show firmware + config table (diagnostics)
 jdrgb --version
 jdrgb --help
 
-  --wait              retry ~20s until the controller is ready (used at boot)
+  --wait              retry ~60s until the controller is ready (used at boot)
+```
+
+### Color presets
+
+A color can be a case-insensitive keyword or an `RRGGBB` hex string. `jdrgb
+presets` prints them with swatches. They're only starting points — these LEDs
+render colors quite differently from nominal RGB, so tune any that look off.
+Notably `white` (`#FFFFFF`) reads greenish here, so the default is `coolwhite`
+(`#FFB0D0`), a by-eye-tuned clean white; `warmwhite` (`#FA9536`) is the original
+warm tone.
+
+```
+coolwhite  warmwhite  white  red  orange  amber  yellow  lime
+green  teal  cyan  blue  azure  purple  magenta  pink
 ```
 
 ### Per-LED config file
@@ -63,14 +79,16 @@ it's dialed in.
 
 ### Tuning a color
 
-`jdrgb tune [hex]` steps a color live on the strip in HSL — `h`/`s`/`l` nudge
-each channel down, `H`/`S`/`L` up. It shows the current HSL, RGB, and hex, and
-`q` quits keeping the color and printing its hex (drop that into a `jdrgb RRGGBB`
-or a config line). Live steps skip the flash-save; the final pick is committed.
+`jdrgb tune [color]` steps a color live on the strip in HSL — `h`/`s`/`l` nudge
+each channel down, `H`/`S`/`L` up (hold a key to ramp). It shows the current HSL,
+RGB, and hex in a compact status line (cyan keys, yellow labels, bold-white
+values, plus a live swatch), and `q` quits keeping the color and printing its
+hex. Live steps skip the flash-save; the final pick is committed. With no
+argument it starts from the last solid color set (remembered in a small state
+file under `%LOCALAPPDATA%\jdrgb`), or the default if the strip was left
+multi-colored by `rainbow`/`load`.
 
-The warm-white preset (`#FA9536`) is a hand-tuned shade that reads as a pleasant
-warm white on this strip. Change the default in `src/main.rs` (`DEFAULT_COLOR`)
-or just pass any hex color.
+To change the built-in default, edit `DEFAULT_COLOR` in `src/main.rs`.
 
 Solid colors are set via the controller's **static effect** mode, which the
 hardware latches *and saves* — the color holds with nothing running. The per-LED
@@ -91,8 +109,8 @@ resume from sleep**.
 
 ```powershell
 # from an elevated PowerShell (the script self-elevates if needed)
-.\install.ps1                      # boots to the warm-white preset
-.\install.ps1 -Color ffcf9e        # boot to a specific solid color
+.\install.ps1                      # boots to the default (coolwhite)
+.\install.ps1 -Color warmwhite     # boot to a preset name (or an RRGGBB hex)
 .\install.ps1 -Config leds.conf    # boot to a saved per-LED pattern
 ```
 

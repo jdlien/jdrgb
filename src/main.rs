@@ -41,8 +41,31 @@ const MODE_DIRECT: u8 = 0xFF;
 
 const LEDS_PER_PACKET: usize = 20; // 20 * 3 bytes = 60, fits one report
 
-/// Warm white — the shade jdlien dialed in as pleasant on this strip.
-const DEFAULT_COLOR: (u8, u8, u8) = (0xFA, 0x95, 0x36);
+/// Default: `coolwhite`, hand-tuned by eye so the strip renders a clean white.
+/// (Nominal #FFFFFF reads greenish on this strip; this tuned value looks pink on
+/// a screen but renders as a proper cool white, so it's the default.)
+const DEFAULT_COLOR: (u8, u8, u8) = (0xFF, 0xB0, 0xD0);
+
+/// Case-insensitive keyword colors. Sensible starting points only — LEDs render
+/// colors quite differently from nominal RGB, so tune any that look off by eye.
+const PRESETS: &[(&str, (u8, u8, u8))] = &[
+    ("coolwhite", (0xFF, 0xB0, 0xD0)), // hand-tuned clean white; the default
+    ("warmwhite", (0xFA, 0x95, 0x36)), // the original warm white
+    ("white", (0xFF, 0xFF, 0xFF)),     // nominal white (reads greenish here)
+    ("red", (0xFF, 0x00, 0x00)),
+    ("orange", (0xFF, 0x60, 0x00)),
+    ("amber", (0xFF, 0xA0, 0x00)),
+    ("yellow", (0xFF, 0xD0, 0x00)),
+    ("lime", (0x80, 0xFF, 0x00)),
+    ("green", (0x00, 0xFF, 0x00)),
+    ("teal", (0x00, 0xFF, 0x80)),
+    ("cyan", (0x00, 0xFF, 0xFF)),
+    ("blue", (0x00, 0x00, 0xFF)),
+    ("azure", (0x00, 0x80, 0xFF)),
+    ("purple", (0x80, 0x00, 0xFF)),
+    ("magenta", (0xFF, 0x00, 0xFF)),
+    ("pink", (0xFF, 0x00, 0x80)),
+];
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -54,6 +77,7 @@ enum Command {
     Load(String),            // per-LED colors from a config file
     Template(String),        // write a starter config file
     Tune((u8, u8, u8)),      // interactively dial in a color
+    Presets,                 // list keyword presets
     Probe,                   // diagnostics
     Help,
     Version,
@@ -86,6 +110,7 @@ fn main() -> ExitCode {
             println!("jdrgb {}", env!("CARGO_PKG_VERSION"));
             return ExitCode::SUCCESS;
         }
+        Command::Presets => list_presets(),
         Command::Probe => probe(),
         Command::Solid(mode, color) => with_retry(wait, || set_solid(mode, color)).map(|()| {
             if mode == MODE_OFF {
@@ -122,6 +147,7 @@ fn parse(args: &[&str]) -> Result<Command, String> {
         "-h" | "--help" | "help" => Ok(Command::Help),
         "-V" | "--version" => Ok(Command::Version),
         "probe" => Ok(Command::Probe),
+        "presets" | "colors" => Ok(Command::Presets),
         "off" => Ok(Command::Solid(MODE_OFF, (0, 0, 0))),
         "rainbow" => {
             let n = match args.get(1) {
@@ -134,14 +160,16 @@ fn parse(args: &[&str]) -> Result<Command, String> {
         "template" => Ok(Command::Template(args.get(1).copied().unwrap_or("leds.conf").to_string())),
         "tune" => {
             let start = match args.get(1) {
-                Some(s) => parse_hex(s).ok_or_else(|| format!("'{s}' is not a color (RRGGBB)"))?,
-                None => DEFAULT_COLOR,
+                Some(s) => parse_color(s).ok_or_else(|| format!("'{s}' is not a color or preset"))?,
+                // No arg: start from the last solid color we set, else the
+                // default (also the fallback when the strip is multi-colored).
+                None => load_last().unwrap_or(DEFAULT_COLOR),
             };
             Ok(Command::Tune(start))
         }
-        other => parse_hex(other)
+        other => parse_color(other)
             .map(|c| Command::Solid(MODE_STATIC, c))
-            .ok_or_else(|| format!("'{other}' is not a color (RRGGBB), 'off', 'rainbow', or 'probe'")),
+            .ok_or_else(|| format!("'{other}' is not a color, preset, or command (try `jdrgb --help`)")),
     }
 }
 
@@ -243,7 +271,9 @@ fn set_solid(mode: u8, color: (u8, u8, u8)) -> Result<(), String> {
     if headers == 0 {
         return Err("config table reported no addressable headers".into());
     }
-    apply_solid(&dev, headers, mode, color, true)
+    apply_solid(&dev, headers, mode, color, true)?;
+    save_state(Some(color));
+    Ok(())
 }
 
 /// Set every header to one color. Each header is one effect "channel" of a
@@ -324,6 +354,7 @@ fn set_rainbow(count: usize) -> Result<(), String> {
     for ch in 0..header_count(&cfg) {
         send_direct(&dev, ch, &colors)?;
     }
+    save_state(None); // strip is now multi-colored
     Ok(())
 }
 
@@ -341,6 +372,7 @@ fn set_from_config(path: &str) -> Result<(), String> {
     for ch in 0..header_count(&cfg) {
         send_direct(&dev, ch, &colors)?;
     }
+    save_state(None); // strip is now multi-colored
     Ok(())
 }
 
@@ -445,6 +477,7 @@ fn tune(start: (u8, u8, u8)) -> Result<(), String> {
     }
 
     apply_solid(&dev, headers, MODE_STATIC, rgb, true)?; // commit the chosen color
+    save_state(Some(rgb));
     let (cr, cg, cb) = rgb;
     println!();
     println!("jdrgb: kept {}#{cr:02X}{cg:02X}{cb:02X}{}", pal.value, pal.reset);
@@ -656,25 +689,94 @@ fn parse_hex(s: &str) -> Option<(u8, u8, u8)> {
     ))
 }
 
+/// Resolve a color from a case-insensitive preset name or an RRGGBB hex string.
+fn parse_color(s: &str) -> Option<(u8, u8, u8)> {
+    let lower = s.to_ascii_lowercase();
+    PRESETS
+        .iter()
+        .find(|(name, _)| *name == lower)
+        .map(|&(_, rgb)| rgb)
+        .or_else(|| parse_hex(s))
+}
+
+/// Path to the "last color" state file in the user's local app data.
+fn state_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|p| std::path::PathBuf::from(p).join("jdrgb").join("last"))
+}
+
+/// Remember the last solid color set, or `None` to mark the strip multi-colored
+/// (so `tune` falls back to the default). Best-effort; failures are ignored.
+fn save_state(color: Option<(u8, u8, u8)>) {
+    if let Some(path) = state_path() {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let content = match color {
+            Some((r, g, b)) => format!("{r:02X}{g:02X}{b:02X}"),
+            None => "multi".to_string(),
+        };
+        let _ = std::fs::write(path, content);
+    }
+}
+
+/// The last solid color we set, if the strip isn't multi-colored.
+fn load_last() -> Option<(u8, u8, u8)> {
+    parse_hex(std::fs::read_to_string(state_path()?).ok()?.trim())
+}
+
+/// Print the keyword presets, with a swatch when the terminal supports color.
+fn list_presets() -> Result<(), String> {
+    let color = enable_ansi_output();
+    println!("Presets (case-insensitive) - tune any that render off by eye:");
+    for &(name, (r, g, b)) in PRESETS {
+        if color {
+            println!("  [\x1b[48;2;{r};{g};{b}m    \x1b[0m]  \x1b[1;97m{name:<10}\x1b[0m \x1b[33m#{r:02X}{g:02X}{b:02X}\x1b[0m");
+        } else {
+            println!("  {name:<10} #{r:02X}{g:02X}{b:02X}");
+        }
+    }
+    Ok(())
+}
+
+/// Enable ANSI/VT output on the console; returns whether color is available.
+fn enable_ansi_output() -> bool {
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        STD_OUTPUT_HANDLE,
+    };
+    unsafe {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        let mut mode = 0u32;
+        if GetConsoleMode(h, &mut mode) != 0 {
+            SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 fn print_help() {
     let (r, g, b) = DEFAULT_COLOR;
     println!(
         "jdrgb {ver} — set the ASUS Aura LEDs, then exit.\n\
          \n\
          USAGE:\n\
-         \x20 jdrgb                 warm-white preset (#{r:02X}{g:02X}{b:02X})\n\
-         \x20 jdrgb RRGGBB          solid color, e.g. jdrgb ffcf9e\n\
+         \x20 jdrgb                 default color, coolwhite (#{r:02X}{g:02X}{b:02X})\n\
+         \x20 jdrgb NAME            a named preset, e.g. jdrgb red  (`jdrgb presets` lists them)\n\
+         \x20 jdrgb RRGGBB          a hex color, e.g. jdrgb ffcf9e\n\
          \x20 jdrgb off             turn the LEDs off\n\
+         \x20 jdrgb presets         list the named color presets\n\
          \x20 jdrgb load [file]     per-LED colors from a config file (default leds.conf)\n\
          \x20 jdrgb template [file] write a starter config, one line per LED\n\
          \x20 jdrgb rainbow [n]     per-LED rainbow across n LEDs (default {STRIP_LEDS})\n\
-         \x20 jdrgb tune [hex]      interactively dial in a color (live), prints the hex\n\
+         \x20 jdrgb tune [color]    dial in a color live (from a preset/hex, or the last set)\n\
          \x20 jdrgb probe           show firmware + config (diagnostics)\n\
          \x20 jdrgb --version       print version\n\
          \x20 jdrgb --help          this message\n\
          \n\
          FLAGS:\n\
-         \x20 --wait                retry ~20s until the controller is ready (use at boot)\n",
+         \x20 --wait                retry ~60s until the controller is ready (use at boot)\n",
         ver = env!("CARGO_PKG_VERSION"),
     );
 }
