@@ -647,7 +647,7 @@ fn preview() -> Result<(), String> {
     let pal = Palette::new(raw.color);
     let (k, r) = (pal.key, pal.reset);
     println!("jdrgb preview - cycling {} presets, live on the strip.", PRESETS.len());
-    println!("  {k}+{r} faster    {k}-{r} slower    {k}n{r} next    {k}q{r} quit");
+    println!("  {k}+{r} faster    {k}-{r} slower    {k}n{r}/{k}N{r} next/prev    {k}s{r} stop    {k}q{r} quit");
     println!();
 
     let total = PRESETS.len();
@@ -655,10 +655,11 @@ fn preview() -> Result<(), String> {
     let mut dwell_ms = 4000u64;
     let mut idx = 0usize;
     let mut elapsed = 0u64;
+    let mut paused = false;
 
     // Live preview (no flash-save) while cycling.
     apply_solid(&dev, headers, MODE_STATIC, PRESETS[idx].1, false)?;
-    draw_preview(idx, total, dwell_ms, &pal);
+    draw_preview(idx, total, dwell_ms, paused, &pal);
 
     let mut quit = false;
     while !quit {
@@ -666,6 +667,10 @@ fn preview() -> Result<(), String> {
         while let Some(c) = poll_key(raw.in_handle) {
             match c {
                 'q' | '\u{3}' => quit = true, // q or Ctrl+C
+                's' | 'S' => {
+                    paused = !paused;
+                    refresh = true;
+                }
                 '+' | '=' => {
                     dwell_ms = dwell_ms.saturating_sub(500).max(500);
                     refresh = true;
@@ -680,6 +685,12 @@ fn preview() -> Result<(), String> {
                     elapsed = 0;
                     refresh = true;
                 }
+                'N' => {
+                    idx = (idx + total - 1) % total;
+                    apply_solid(&dev, headers, MODE_STATIC, PRESETS[idx].1, false)?;
+                    elapsed = 0;
+                    refresh = true;
+                }
                 _ => {}
             }
         }
@@ -687,16 +698,18 @@ fn preview() -> Result<(), String> {
             break;
         }
         if refresh {
-            draw_preview(idx, total, dwell_ms, &pal);
+            draw_preview(idx, total, dwell_ms, paused, &pal);
         }
 
         std::thread::sleep(std::time::Duration::from_millis(tick_ms));
-        elapsed += tick_ms;
-        if elapsed >= dwell_ms {
-            idx = (idx + 1) % total;
-            apply_solid(&dev, headers, MODE_STATIC, PRESETS[idx].1, false)?;
-            elapsed = 0;
-            draw_preview(idx, total, dwell_ms, &pal);
+        if !paused {
+            elapsed += tick_ms;
+            if elapsed >= dwell_ms {
+                idx = (idx + 1) % total;
+                apply_solid(&dev, headers, MODE_STATIC, PRESETS[idx].1, false)?;
+                elapsed = 0;
+                draw_preview(idx, total, dwell_ms, paused, &pal);
+            }
         }
     }
 
@@ -710,7 +723,7 @@ fn preview() -> Result<(), String> {
     Ok(())
 }
 
-fn draw_preview(idx: usize, total: usize, dwell_ms: u64, pal: &Palette) {
+fn draw_preview(idx: usize, total: usize, dwell_ms: u64, paused: bool, pal: &Palette) {
     let (name, (r, g, b)) = PRESETS[idx];
     let swatch = if pal.enabled {
         format!("[\x1b[48;2;{r};{g};{b}m     \x1b[0m]  ")
@@ -719,8 +732,14 @@ fn draw_preview(idx: usize, total: usize, dwell_ms: u64, pal: &Palette) {
     };
     let (lab, val, rst) = (pal.label, pal.value, pal.reset);
     let secs = dwell_ms as f64 / 1000.0;
+    // Fixed width ("  [paused]" vs 10 spaces) so the line never leaves residue.
+    let state = if paused {
+        format!("  {}[paused]{rst}", pal.key)
+    } else {
+        "          ".to_string()
+    };
     print!(
-        "\r  {swatch}{val}{name:<10}{rst} {lab}#{r:02X}{g:02X}{b:02X}{rst}   {lab}({}/{}){rst}   {lab}dwell{rst} {val}{secs:.1}s{rst}    ",
+        "\r  {swatch}{val}{name:<10}{rst} {lab}#{r:02X}{g:02X}{b:02X}{rst}   {lab}({}/{}){rst}   {lab}dwell{rst} {val}{secs:.1}s{rst}{state}    ",
         idx + 1,
         total,
     );
@@ -900,7 +919,7 @@ fn print_help() {
          \x20 jdrgb template [file] write a starter config, one line per LED\n\
          \x20 jdrgb rainbow [n]     per-LED rainbow across n LEDs (default {STRIP_LEDS})\n\
          \x20 jdrgb tune [color]    dial in a color live (from a preset/hex, or the last set)\n\
-         \x20 jdrgb preview         slideshow all presets (+/- speed, n next, q quit)\n\
+         \x20 jdrgb preview         slideshow all presets (+/- speed, n/N next/prev, s stop)\n\
          \x20 jdrgb probe           show firmware + config (diagnostics)\n\
          \x20 jdrgb --version       print version\n\
          \x20 jdrgb --help          this message\n\
