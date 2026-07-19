@@ -409,18 +409,21 @@ fn tune(start: (u8, u8, u8)) -> Result<(), String> {
 
     let (mut h, mut s, mut l) = rgb_to_hsl(start);
 
+    // Enable the console (and ANSI) before printing so the colored intro renders.
+    let raw = RawMode::enable();
+    let pal = Palette::new(raw.color);
+    let (k, r) = (pal.key, pal.reset);
+
     println!("jdrgb tune - dial in a color, live on the strip.");
-    println!("  h/H hue -/+    s/S sat -/+    l/L light -/+    q quit");
+    println!("  {k}h/H{r} hue    {k}s/S{r} sat    {k}l/L{r} light    {k}q{r} quit");
     println!();
 
-    let raw = RawMode::enable();
-    let color = raw.color;
     let mut stdin = std::io::stdin();
     let mut key = [0u8; 1];
 
     let mut rgb = hsl_to_rgb(h, s, l);
     apply_solid(&dev, headers, MODE_STATIC, rgb, false)?; // live preview, no flash-save
-    draw_status(h, s, l, rgb, color);
+    draw_status(h, s, l, rgb, &pal);
 
     loop {
         if stdin.read(&mut key).unwrap_or(0) == 0 {
@@ -438,31 +441,59 @@ fn tune(start: (u8, u8, u8)) -> Result<(), String> {
         }
         rgb = hsl_to_rgb(h, s, l);
         apply_solid(&dev, headers, MODE_STATIC, rgb, false)?;
-        draw_status(h, s, l, rgb, color);
+        draw_status(h, s, l, rgb, &pal);
     }
 
     apply_solid(&dev, headers, MODE_STATIC, rgb, true)?; // commit the chosen color
-    let (r, g, b) = rgb;
+    let (cr, cg, cb) = rgb;
     println!();
-    println!("jdrgb: kept #{r:02X}{g:02X}{b:02X}");
+    println!("jdrgb: kept {}#{cr:02X}{cg:02X}{cb:02X}{}", pal.value, pal.reset);
     Ok(())
 }
 
-fn draw_status(h: f32, s: f32, l: f32, (r, g, b): (u8, u8, u8), color: bool) {
-    if color {
-        // truecolor swatch + color-matched hex
-        print!(
-            "\r  \x1b[48;2;{r};{g};{b}m       \x1b[0m  H {h:5.1}  S {:3.0}%  L {:3.0}%  rgb({r:3},{g:3},{b:3})  \x1b[1;38;2;{r};{g};{b}m#{r:02X}{g:02X}{b:02X}\x1b[0m    ",
-            s * 100.0,
-            l * 100.0
-        );
-    } else {
-        print!(
-            "\r  H {h:5.1}  S {:3.0}%  L {:3.0}%  rgb({r:3},{g:3},{b:3})  #{r:02X}{g:02X}{b:02X}    ",
-            s * 100.0,
-            l * 100.0
-        );
+/// Terminal color codes, or empty strings when output isn't a console.
+/// Convention (à la well-behaved CLIs): cyan hotkeys, yellow labels,
+/// bold-white values.
+struct Palette {
+    enabled: bool,
+    reset: &'static str,
+    value: &'static str,
+    label: &'static str,
+    key: &'static str,
+}
+
+impl Palette {
+    fn new(color: bool) -> Self {
+        if color {
+            Palette {
+                enabled: true,
+                reset: "\x1b[0m",
+                value: "\x1b[1;97m", // bold bright white
+                label: "\x1b[33m",   // yellow
+                key: "\x1b[36m",     // cyan
+            }
+        } else {
+            Palette { enabled: false, reset: "", value: "", label: "", key: "" }
+        }
     }
+}
+
+fn draw_status(h: f32, s: f32, l: f32, (r, g, b): (u8, u8, u8), pal: &Palette) {
+    // Bracket-framed swatch: the frame keeps its extent visible even for a
+    // near-black color on a dark terminal, so it never blends into nothing.
+    let swatch = if pal.enabled {
+        format!("[\x1b[48;2;{r};{g};{b}m     \x1b[0m]  ")
+    } else {
+        String::new()
+    };
+    let (lab, val, rst) = (pal.label, pal.value, pal.reset);
+    print!(
+        "\r  {swatch}{lab}H{rst} {val}{h:5.1}{rst}   {lab}S{rst} {val}{:3.0}%{rst}   \
+         {lab}L{rst} {val}{:3.0}%{rst}   {lab}rgb{rst} {val}({r:3},{g:3},{b:3}){rst}   \
+         {val}#{r:02X}{g:02X}{b:02X}{rst}    ",
+        s * 100.0,
+        l * 100.0,
+    );
     let _ = std::io::stdout().flush();
 }
 
