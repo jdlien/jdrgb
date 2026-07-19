@@ -65,7 +65,8 @@ const PRESETS: &[(&str, (u8, u8, u8))] = &[
     ("azure", (0x00, 0x80, 0xFF)),
     ("purple", (0x80, 0x00, 0xFF)),
     ("magenta", (0xFF, 0x00, 0xFF)),
-    ("pink", (0xFF, 0x00, 0x80)),
+    ("hotpink", (0xFF, 0x00, 0x80)), // intense synthwave/Barbie pink
+    ("pink", (0xD5, 0x2A, 0x66)),    // softer, "pretty in pink"
 ];
 
 // ---------------------------------------------------------------------------
