@@ -6,6 +6,7 @@ description = "Minimal one-shot static-color setter for the ASUS Aura USB LED co
 
 [dependencies]
 hidapi = "2"
+windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_Foundation"] }
 
 [profile.release]
 opt-level = "z"     # optimize for size

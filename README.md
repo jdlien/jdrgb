@@ -35,6 +35,7 @@ jdrgb off             turn the LEDs off
 jdrgb load [file]     per-LED colors from a config file (default leds.conf)
 jdrgb template [file] write a starter config, one line per LED
 jdrgb rainbow [n]     per-LED rainbow across n LEDs (default 38, white end-caps)
+jdrgb tune [hex]      interactively dial in a color (live), prints the hex
 jdrgb probe           show firmware + config table (diagnostics)
 jdrgb --version
 jdrgb --help
@@ -59,6 +60,13 @@ FA9536   # LED 1
 Generate a starter file pre-filled with the preset (`jdrgb template leds.conf`),
 edit it, and preview with `jdrgb load leds.conf` — re-run after each edit until
 it's dialed in.
+
+### Tuning a color
+
+`jdrgb tune [hex]` steps a color live on the strip in HSL — `h`/`s`/`l` nudge
+each channel down, `H`/`S`/`L` up. It shows the current HSL, RGB, and hex, and
+`q` quits keeping the color and printing its hex (drop that into a `jdrgb RRGGBB`
+or a config line). Live steps skip the flash-save; the final pick is committed.
 
 The warm-white preset (`#FA9536`) is a hand-tuned shade that reads as a pleasant
 warm white on this strip. Change the default in `src/main.rs` (`DEFAULT_COLOR`)

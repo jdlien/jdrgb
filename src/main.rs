@@ -13,6 +13,7 @@
 //! Protocol ported from OpenRGB's AuraMainboardController (GPL-2.0-or-later) and
 //! cross-checked against liquidctl's aura_led.py. See README for lineage.
 
+use std::io::{Read, Write};
 use std::process::ExitCode;
 
 use hidapi::{DeviceInfo, HidApi, HidDevice};
@@ -52,6 +53,7 @@ enum Command {
     Rainbow(usize),          // per-LED demo across N LEDs
     Load(String),            // per-LED colors from a config file
     Template(String),        // write a starter config file
+    Tune((u8, u8, u8)),      // interactively dial in a color
     Probe,                   // diagnostics
     Help,
     Version,
@@ -102,6 +104,7 @@ fn main() -> ExitCode {
         Command::Template(path) => write_template(&path).map(|()| {
             println!("jdrgb: wrote {path} ({STRIP_LEDS} LEDs) — edit it, then `jdrgb load {path}`");
         }),
+        Command::Tune(start) => tune(start),
     };
 
     match result {
@@ -129,6 +132,13 @@ fn parse(args: &[&str]) -> Result<Command, String> {
         }
         "load" => Ok(Command::Load(args.get(1).copied().unwrap_or("leds.conf").to_string())),
         "template" => Ok(Command::Template(args.get(1).copied().unwrap_or("leds.conf").to_string())),
+        "tune" => {
+            let start = match args.get(1) {
+                Some(s) => parse_hex(s).ok_or_else(|| format!("'{s}' is not a color (RRGGBB)"))?,
+                None => DEFAULT_COLOR,
+            };
+            Ok(Command::Tune(start))
+        }
         other => parse_hex(other)
             .map(|c| Command::Solid(MODE_STATIC, c))
             .ok_or_else(|| format!("'{other}' is not a color (RRGGBB), 'off', 'rainbow', or 'probe'")),
@@ -233,18 +243,24 @@ fn set_solid(mode: u8, color: (u8, u8, u8)) -> Result<(), String> {
     if headers == 0 {
         return Err("config table reported no addressable headers".into());
     }
+    apply_solid(&dev, headers, mode, color, true)
+}
 
-    // Select Gen1 protocol, then set every header to the color and commit so the
-    // controller saves it. Each header is one effect "channel" of one LED-slot;
-    // the hardware fills the whole strip with the color.
-    write(&dev, &[CMD, 0x52, 0x53, 0x00, 0x01])?;
-    let (r, g, b) = color;
+/// Set every header to one color. Each header is one effect "channel" of a
+/// single LED-slot; the hardware fills the whole strip. With `commit`, the
+/// controller saves it (survives with nothing running); without, it's a live
+/// preview only — handy for rapid updates without hammering the flash.
+fn apply_solid(dev: &HidDevice, headers: u8, mode: u8, (r, g, b): (u8, u8, u8), commit: bool) -> Result<(), String> {
+    write(dev, &[CMD, 0x52, 0x53, 0x00, 0x01])?; // select Gen1 protocol
     for ch in 0..headers {
-        write(&dev, &[CMD, CTRL_EFFECT, ch, 0x00, 0x00, mode])?; // select channel + mode
+        write(dev, &[CMD, CTRL_EFFECT, ch, 0x00, 0x00, mode])?; // select channel + mode
         let mask = 1u16 << ch; // one LED-slot per header, at position `ch`
-        write(&dev, &[CMD, CTRL_EFFECT_COLOR, (mask >> 8) as u8, (mask & 0xFF) as u8, 0x00, r, g, b])?;
+        write(dev, &[CMD, CTRL_EFFECT_COLOR, (mask >> 8) as u8, (mask & 0xFF) as u8, 0x00, r, g, b])?;
     }
-    write(&dev, &[CMD, CTRL_COMMIT, 0x55]) // latch + save
+    if commit {
+        write(dev, &[CMD, CTRL_COMMIT, 0x55])?; // latch + save
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -375,6 +391,149 @@ fn hsv(h: f32) -> (u8, u8, u8) {
 }
 
 // ---------------------------------------------------------------------------
+// Interactive tuner
+// ---------------------------------------------------------------------------
+
+const HUE_STEP: f32 = 4.0; // degrees per keypress
+const SL_STEP: f32 = 0.02; // saturation/lightness per keypress (2%)
+
+/// Dial in a color live on the strip with single keypresses, in HSL.
+fn tune(start: (u8, u8, u8)) -> Result<(), String> {
+    let api = HidApi::new().map_err(|e| format!("hidapi init failed: {e}"))?;
+    let dev = open(&api)?;
+    let cfg = read_config(&dev).ok_or("could not read config table")?;
+    let headers = header_count(&cfg);
+    if headers == 0 {
+        return Err("config table reported no addressable headers".into());
+    }
+
+    let (mut h, mut s, mut l) = rgb_to_hsl(start);
+
+    println!("jdrgb tune - dial in a color, live on the strip.");
+    println!("  h/H hue -/+    s/S sat -/+    l/L light -/+    q quit");
+    println!();
+
+    let _raw = RawMode::enable();
+    let mut stdin = std::io::stdin();
+    let mut key = [0u8; 1];
+
+    let mut rgb = hsl_to_rgb(h, s, l);
+    apply_solid(&dev, headers, MODE_STATIC, rgb, false)?; // live preview, no flash-save
+    draw_status(h, s, l, rgb);
+
+    loop {
+        if stdin.read(&mut key).unwrap_or(0) == 0 {
+            break; // EOF
+        }
+        match key[0] {
+            b'q' | 3 => break, // q or Ctrl+C
+            b'h' => h = (h - HUE_STEP).rem_euclid(360.0),
+            b'H' => h = (h + HUE_STEP).rem_euclid(360.0),
+            b's' => s = (s - SL_STEP).max(0.0),
+            b'S' => s = (s + SL_STEP).min(1.0),
+            b'l' => l = (l - SL_STEP).max(0.0),
+            b'L' => l = (l + SL_STEP).min(1.0),
+            _ => continue,
+        }
+        rgb = hsl_to_rgb(h, s, l);
+        apply_solid(&dev, headers, MODE_STATIC, rgb, false)?;
+        draw_status(h, s, l, rgb);
+    }
+
+    apply_solid(&dev, headers, MODE_STATIC, rgb, true)?; // commit the chosen color
+    let (r, g, b) = rgb;
+    println!();
+    println!("jdrgb: kept #{r:02X}{g:02X}{b:02X}");
+    Ok(())
+}
+
+fn draw_status(h: f32, s: f32, l: f32, (r, g, b): (u8, u8, u8)) {
+    print!(
+        "\r  H {h:5.1}  S {:3.0}%  L {:3.0}%   rgb({r:3},{g:3},{b:3})  #{r:02X}{g:02X}{b:02X}    ",
+        s * 100.0,
+        l * 100.0
+    );
+    let _ = std::io::stdout().flush();
+}
+
+/// RAII guard: put the console into raw (unbuffered, no-echo) mode and restore
+/// the previous mode on drop.
+struct RawMode {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    prev: u32,
+    active: bool,
+}
+
+impl RawMode {
+    fn enable() -> Self {
+        use windows_sys::Win32::System::Console::{
+            GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT, ENABLE_LINE_INPUT,
+            ENABLE_PROCESSED_INPUT, STD_INPUT_HANDLE,
+        };
+        unsafe {
+            let handle = GetStdHandle(STD_INPUT_HANDLE);
+            let mut prev = 0u32;
+            if GetConsoleMode(handle, &mut prev) != 0 {
+                SetConsoleMode(handle, prev & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT));
+                RawMode { handle, prev, active: true }
+            } else {
+                RawMode { handle, prev, active: false }
+            }
+        }
+    }
+}
+
+impl Drop for RawMode {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe { windows_sys::Win32::System::Console::SetConsoleMode(self.handle, self.prev) };
+        }
+    }
+}
+
+/// RGB to HSL (h in degrees 0..360, s/l in 0..1).
+fn rgb_to_hsl((r, g, b): (u8, u8, u8)) -> (f32, f32, f32) {
+    let (rf, gf, bf) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+    let max = rf.max(gf).max(bf);
+    let min = rf.min(gf).min(bf);
+    let l = (max + min) / 2.0;
+    let d = max - min;
+    if d.abs() < f32::EPSILON {
+        return (0.0, 0.0, l); // gray
+    }
+    let s = d / (1.0 - (2.0 * l - 1.0).abs());
+    let h = if max == rf {
+        60.0 * ((gf - bf) / d).rem_euclid(6.0)
+    } else if max == gf {
+        60.0 * ((bf - rf) / d + 2.0)
+    } else {
+        60.0 * ((rf - gf) / d + 4.0)
+    };
+    (h.rem_euclid(360.0), s, l)
+}
+
+/// HSL (h in degrees, s/l in 0..1) to RGB.
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
+    let hp = h.rem_euclid(360.0) / 60.0;
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let (r1, g1, b1) = match hp as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    (
+        ((r1 + m) * 255.0).round() as u8,
+        ((g1 + m) * 255.0).round() as u8,
+        ((b1 + m) * 255.0).round() as u8,
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Diagnostics
 // ---------------------------------------------------------------------------
 
@@ -450,6 +609,7 @@ fn print_help() {
          \x20 jdrgb load [file]     per-LED colors from a config file (default leds.conf)\n\
          \x20 jdrgb template [file] write a starter config, one line per LED\n\
          \x20 jdrgb rainbow [n]     per-LED rainbow across n LEDs (default {STRIP_LEDS})\n\
+         \x20 jdrgb tune [hex]      interactively dial in a color (live), prints the hex\n\
          \x20 jdrgb probe           show firmware + config (diagnostics)\n\
          \x20 jdrgb --version       print version\n\
          \x20 jdrgb --help          this message\n\

@@ -42,6 +42,7 @@ name = "jdrgb"
 version = "0.1.0"
 dependencies = [
  "hidapi",
+ "windows-sys",
 ]
 
 [[package]]
