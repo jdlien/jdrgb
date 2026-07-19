@@ -57,7 +57,7 @@ warm tone.
 
 ```
 coolwhite  warmwhite  white  red  orange  amber  yellow  chartreuse  lime
-green  seagreen  teal  cyan  azure  blue  indigo  purple  violet  magenta  hotpink  pink
+green  seagreen  teal  cyan  azure  cobalt  blue  indigo  purple  violet  magenta  hotpink  pink
 ```
 
 ### Per-LED config file
