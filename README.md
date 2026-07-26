@@ -85,19 +85,32 @@ green  seagreen  teal  cyan  azure  cobalt  blue  indigo  purple  violet  magent
 The GPU renders colors quite differently from the strip — the same nominal value
 can look nothing alike on the two.
 
-Roughly: red comes out about true, green runs hot, and blue runs *very* hot —
-nominal `#FFFFFF` reads as sky blue, close to `azure`. Tuning usually means
-holding red and pulling green and blue down, blue much further.
+There's no single correction rule — the fix goes in **both directions** depending
+on where you are on the color wheel:
 
-| preset | strip | GPU |
-|---|---|---|
-| `coolwhite` | `#FFB0D0` | `#C79E38` |
-| `warmwhite` | `#FA9536` | `#FF8512` |
-| `yellow` | `#FFD000` | `#FF8C00` |
+| preset | strip | GPU | what moved |
+|---|---|---|---|
+| `coolwhite` | `#FFB0D0` | `#C79E38` | blue down hard |
+| `warmwhite` | `#FA9536` | `#FF8512` | green + blue down |
+| `orange` | `#FF3A00` | `#FF2000` | green down |
+| `amber` | `#FF8700` | `#FF5400` | green down |
+| `yellow` | `#FFD000` | `#FF8C00` | green down |
+| `chartreuse` | `#D4FF00` | `#FFC000` | red **up** |
+| `lime` | `#80FF00` | `#DEFF00` | red **up** a lot |
+| `seagreen` | `#00FF51` | `#00FF15` | blue down |
+| `teal` | `#00FF80` | `#00FF2F` | blue down |
+| `cyan` | `#00FFFF` | `#00FF62` | blue down hard |
+| `azure` | `#0080FF` | `#00FFB6` | green **up** a lot |
+| `cobalt` | `#0040FF` | `#00C0FF` | green **up** a lot |
+| `indigo` | `#4000FF` | `#BB00FF` | red **up** a lot |
 
-Don't expect a clean linear rule, though — the green correction is barely
-anything on the whites but about a third on `yellow`. That's why these are matched
-by eye rather than computed.
+The through-line is that this card renders the mixing channel much further from
+the dominant one than the strip does, so intermediate hues collapse toward the
+nearest primary unless the minor channel is exaggerated. Nominal `#FFFFFF` reads
+as sky blue for the same reason.
+
+Pure primaries (`red`, `green`, `blue`) need no entry — one channel at max, with
+nothing to rebalance.
 
 So a **preset name resolves per device**, while an **explicit hex is always
 literal**. That split is what keeps `tune` honest: the hex it prints reproduces

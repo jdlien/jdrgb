@@ -84,21 +84,43 @@ const PRESETS: &[(&str, (u8, u8, u8))] = &[
 /// Per-preset overrides for the GPU, which renders colors quite differently from
 /// the strip — the same nominal value can look nothing alike on the two.
 ///
-/// Rough shape of this card's bias, from the entries below: red comes out about
-/// true, green runs hot, and blue runs *very* hot — nominal `#FFFFFF` reads as
-/// sky blue, close to `azure`. So tuning generally means holding red and pulling
-/// green and blue down, blue much further. Don't expect a clean linear rule; the
-/// green correction ranges from barely anything on the whites to about a third on
-/// `yellow`, which is why these are matched by eye rather than computed.
+/// There is no single correction rule here — the fix goes in *both* directions
+/// depending on where you are on the wheel, so don't try to derive one:
+///
+/// - Warm end (`orange`..`yellow`): red pins at max, green pulls down hard.
+/// - Green end (`chartreuse`, `lime`): green pins at max, red pushes *up* a lot.
+/// - Cyan end (`seagreen`..`cyan`): green pins at max, blue pulls down hard.
+/// - Blue end (`azure`, `cobalt`): blue stays high, green pushes *up* a lot.
+/// - Violet (`indigo`): blue pins at max, red pushes *up* a lot.
+///
+/// The through-line is that this card renders the mixing channel much further
+/// from the dominant one than the strip does, so intermediate hues collapse
+/// toward the nearest primary unless the minor channel is exaggerated. Nominal
+/// `#FFFFFF` reads as sky blue, close to `azure`, for the same reason.
+///
+/// Pure primaries (`red`, `green`, `blue`) need no entry: one channel at max and
+/// nothing to rebalance.
 ///
 /// Deliberately sparse: only presets actually dialled in by eye on the GPU belong
 /// here. Anything absent falls back to the shared value in PRESETS above, so this
 /// table never claims a calibration that hasn't been eyeballed. Add entries with
 /// `jdrgb --gpu tune NAME` and paste the hex it prints.
 const GPU_PRESETS: &[(&str, (u8, u8, u8))] = &[
-    ("coolwhite", (0xC7, 0x9E, 0x38)), // matches the strip's FFB0D0 by eye
-    ("warmwhite", (0xFF, 0x85, 0x12)), // matches the strip's FA9536 by eye
-    ("yellow", (0xFF, 0x8C, 0x00)),    // matches the strip's FFD000 by eye
+    // Kept in PRESETS order so the two tables read side by side. The comment on
+    // each line is the strip value it was matched against.
+    ("coolwhite", (0xC7, 0x9E, 0x38)),  // FFB0D0
+    ("warmwhite", (0xFF, 0x85, 0x12)),  // FA9536
+    ("orange", (0xFF, 0x20, 0x00)),     // FF3A00
+    ("amber", (0xFF, 0x54, 0x00)),      // FF8700
+    ("yellow", (0xFF, 0x8C, 0x00)),     // FFD000
+    ("chartreuse", (0xFF, 0xC0, 0x00)), // D4FF00
+    ("lime", (0xDE, 0xFF, 0x00)),       // 80FF00
+    ("seagreen", (0x00, 0xFF, 0x15)),   // 00FF51
+    ("teal", (0x00, 0xFF, 0x2F)),       // 00FF80
+    ("cyan", (0x00, 0xFF, 0x62)),       // 00FFFF
+    ("azure", (0x00, 0xFF, 0xB6)),      // 0080FF
+    ("cobalt", (0x00, 0xC0, 0xFF)),     // 0040FF
+    ("indigo", (0xBB, 0x00, 0xFF)),     // 4000FF
 ];
 
 /// A color on its way to a device.
