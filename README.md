@@ -85,14 +85,19 @@ green  seagreen  teal  cyan  azure  cobalt  blue  indigo  purple  violet  magent
 The GPU renders colors quite differently from the strip — the same nominal value
 can look nothing alike on the two.
 
-This card overdrives blue badly: nominal `#FFFFFF` reads as sky blue, close to
-`azure`. Both calibrated whites land at roughly a quarter of the strip's blue, so
-expect to pull blue a long way down when tuning a new one.
+Roughly: red comes out about true, green runs hot, and blue runs *very* hot —
+nominal `#FFFFFF` reads as sky blue, close to `azure`. Tuning usually means
+holding red and pulling green and blue down, blue much further.
 
 | preset | strip | GPU |
 |---|---|---|
 | `coolwhite` | `#FFB0D0` | `#C79E38` |
 | `warmwhite` | `#FA9536` | `#FF8512` |
+| `yellow` | `#FFD000` | `#FF8C00` |
+
+Don't expect a clean linear rule, though — the green correction is barely
+anything on the whites but about a third on `yellow`. That's why these are matched
+by eye rather than computed.
 
 So a **preset name resolves per device**, while an **explicit hex is always
 literal**. That split is what keeps `tune` honest: the hex it prints reproduces

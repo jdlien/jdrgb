@@ -84,10 +84,12 @@ const PRESETS: &[(&str, (u8, u8, u8))] = &[
 /// Per-preset overrides for the GPU, which renders colors quite differently from
 /// the strip — the same nominal value can look nothing alike on the two.
 ///
-/// This card overdrives blue hard: nominal `#FFFFFF` reads as sky blue, close to
-/// `azure`. Both calibrations below land at roughly a quarter of the strip's blue
-/// (54 -> 18, 208 -> 56), so when tuning a new one, expect to pull blue down a
-/// long way before it looks right.
+/// Rough shape of this card's bias, from the entries below: red comes out about
+/// true, green runs hot, and blue runs *very* hot — nominal `#FFFFFF` reads as
+/// sky blue, close to `azure`. So tuning generally means holding red and pulling
+/// green and blue down, blue much further. Don't expect a clean linear rule; the
+/// green correction ranges from barely anything on the whites to about a third on
+/// `yellow`, which is why these are matched by eye rather than computed.
 ///
 /// Deliberately sparse: only presets actually dialled in by eye on the GPU belong
 /// here. Anything absent falls back to the shared value in PRESETS above, so this
@@ -96,6 +98,7 @@ const PRESETS: &[(&str, (u8, u8, u8))] = &[
 const GPU_PRESETS: &[(&str, (u8, u8, u8))] = &[
     ("coolwhite", (0xC7, 0x9E, 0x38)), // matches the strip's FFB0D0 by eye
     ("warmwhite", (0xFF, 0x85, 0x12)), // matches the strip's FA9536 by eye
+    ("yellow", (0xFF, 0x8C, 0x00)),    // matches the strip's FFD000 by eye
 ];
 
 /// A color on its way to a device.
