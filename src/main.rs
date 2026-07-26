@@ -57,7 +57,9 @@ const DEFAULT_PRESET: &str = "coolwhite";
 const PRESETS: &[(&str, (u8, u8, u8))] = &[
     ("coolwhite", (0xFF, 0xB0, 0xD0)), // hand-tuned clean white; the default
     ("warmwhite", (0xFA, 0x95, 0x36)), // the original warm white
-    ("white", (0xFF, 0xFF, 0xFF)),     // nominal white (reads greenish here)
+    // Nominal white, deliberately left untuned as a reference point: it reads
+    // greenish on the strip and sky-blue on the GPU. Use coolwhite for a real white.
+    ("white", (0xFF, 0xFF, 0xFF)),
     ("red", (0xFF, 0x00, 0x00)),
     ("orange", (0xFF, 0x3A, 0x00)),
     ("amber", (0xFF, 0x87, 0x00)),
@@ -82,11 +84,17 @@ const PRESETS: &[(&str, (u8, u8, u8))] = &[
 /// Per-preset overrides for the GPU, which renders colors quite differently from
 /// the strip — the same nominal value can look nothing alike on the two.
 ///
+/// This card overdrives blue hard: nominal `#FFFFFF` reads as sky blue, close to
+/// `azure`. Both calibrations below land at roughly a quarter of the strip's blue
+/// (54 -> 18, 208 -> 56), so when tuning a new one, expect to pull blue down a
+/// long way before it looks right.
+///
 /// Deliberately sparse: only presets actually dialled in by eye on the GPU belong
 /// here. Anything absent falls back to the shared value in PRESETS above, so this
 /// table never claims a calibration that hasn't been eyeballed. Add entries with
 /// `jdrgb --gpu tune NAME` and paste the hex it prints.
 const GPU_PRESETS: &[(&str, (u8, u8, u8))] = &[
+    ("coolwhite", (0xC7, 0x9E, 0x38)), // matches the strip's FFB0D0 by eye
     ("warmwhite", (0xFF, 0x85, 0x12)), // matches the strip's FA9536 by eye
 ];
 
@@ -1292,6 +1300,16 @@ mod tests {
         let p = Paint::Preset("warmwhite");
         assert_eq!(p.rgb(false), (0xFA, 0x95, 0x36)); // strip
         assert_eq!(p.rgb(true), (0xFF, 0x85, 0x12)); // GPU, tuned by eye
+    }
+
+    #[test]
+    fn default_preset_is_calibrated_for_both() {
+        // Bare `jdrgb` and `jdrgb --gpu` must each get their own tuned white,
+        // since the default is what install.ps1 uses when no color is given.
+        let p = Paint::Preset(DEFAULT_PRESET);
+        assert_eq!(p.rgb(false), (0xFF, 0xB0, 0xD0));
+        assert_eq!(p.rgb(true), (0xC7, 0x9E, 0x38));
+        assert_ne!(p.rgb(false), p.rgb(true));
     }
 
     #[test]

@@ -83,8 +83,16 @@ green  seagreen  teal  cyan  azure  cobalt  blue  indigo  purple  violet  magent
 #### Per-device calibration
 
 The GPU renders colors quite differently from the strip — the same nominal value
-can look nothing alike on the two. `warmwhite` needs `#FA9536` on the strip but
-`#FF8512` on the GPU to land in the same place by eye.
+can look nothing alike on the two.
+
+This card overdrives blue badly: nominal `#FFFFFF` reads as sky blue, close to
+`azure`. Both calibrated whites land at roughly a quarter of the strip's blue, so
+expect to pull blue a long way down when tuning a new one.
+
+| preset | strip | GPU |
+|---|---|---|
+| `coolwhite` | `#FFB0D0` | `#C79E38` |
+| `warmwhite` | `#FA9536` | `#FF8512` |
 
 So a **preset name resolves per device**, while an **explicit hex is always
 literal**. That split is what keeps `tune` honest: the hex it prints reproduces
