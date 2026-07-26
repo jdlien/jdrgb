@@ -388,12 +388,33 @@ impl Gpu {
     }
 
     /// Paint every LED one color in static mode.
+    pub fn apply_solid(&self, mode: u8, color: (u8, u8, u8)) -> Result<()> {
+        self.apply_colors(mode, &[color])
+    }
+
+    /// Paint the LEDs individually in static mode. The effect bank holds three
+    /// bytes per LED, and ENE static mode honours them per-LED, so the card's
+    /// LEDs can each show a different color.
+    ///
+    /// Fewer colors than LEDs cycle to fill; more are ignored.
+    ///
+    /// Verified by photograph on the TUF 5090: the four LEDs light the left tick
+    /// marks, the left half of the TUF logo, the right of the logo plus the right
+    /// ticks, and the five dots along the bottom. The zones are distinguishable
+    /// but bleed into each other badly through the shared diffuser — sending pure
+    /// `FF0000` renders pink and pure `00FF00` renders teal, despite neither
+    /// having any blue. Saturated per-LED patterns go muddy; soft gradients
+    /// between neighbouring hues are what this actually looks good doing.
     ///
     /// The final two writes are not optional: a stale "direct" flag overrides the
     /// effect mode entirely, so the colors would land but never show.
-    pub fn apply_solid(&self, mode: u8, color: (u8, u8, u8)) -> Result<()> {
+    pub fn apply_colors(&self, mode: u8, colors: &[(u8, u8, u8)]) -> Result<()> {
         let led_count = self.validate()?;
-        let buf = pack_colors(&vec![color; led_count]);
+        if colors.is_empty() {
+            return Err(Error::permanent("no colors given"));
+        }
+        let per_led: Vec<(u8, u8, u8)> = (0..led_count).map(|i| colors[i % colors.len()]).collect();
+        let buf = pack_colors(&per_led);
 
         let mut sent = 0;
         while sent < buf.len() {

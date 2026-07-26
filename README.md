@@ -162,6 +162,24 @@ jdrgb --gpu tune amber      # dial by eye, q to quit
 A test asserts every name in `GPU_PRESETS` matches a real preset, so a typo fails
 the build instead of silently doing nothing.
 
+### GPU zones
+
+The card has four LEDs and they *are* individually addressable, lighting the left
+tick marks, the left half of the TUF logo, the right of the logo plus the right
+ticks, and the five dots along the bottom.
+
+They bleed into each other badly, though. Sending pure `#FF0000` renders pink and
+pure `#00FF00` renders teal — neither has any blue in it — because the zones share
+a diffuser and this card's blue dominates anything it touches. Saturated per-LED
+patterns come out muddy.
+
+Soft gradients between neighbouring hues are what it's actually good at, since the
+blending works in your favour:
+
+```
+gpu: warmwhite amber warmwhite amber
+```
+
 ### Per-LED config file
 
 For dialing in individual LEDs, use a plain-text config: one `RRGGBB` hex color

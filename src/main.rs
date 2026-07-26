@@ -215,8 +215,9 @@ impl Target {
 fn mb_only(command: &Command) -> Option<&'static str> {
     match command {
         Command::Rainbow(_) => Some("rainbow"),
-        Command::Load(_) => Some("load"),
         Command::Template(_) => Some("template"),
+        // `load` is not here: a config can carry a `gpu:` line, so it's the one
+        // file that describes a whole-machine theme.
         _ => None,
     }
 }
@@ -275,9 +276,8 @@ fn main() -> ExitCode {
         Command::Rainbow(n) => with_retry(wait, || set_rainbow(n)).map(|()| {
             println!("jdrgb: rainbow across {n} LEDs (white end-caps)");
         }),
-        Command::Load(path) => {
-            with_retry(wait, || set_from_config(&path)).map(|()| println!("jdrgb: loaded {path}"))
-        }
+        Command::Load(path) => with_retry(wait, || set_from_config(&path, target))
+            .map(|()| println!("jdrgb: loaded {path}")),
         Command::Template(path) => write_template(&path).map(|()| {
             println!("jdrgb: wrote {path} ({STRIP_LEDS} LEDs) — edit it, then `jdrgb load {path}`");
         }),
@@ -455,9 +455,14 @@ fn set_solid_targets(target: Target, wait: bool, mode: u8, paint: Paint) -> Resu
 
 /// Discover, validate, and write the GPU exactly once.
 fn apply_gpu_solid(mode: u8, color: (u8, u8, u8)) -> Result<(), gpu::Error> {
+    apply_gpu_colors(mode, &[color])
+}
+
+/// As above, but driving the card's LEDs individually.
+fn apply_gpu_colors(mode: u8, colors: &[(u8, u8, u8)]) -> Result<(), gpu::Error> {
     let mut card = gpu::detect()?;
     card.prepare()?;
-    card.apply_solid(mode, color)
+    card.apply_colors(mode, colors)
 }
 
 fn report(label: Option<&str>, mode: u8, (r, g, b): (u8, u8, u8)) {
@@ -659,55 +664,127 @@ fn set_rainbow(count: usize) -> Result<(), String> {
 
 /// Load per-LED colors from a config file and paint them via direct mode.
 /// The strip is padded to its full length with "off" so every LED is defined.
-fn set_from_config(path: &str) -> Result<(), String> {
-    let mut colors = read_led_config(path)?;
-    if colors.len() < STRIP_LEDS {
-        colors.resize(STRIP_LEDS, (0, 0, 0));
+fn set_from_config(path: &str, target: Target) -> Result<(), String> {
+    let conf = read_led_config(path)?;
+    let mut failures = Vec::new();
+
+    if target.mb() {
+        let mut colors = conf.strip.clone();
+        if colors.len() < STRIP_LEDS {
+            colors.resize(STRIP_LEDS, (0, 0, 0));
+        }
+        match paint_strip(&colors) {
+            Ok(()) => save_state(None), // strip is now multi-colored
+            Err(e) => failures.push(format!("mb: {e}")),
+        }
     }
 
+    if target.gpu() {
+        match conf.gpu {
+            // Silent no-op would be worse than saying so: the user asked for the
+            // GPU and the file has nothing for it.
+            None => failures.push(format!("gpu: {path} has no `gpu:` line")),
+            Some(ref colors) => match apply_gpu_colors(MODE_STATIC, colors) {
+                Ok(()) => {
+                    let hex: Vec<String> =
+                        colors.iter().map(|&(r, g, b)| format!("#{r:02X}{g:02X}{b:02X}")).collect();
+                    println!("jdrgb: gpu: set {}", hex.join(" "));
+                }
+                Err(e) => failures.push(format!("gpu: {}", e.msg)),
+            },
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+fn paint_strip(colors: &[(u8, u8, u8)]) -> Result<(), String> {
     let api = HidApi::new().map_err(|e| format!("hidapi init failed: {e}"))?;
     let dev = open(&api)?;
     let cfg = read_config(&dev).ok_or("could not read config table")?;
     for ch in 0..header_count(&cfg) {
-        send_direct(&dev, ch, &colors)?;
+        send_direct(&dev, ch, colors)?;
     }
-    save_state(None); // strip is now multi-colored
     Ok(())
 }
 
+/// A parsed config: per-LED strip colors, plus optional GPU colors.
+struct LedConfig {
+    strip: Vec<(u8, u8, u8)>,
+    gpu: Option<Vec<(u8, u8, u8)>>,
+}
+
 /// Parse a config file: one `RRGGBB` hex or preset name per line, line N = LED N.
-/// `#` starts a comment; blank lines are skipped.
+/// A `gpu: COLOR` line sets the GPU. `#` starts a comment; blanks are skipped.
 ///
-/// Preset names resolve against the strip, since per-LED patterns are
-/// motherboard-only. `black` is the useful one here — it's how you light just
-/// part of the strip and leave the rest dark.
-fn read_led_config(path: &str) -> Result<Vec<(u8, u8, u8)>, String> {
+/// Bare color lines resolve against the strip and the `gpu:` line against the
+/// GPU, so a preset name on either gets that device's own calibration — which is
+/// the whole point of naming one file a "theme". `black` is the useful one for
+/// the strip: it's how you light part of it and leave the rest dark.
+fn read_led_config(path: &str) -> Result<LedConfig, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
-    let mut colors = Vec::new();
+    let mut strip = Vec::new();
+    let mut gpu = None;
+
     for (n, raw) in text.lines().enumerate() {
         let line = raw.split('#').next().unwrap_or("").trim();
         if line.is_empty() {
             continue;
         }
+
+        // `gpu: COLOR` — or several, whitespace/comma separated, to drive the
+        // card's LEDs individually. Fewer than it has will cycle to fill.
+        let directive = line
+            .strip_prefix("gpu:")
+            .or_else(|| line.strip_prefix("GPU:"))
+            .or_else(|| line.strip_prefix("Gpu:"));
+        if let Some(rest) = directive {
+            let mut colors = Vec::new();
+            for value in rest.split([' ', '\t', ',']).filter(|s| !s.is_empty()) {
+                colors.push(
+                    parse_paint(value)
+                        .map(|p| p.rgb(true))
+                        .ok_or_else(|| format!("{path}:{}: invalid color or preset '{value}'", n + 1))?,
+                );
+            }
+            if colors.is_empty() {
+                return Err(format!("{path}:{}: `gpu:` needs at least one color", n + 1));
+            }
+            gpu = Some(colors);
+            continue;
+        }
+
         let color = parse_paint(line)
             .map(|p| p.rgb(false))
             .ok_or_else(|| format!("{path}:{}: invalid color or preset '{line}'", n + 1))?;
-        colors.push(color);
+        strip.push(color);
     }
-    if colors.is_empty() {
+
+    if strip.is_empty() && gpu.is_none() {
         return Err(format!("{path}: no colors found"));
     }
-    Ok(colors)
+    Ok(LedConfig { strip, gpu })
 }
 
 /// Write a starter config with one line per LED, pre-filled with the preset.
 fn write_template(path: &str) -> Result<(), String> {
     let (r, g, b) = DEFAULT_COLOR;
     let mut out = String::from(
-        "# jdrgb per-LED config: one color per line, top = LED 0.\n\
+        "# jdrgb config: one color per line for the strip, top = LED 0.\n\
          # Each line is an RRGGBB hex value or a preset name (see `jdrgb presets`).\n\
          # Use `black` to leave an LED dark and light only part of the strip.\n\
-         # '#' starts a comment; blank lines are ignored.\n\n",
+         # '#' starts a comment; blank lines are ignored.\n\
+         #\n\
+         # A `gpu:` line sets the GPU (all 4 of its LEDs, one color). Preset names\n\
+         # on it get the GPU's own calibration, so `gpu: warmwhite` matches the\n\
+         # strip's warmwhite by eye rather than by number.\n\
+         # Applied with `jdrgb load <file> --all` (or --gpu for the GPU alone).\n\
+         \n\
+         gpu: warmwhite\n\n",
     );
     for i in 0..STRIP_LEDS {
         out.push_str(&format!("{r:02X}{g:02X}{b:02X}   # LED {i}\n"));
@@ -1432,9 +1509,11 @@ mod tests {
     #[test]
     fn per_led_commands_are_motherboard_only() {
         assert!(mb_only(&Command::Rainbow(38)).is_some());
-        assert!(mb_only(&Command::Load("x".into())).is_some());
         assert!(mb_only(&Command::Template("x".into())).is_some());
         assert!(mb_only(&Command::Solid(MODE_STATIC, Paint::Preset("red"))).is_none());
         assert!(mb_only(&Command::Probe).is_none());
+        // `load` is deliberately NOT motherboard-only: a config can carry a
+        // `gpu:` line, making it the one file that describes a whole machine.
+        assert!(mb_only(&Command::Load("x".into())).is_none());
     }
 }
