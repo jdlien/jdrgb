@@ -76,9 +76,25 @@ Notably `white` (`#FFFFFF`) reads greenish here, so the default is `coolwhite`
 warm tone.
 
 ```
-coolwhite  warmwhite  white  red  orange  amber  yellow  chartreuse  lime
+coolwhite  warmwhite  white  black  red  orange  amber  yellow  chartreuse  lime
 green  seagreen  teal  cyan  azure  cobalt  blue  indigo  purple  violet  magenta  hotpink  pink
 ```
+
+#### `black` vs `off`
+
+They look the same but are different controller states, confirmed by reading the
+mode register back with `jdrgb --gpu probe`:
+
+| command | mode register |
+|---|---|
+| `jdrgb off` | `0` — the controller's own off mode |
+| `jdrgb black` | `1` — static, displaying `#000000` |
+
+There's no measurable power difference: the LEDs draw nothing either way and the
+controller stays powered regardless. Prefer `off` when you mean "dark" — it's the
+honest expression of intent and what gets committed if you `save`. `black` exists
+so a theme can leave one device dark while the other is lit, e.g.
+`jdrgb --gpu black` alongside `jdrgb warmwhite`.
 
 #### Per-device calibration
 

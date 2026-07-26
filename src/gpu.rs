@@ -381,6 +381,12 @@ impl Gpu {
         &self.config_table
     }
 
+    /// Current mode and direct-flag registers, for diagnostics. Mode 0 is the
+    /// controller's own off state; 1 is static.
+    pub fn mode_state(&self) -> Result<(u8, u8)> {
+        Ok((self.ene_read(REG_MODE)?, self.ene_read(REG_DIRECT)?))
+    }
+
     /// Paint every LED one color in static mode.
     ///
     /// The final two writes are not optional: a stale "direct" flag overrides the
