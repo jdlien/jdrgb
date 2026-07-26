@@ -48,6 +48,10 @@ const LEDS_PER_PACKET: usize = 20; // 20 * 3 bytes = 60, fits one report
 /// a screen but renders as a proper cool white, so it's the default.)
 const DEFAULT_COLOR: (u8, u8, u8) = (0xFF, 0xB0, 0xD0);
 
+/// The default as a preset name, so each device gets its own tuned value if one
+/// is listed in GPU_PRESETS.
+const DEFAULT_PRESET: &str = "coolwhite";
+
 /// Case-insensitive keyword colors. Sensible starting points only — LEDs render
 /// colors quite differently from nominal RGB, so tune any that look off by eye.
 const PRESETS: &[(&str, (u8, u8, u8))] = &[
@@ -75,16 +79,68 @@ const PRESETS: &[(&str, (u8, u8, u8))] = &[
     ("pink", (0xD5, 0x2A, 0x66)),    // softer, "pretty in pink"
 ];
 
+/// Per-preset overrides for the GPU, which renders colors quite differently from
+/// the strip — the same nominal value can look nothing alike on the two.
+///
+/// Deliberately sparse: only presets actually dialled in by eye on the GPU belong
+/// here. Anything absent falls back to the shared value in PRESETS above, so this
+/// table never claims a calibration that hasn't been eyeballed. Add entries with
+/// `jdrgb --gpu tune NAME` and paste the hex it prints.
+const GPU_PRESETS: &[(&str, (u8, u8, u8))] = &[
+    ("warmwhite", (0xFF, 0x85, 0x12)), // matches the strip's FA9536 by eye
+];
+
+/// A color on its way to a device.
+///
+/// Preset names stay unresolved until the moment of writing, because the right
+/// RGB depends on which controller it lands on. An explicit hex is always taken
+/// literally — if you type a value, you get that value, which is what makes
+/// `tune`'s output directly reusable.
+#[derive(Clone, Copy)]
+enum Paint {
+    Literal((u8, u8, u8)),
+    Preset(&'static str),
+}
+
+impl Paint {
+    fn rgb(self, gpu: bool) -> (u8, u8, u8) {
+        match self {
+            Paint::Literal(rgb) => rgb,
+            Paint::Preset(name) => {
+                if gpu {
+                    if let Some(&(_, rgb)) = GPU_PRESETS.iter().find(|(n, _)| *n == name) {
+                        return rgb;
+                    }
+                }
+                lookup_preset(name).unwrap_or(DEFAULT_COLOR)
+            }
+        }
+    }
+}
+
+fn lookup_preset(name: &str) -> Option<(u8, u8, u8)> {
+    PRESETS.iter().find(|(n, _)| *n == name).map(|&(_, rgb)| rgb)
+}
+
+/// Resolve a preset name (case-insensitive) or an `RRGGBB` hex string.
+fn parse_paint(s: &str) -> Option<Paint> {
+    let lower = s.to_ascii_lowercase();
+    if let Some(&(name, _)) = PRESETS.iter().find(|(n, _)| *n == lower) {
+        return Some(Paint::Preset(name));
+    }
+    parse_hex(s).map(Paint::Literal)
+}
+
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
 enum Command {
-    Solid(u8, (u8, u8, u8)), // effect mode + color (MODE_STATIC or MODE_OFF)
+    Solid(u8, Paint), // effect mode + color (MODE_STATIC or MODE_OFF)
     Rainbow(usize),          // per-LED demo across N LEDs
     Load(String),            // per-LED colors from a config file
     Template(String),        // write a starter config file
-    Tune((u8, u8, u8)),      // interactively dial in a color
+    Tune(Paint),             // interactively dial in a color
     Preview,                 // cycle through all presets
     Presets,                 // list keyword presets
     Probe,                   // diagnostics
@@ -183,7 +239,10 @@ fn main() -> ExitCode {
         Command::Template(path) => write_template(&path).map(|()| {
             println!("jdrgb: wrote {path} ({STRIP_LEDS} LEDs) — edit it, then `jdrgb load {path}`");
         }),
-        Command::Tune(start) => tune(target, start),
+        // Tuning needs one concrete starting RGB even with --all, so a preset
+        // resolves against whichever device is the focus: the GPU only when
+        // it's the sole target.
+        Command::Tune(start) => tune(target, start.rgb(target == Target::Gpu)),
     };
 
     match result {
@@ -197,14 +256,14 @@ fn main() -> ExitCode {
 
 fn parse(args: &[&str]) -> Result<Command, String> {
     match args.first().copied().unwrap_or("") {
-        "" => Ok(Command::Solid(MODE_STATIC, DEFAULT_COLOR)),
+        "" => Ok(Command::Solid(MODE_STATIC, Paint::Preset(DEFAULT_PRESET))),
         "-h" | "--help" | "help" => Ok(Command::Help),
         "-V" | "--version" => Ok(Command::Version),
         "probe" => Ok(Command::Probe),
         "save" => Ok(Command::Save),
         "preview" => Ok(Command::Preview),
         "presets" | "colors" => Ok(Command::Presets),
-        "off" => Ok(Command::Solid(MODE_OFF, (0, 0, 0))),
+        "off" => Ok(Command::Solid(MODE_OFF, Paint::Literal((0, 0, 0)))),
         "rainbow" => {
             let n = match args.get(1) {
                 Some(s) => s.parse().map_err(|_| format!("invalid LED count '{s}'"))?,
@@ -216,15 +275,15 @@ fn parse(args: &[&str]) -> Result<Command, String> {
         "template" => Ok(Command::Template(args.get(1).copied().unwrap_or("leds.conf").to_string())),
         "tune" => {
             let start = match args.get(1) {
-                Some(s) => parse_color(s).ok_or_else(|| format!("'{s}' is not a color or preset"))?,
+                Some(s) => parse_paint(s).ok_or_else(|| format!("'{s}' is not a color or preset"))?,
                 // No arg: start from the last solid color we set, else the
                 // default (also the fallback when the strip is multi-colored).
-                None => load_last().unwrap_or(DEFAULT_COLOR),
+                None => Paint::Literal(load_last().unwrap_or(DEFAULT_COLOR)),
             };
             Ok(Command::Tune(start))
         }
-        other => parse_color(other)
-            .map(|c| Command::Solid(MODE_STATIC, c))
+        other => parse_paint(other)
+            .map(|p| Command::Solid(MODE_STATIC, p))
             .ok_or_else(|| format!("'{other}' is not a color, preset, or command (try `jdrgb --help`)")),
     }
 }
@@ -310,7 +369,7 @@ fn check_targets(target: Target) -> Result<(), gpu::Error> {
 /// each target is written exactly once. Retrying the *write* instead would
 /// re-issue the motherboard's flash commit on every attempt while waiting for
 /// the GPU to come up — hammering flash that has finite write cycles.
-fn set_solid_targets(target: Target, wait: bool, mode: u8, color: (u8, u8, u8)) -> Result<(), String> {
+fn set_solid_targets(target: Target, wait: bool, mode: u8, paint: Paint) -> Result<(), String> {
     with_retry(wait, || check_targets(target))?;
 
     // Label each line only when there's more than one device to tell apart, so
@@ -318,10 +377,12 @@ fn set_solid_targets(target: Target, wait: bool, mode: u8, color: (u8, u8, u8)) 
     let labelled = target == Target::All;
 
     if target.mb() {
+        let color = paint.rgb(false);
         set_solid(mode, color)?;
         report(labelled.then_some("mb"), mode, color);
     }
     if target.gpu() {
+        let color = paint.rgb(true);
         let mut card = gpu::detect().map_err(|e| e.msg)?;
         card.prepare().map_err(|e| e.msg)?;
         card.apply_solid(mode, color).map_err(|e| e.msg)?;
@@ -628,15 +689,16 @@ impl Live<'_> {
         Ok(Live { mb, gpu, _api: api })
     }
 
-    /// Paint one color everywhere. `commit` only means anything on the
-    /// motherboard; the GPU's equivalent is the separate `save` command, so
+    /// Paint everywhere, resolving the color separately per device so a preset
+    /// lands as whatever looks right on each. `commit` only means anything on
+    /// the motherboard; the GPU's equivalent is the separate `save` command, so
     /// live stepping never touches its flash.
-    fn paint(&self, color: (u8, u8, u8), commit: bool) -> Result<(), String> {
+    fn paint(&self, paint: Paint, commit: bool) -> Result<(), String> {
         if let Some((dev, headers)) = &self.mb {
-            apply_solid(dev, *headers, MODE_STATIC, color, commit)?;
+            apply_solid(dev, *headers, MODE_STATIC, paint.rgb(false), commit)?;
         }
         if let Some(card) = &self.gpu {
-            card.apply_solid(MODE_STATIC, color).map_err(|e| e.msg)?;
+            card.apply_solid(MODE_STATIC, paint.rgb(true)).map_err(|e| e.msg)?;
         }
         Ok(())
     }
@@ -662,7 +724,10 @@ fn tune(target: Target, start: (u8, u8, u8)) -> Result<(), String> {
     let mut key = [0u8; 1];
 
     let mut rgb = hsl_to_rgb(h, s, l);
-    live.paint(rgb, false)?; // live preview, no flash-save
+    // Tuning is always literal: you're dialling in a specific value, so no
+    // per-device preset substitution happens here — what you see is what the
+    // printed hex will reproduce.
+    live.paint(Paint::Literal(rgb), false)?; // live preview, no flash-save
     draw_status(h, s, l, rgb, &pal);
 
     loop {
@@ -680,11 +745,11 @@ fn tune(target: Target, start: (u8, u8, u8)) -> Result<(), String> {
             _ => continue,
         }
         rgb = hsl_to_rgb(h, s, l);
-        live.paint(rgb, false)?;
+        live.paint(Paint::Literal(rgb), false)?;
         draw_status(h, s, l, rgb, &pal);
     }
 
-    live.paint(rgb, true)?; // commit the chosen color
+    live.paint(Paint::Literal(rgb), true)?; // commit the chosen color
     save_state(Some(rgb));
     let (cr, cg, cb) = rgb;
     println!();
@@ -856,7 +921,7 @@ fn preview(target: Target) -> Result<(), String> {
     let mut paused = false;
 
     // Live preview (no flash-save) while cycling.
-    live.paint(PRESETS[idx].1, false)?;
+    live.paint(Paint::Preset(PRESETS[idx].0), false)?;
     draw_preview(idx, total, dwell_ms, paused, &pal);
 
     let mut quit = false;
@@ -879,13 +944,13 @@ fn preview(target: Target) -> Result<(), String> {
                 }
                 'n' | ' ' => {
                     idx = (idx + 1) % total;
-                    live.paint(PRESETS[idx].1, false)?;
+                    live.paint(Paint::Preset(PRESETS[idx].0), false)?;
                     elapsed = 0;
                     refresh = true;
                 }
                 'N' => {
                     idx = (idx + total - 1) % total;
-                    live.paint(PRESETS[idx].1, false)?;
+                    live.paint(Paint::Preset(PRESETS[idx].0), false)?;
                     elapsed = 0;
                     refresh = true;
                 }
@@ -904,7 +969,7 @@ fn preview(target: Target) -> Result<(), String> {
             elapsed += tick_ms;
             if elapsed >= dwell_ms {
                 idx = (idx + 1) % total;
-                live.paint(PRESETS[idx].1, false)?;
+                live.paint(Paint::Preset(PRESETS[idx].0), false)?;
                 elapsed = 0;
                 draw_preview(idx, total, dwell_ms, paused, &pal);
             }
@@ -913,7 +978,7 @@ fn preview(target: Target) -> Result<(), String> {
 
     // Keep whatever's showing when you quit: commit and remember it.
     let (name, rgb) = PRESETS[idx];
-    live.paint(rgb, true)?;
+    live.paint(Paint::Preset(name), true)?;
     save_state(Some(rgb));
     let (cr, cg, cb) = rgb;
     println!();
@@ -1098,16 +1163,6 @@ fn parse_hex(s: &str) -> Option<(u8, u8, u8)> {
     ))
 }
 
-/// Resolve a color from a case-insensitive preset name or an RRGGBB hex string.
-fn parse_color(s: &str) -> Option<(u8, u8, u8)> {
-    let lower = s.to_ascii_lowercase();
-    PRESETS
-        .iter()
-        .find(|(name, _)| *name == lower)
-        .map(|&(_, rgb)| rgb)
-        .or_else(|| parse_hex(s))
-}
-
 /// Path to the "last color" state file in the user's local app data.
 fn state_path() -> Option<std::path::PathBuf> {
     std::env::var_os("LOCALAPPDATA").map(|p| std::path::PathBuf::from(p).join("jdrgb").join("last"))
@@ -1134,15 +1189,34 @@ fn load_last() -> Option<(u8, u8, u8)> {
 }
 
 /// Print the keyword presets, with a swatch when the terminal supports color.
+/// Presets carrying a separate GPU calibration show it in a second column.
 fn list_presets() -> Result<(), String> {
     let color = enable_ansi_output();
     println!("Presets (case-insensitive) - tune any that render off by eye:");
     for &(name, (r, g, b)) in PRESETS {
+        // Only presets dialled in on the GPU get a second column; the rest fall
+        // back to the strip's value, and saying so would be noise.
+        let gpu = GPU_PRESETS.iter().find(|(n, _)| *n == name).map(|&(_, rgb)| rgb);
         if color {
-            println!("  [\x1b[48;2;{r};{g};{b}m    \x1b[0m]  \x1b[1;97m{name:<10}\x1b[0m \x1b[33m#{r:02X}{g:02X}{b:02X}\x1b[0m");
+            let extra = match gpu {
+                Some((gr, gg, gb)) => format!(
+                    "   [\x1b[48;2;{gr};{gg};{gb}m    \x1b[0m] \x1b[33m#{gr:02X}{gg:02X}{gb:02X}\x1b[0m \x1b[36mgpu\x1b[0m"
+                ),
+                None => String::new(),
+            };
+            println!("  [\x1b[48;2;{r};{g};{b}m    \x1b[0m]  \x1b[1;97m{name:<10}\x1b[0m \x1b[33m#{r:02X}{g:02X}{b:02X}\x1b[0m{extra}");
         } else {
-            println!("  {name:<10} #{r:02X}{g:02X}{b:02X}");
+            let extra = match gpu {
+                Some((gr, gg, gb)) => format!("   #{gr:02X}{gg:02X}{gb:02X} gpu"),
+                None => String::new(),
+            };
+            println!("  {name:<10} #{r:02X}{g:02X}{b:02X}{extra}");
         }
+    }
+    if !GPU_PRESETS.is_empty() {
+        println!();
+        println!("A `gpu` column means that preset is calibrated separately for the GPU.");
+        println!("Others use the same value on both. Hex arguments are always literal.");
     }
     Ok(())
 }
@@ -1198,4 +1272,70 @@ fn print_help() {
          \x20 with nothing running — do it once by hand, never on a schedule.\n",
         ver = env!("CARGO_PKG_VERSION"),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A typo'd name in GPU_PRESETS would silently never match, and the preset
+    /// would quietly keep using the strip's value forever.
+    #[test]
+    fn every_gpu_override_names_a_real_preset() {
+        for &(name, _) in GPU_PRESETS {
+            assert!(lookup_preset(name).is_some(), "GPU_PRESETS has no matching preset: {name}");
+        }
+    }
+
+    #[test]
+    fn calibrated_preset_differs_per_device() {
+        let p = Paint::Preset("warmwhite");
+        assert_eq!(p.rgb(false), (0xFA, 0x95, 0x36)); // strip
+        assert_eq!(p.rgb(true), (0xFF, 0x85, 0x12)); // GPU, tuned by eye
+    }
+
+    #[test]
+    fn uncalibrated_preset_is_shared() {
+        // `red` has no GPU entry, so both devices get the same value.
+        let p = Paint::Preset("red");
+        assert_eq!(p.rgb(false), p.rgb(true));
+        assert_eq!(p.rgb(true), (0xFF, 0x00, 0x00));
+    }
+
+    #[test]
+    fn hex_is_never_remapped() {
+        // Typing warmwhite's strip value explicitly must not become the GPU's.
+        let p = Paint::Literal((0xFA, 0x95, 0x36));
+        assert_eq!(p.rgb(false), (0xFA, 0x95, 0x36));
+        assert_eq!(p.rgb(true), (0xFA, 0x95, 0x36));
+    }
+
+    #[test]
+    fn parses_names_and_hex() {
+        assert!(matches!(parse_paint("WarmWhite"), Some(Paint::Preset("warmwhite"))));
+        assert!(matches!(parse_paint("ff8512"), Some(Paint::Literal((0xFF, 0x85, 0x12)))));
+        assert!(matches!(parse_paint("#FF8512"), Some(Paint::Literal((0xFF, 0x85, 0x12)))));
+        assert!(parse_paint("nonsense").is_none());
+    }
+
+    #[test]
+    fn default_preset_resolves() {
+        assert_eq!(Paint::Preset(DEFAULT_PRESET).rgb(false), DEFAULT_COLOR);
+    }
+
+    #[test]
+    fn target_flags_select_devices() {
+        assert!(Target::Mb.mb() && !Target::Mb.gpu());
+        assert!(!Target::Gpu.mb() && Target::Gpu.gpu());
+        assert!(Target::All.mb() && Target::All.gpu());
+    }
+
+    #[test]
+    fn per_led_commands_are_motherboard_only() {
+        assert!(mb_only(&Command::Rainbow(38)).is_some());
+        assert!(mb_only(&Command::Load("x".into())).is_some());
+        assert!(mb_only(&Command::Template("x".into())).is_some());
+        assert!(mb_only(&Command::Solid(MODE_STATIC, Paint::Preset("red"))).is_none());
+        assert!(mb_only(&Command::Probe).is_none());
+    }
 }

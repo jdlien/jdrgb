@@ -80,6 +80,35 @@ coolwhite  warmwhite  white  red  orange  amber  yellow  chartreuse  lime
 green  seagreen  teal  cyan  azure  cobalt  blue  indigo  purple  violet  magenta  hotpink  pink
 ```
 
+#### Per-device calibration
+
+The GPU renders colors quite differently from the strip — the same nominal value
+can look nothing alike on the two. `warmwhite` needs `#FA9536` on the strip but
+`#FF8512` on the GPU to land in the same place by eye.
+
+So a **preset name resolves per device**, while an **explicit hex is always
+literal**. That split is what keeps `tune` honest: the hex it prints reproduces
+exactly what you were looking at, on whichever device you were looking at.
+
+```powershell
+jdrgb --all warmwhite   # strip #FA9536, GPU #FF8512 — same look, different values
+jdrgb --gpu FA9536      # literal: no substitution
+```
+
+The override table (`GPU_PRESETS` in `src/main.rs`) is deliberately sparse. Only
+presets actually dialled in by eye on the GPU belong there; everything else falls
+back to the shared value, so the table never claims a calibration nobody has
+looked at. `jdrgb presets` marks the calibrated ones with a `gpu` column.
+
+To add one, tune it and paste the hex it prints:
+
+```powershell
+jdrgb --gpu tune amber      # dial by eye, q to quit
+```
+
+A test asserts every name in `GPU_PRESETS` matches a real preset, so a typo fails
+the build instead of silently doing nothing.
+
 ### Per-LED config file
 
 For dialing in individual LEDs, use a plain-text config: one `RRGGBB` hex color
