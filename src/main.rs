@@ -84,22 +84,22 @@ const PRESETS: &[(&str, (u8, u8, u8))] = &[
 /// Per-preset overrides for the GPU, which renders colors quite differently from
 /// the strip — the same nominal value can look nothing alike on the two.
 ///
-/// There is no single correction rule here — the fix goes in *both* directions
-/// depending on where you are on the wheel, so don't try to derive one:
+/// With the full wheel dialled in, one pattern holds across every entry: this
+/// card's blue is far stronger than the strip's, so **every** calibration lowers
+/// blue relative to the other channels. Nothing else is consistent — green
+/// against red moves both ways and only slightly.
 ///
-/// - Warm end (`orange`..`yellow`): red pins at max, green pulls down hard.
-/// - Green end (`chartreuse`, `lime`): green pins at max, red pushes *up* a lot.
-/// - Cyan end (`seagreen`..`cyan`): green pins at max, blue pulls down hard.
-/// - Blue end (`azure`, `cobalt`): blue stays high, green pushes *up* a lot.
-/// - Violet (`indigo`): blue pins at max, red pushes *up* a lot.
+/// That single effect explains what look like opposite corrections. Where blue is
+/// the minor channel it gets cut outright (`magenta` 255 -> 38, `cyan` 255 -> 98).
+/// Where blue is already the dominant channel and pinned at max, the same
+/// reduction has to be expressed by raising the others instead (`azure` green
+/// 128 -> 255, `indigo` red 64 -> 187) — which is why those look like they follow
+/// a different rule. They don't.
 ///
-/// The through-line is that this card renders the mixing channel much further
-/// from the dominant one than the strip does, so intermediate hues collapse
-/// toward the nearest primary unless the minor channel is exaggerated. Nominal
-/// `#FFFFFF` reads as sky blue, close to `azure`, for the same reason.
+/// Nominal `#FFFFFF` reading as sky blue is the same effect at its most obvious.
 ///
 /// Pure primaries (`red`, `green`, `blue`) need no entry: one channel at max and
-/// nothing to rebalance.
+/// no ratio to correct.
 ///
 /// Deliberately sparse: only presets actually dialled in by eye on the GPU belong
 /// here. Anything absent falls back to the shared value in PRESETS above, so this
@@ -121,6 +121,11 @@ const GPU_PRESETS: &[(&str, (u8, u8, u8))] = &[
     ("azure", (0x00, 0xFF, 0xB6)),      // 0080FF
     ("cobalt", (0x00, 0xC0, 0xFF)),     // 0040FF
     ("indigo", (0xBB, 0x00, 0xFF)),     // 4000FF
+    ("purple", (0xFF, 0x00, 0x7F)),     // 8000FF
+    ("violet", (0xFF, 0x00, 0x62)),     // BF00FF
+    ("magenta", (0xFF, 0x00, 0x26)),    // FF00FF
+    ("hotpink", (0xFF, 0x00, 0x11)),    // FF0080
+    ("pink", (0xE7, 0x1F, 0x18)),       // D52A66
 ];
 
 /// A color on its way to a device.

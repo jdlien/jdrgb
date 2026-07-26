@@ -85,32 +85,43 @@ green  seagreen  teal  cyan  azure  cobalt  blue  indigo  purple  violet  magent
 The GPU renders colors quite differently from the strip — the same nominal value
 can look nothing alike on the two.
 
-There's no single correction rule — the fix goes in **both directions** depending
-on where you are on the color wheel:
+One pattern holds across every entry: **this card's blue is far stronger than the
+strip's**, so every calibration lowers blue relative to the other channels.
+Nothing else is consistent — green against red moves both ways, and only slightly.
 
-| preset | strip | GPU | what moved |
-|---|---|---|---|
-| `coolwhite` | `#FFB0D0` | `#C79E38` | blue down hard |
-| `warmwhite` | `#FA9536` | `#FF8512` | green + blue down |
-| `orange` | `#FF3A00` | `#FF2000` | green down |
-| `amber` | `#FF8700` | `#FF5400` | green down |
-| `yellow` | `#FFD000` | `#FF8C00` | green down |
-| `chartreuse` | `#D4FF00` | `#FFC000` | red **up** |
-| `lime` | `#80FF00` | `#DEFF00` | red **up** a lot |
-| `seagreen` | `#00FF51` | `#00FF15` | blue down |
-| `teal` | `#00FF80` | `#00FF2F` | blue down |
-| `cyan` | `#00FFFF` | `#00FF62` | blue down hard |
-| `azure` | `#0080FF` | `#00FFB6` | green **up** a lot |
-| `cobalt` | `#0040FF` | `#00C0FF` | green **up** a lot |
-| `indigo` | `#4000FF` | `#BB00FF` | red **up** a lot |
+| preset | strip | GPU |
+|---|---|---|
+| `coolwhite` | `#FFB0D0` | `#C79E38` |
+| `warmwhite` | `#FA9536` | `#FF8512` |
+| `orange` | `#FF3A00` | `#FF2000` |
+| `amber` | `#FF8700` | `#FF5400` |
+| `yellow` | `#FFD000` | `#FF8C00` |
+| `chartreuse` | `#D4FF00` | `#FFC000` |
+| `lime` | `#80FF00` | `#DEFF00` |
+| `seagreen` | `#00FF51` | `#00FF15` |
+| `teal` | `#00FF80` | `#00FF2F` |
+| `cyan` | `#00FFFF` | `#00FF62` |
+| `azure` | `#0080FF` | `#00FFB6` |
+| `cobalt` | `#0040FF` | `#00C0FF` |
+| `indigo` | `#4000FF` | `#BB00FF` |
+| `purple` | `#8000FF` | `#FF007F` |
+| `violet` | `#BF00FF` | `#FF0062` |
+| `magenta` | `#FF00FF` | `#FF0026` |
+| `hotpink` | `#FF0080` | `#FF0011` |
+| `pink` | `#D52A66` | `#E71F18` |
 
-The through-line is that this card renders the mixing channel much further from
-the dominant one than the strip does, so intermediate hues collapse toward the
-nearest primary unless the minor channel is exaggerated. Nominal `#FFFFFF` reads
-as sky blue for the same reason.
+That one effect explains corrections that look opposite. Where blue is the minor
+channel it gets cut outright (`magenta` 255 → 38). Where blue is already dominant
+and pinned at max, the same reduction has to be expressed by raising the others
+instead (`azure` green 128 → 255, `indigo` red 64 → 187). Same rule, different
+arithmetic.
+
+The whites diverge most because they carry all three channels, so the blue excess
+has nowhere to hide. Nominal `#FFFFFF` reading as sky blue is the same effect at
+its most obvious — which is why `white` is left uncalibrated as a reference.
 
 Pure primaries (`red`, `green`, `blue`) need no entry — one channel at max, with
-nothing to rebalance.
+no ratio to correct.
 
 So a **preset name resolves per device**, while an **explicit hex is always
 literal**. That split is what keeps `tune` honest: the hex it prints reproduces
