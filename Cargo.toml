@@ -2,11 +2,15 @@
 name = "jdrgb"
 version = "0.1.0"
 edition = "2021"
-description = "Minimal one-shot static-color setter for the ASUS Aura USB LED controller (0B05:19AF)"
+description = "Minimal one-shot static-color setter for the ASUS Aura USB LED controller (0B05:19AF) and ASUS GPU ENE controller"
 
 [dependencies]
 hidapi = "2"
-windows-sys = { version = "0.61", features = ["Win32_System_Console", "Win32_Foundation"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader", # LoadLibraryA/GetProcAddress for nvapi64.dll
+    "Win32_Foundation",
+] }
 
 [profile.release]
 opt-level = "z"     # optimize for size

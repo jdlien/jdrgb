@@ -12,17 +12,31 @@
   Where to place the binary. Defaults to "C:\Program Files\jdrgb".
 .PARAMETER NoWake
   Skip the resume-from-sleep trigger (register the startup trigger only).
+.PARAMETER Gpu
+  Set the GPU LEDs instead of the motherboard strip.
+.PARAMETER All
+  Set both the motherboard strip and the GPU LEDs.
 #>
 [CmdletBinding()]
 param(
     [string]$Color = "",
     [string]$Config = "",
     [string]$InstallDir = "$env:ProgramFiles\jdrgb",
-    [switch]$NoWake
+    [switch]$NoWake,
+    [switch]$Gpu,
+    [switch]$All
 )
 
 $ErrorActionPreference = "Stop"
 $TaskName = "jdrgb"
+
+# --- Reject combinations that would install a permanently failing task -------
+if ($Gpu -and $All) {
+    throw "-Gpu and -All are mutually exclusive."
+}
+if ($Config -and ($Gpu -or $All)) {
+    throw "-Config is motherboard-only (per-LED patterns need the addressable strip); drop -Gpu/-All."
+}
 
 # --- Self-elevate if not running as Administrator ---------------------------
 $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -33,6 +47,8 @@ if (-not $admin) {
     if ($Color)  { $argList += @("-Color", $Color) }
     if ($Config) { $argList += @("-Config", "`"$Config`"") }
     if ($NoWake) { $argList += "-NoWake" }
+    if ($Gpu)    { $argList += "-Gpu" }
+    if ($All)    { $argList += "-All" }
     if ($PSBoundParameters.ContainsKey("InstallDir")) { $argList += @("-InstallDir", "`"$InstallDir`"") }
     Start-Process -FilePath (Get-Process -Id $PID).Path -Verb RunAs -ArgumentList $argList
     return
@@ -54,7 +70,8 @@ try {
     Write-Host "Installed binary: $target"
 
     # Task components. A config file wins over a single color.
-    $taskArgs = "--wait"
+    $targetFlag = if ($Gpu) { " --gpu" } elseif ($All) { " --all" } else { "" }
+    $taskArgs = "--wait$targetFlag"
     if ($Config) {
         if (-not (Test-Path $Config)) { throw "config file not found: $Config" }
         $confTarget = Join-Path $InstallDir "leds.conf"
@@ -62,7 +79,7 @@ try {
         Write-Host "Installed config: $confTarget"
         $taskArgs = "load `"$confTarget`" --wait"
     } elseif ($Color) {
-        $taskArgs = "$Color --wait"
+        $taskArgs = "$Color --wait$targetFlag"
     }
     $action    = New-ScheduledTaskAction -Execute $target -Argument $taskArgs
     $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
@@ -107,8 +124,9 @@ try {
     Start-Sleep -Milliseconds 500
     $info = Get-ScheduledTaskInfo -TaskName $TaskName
     Write-Host ("Ran once: LastTaskResult=0x{0:X8}" -f $info.LastTaskResult)
-    $what = if ($Config) { "config '$confTarget'" } elseif ($Color) { "color '$Color'" } else { "warm-white preset" }
-    Write-Host "SUCCESS. The $what will be set on every boot."
+    $what = if ($Config) { "config '$confTarget'" } elseif ($Color) { "color '$Color'" } else { "default preset" }
+    $where = if ($Gpu) { "the GPU" } elseif ($All) { "the motherboard strip and the GPU" } else { "the motherboard strip" }
+    Write-Host "SUCCESS. The $what will be set on $where on every boot."
 }
 catch {
     Write-Host ""
