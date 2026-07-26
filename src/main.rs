@@ -60,6 +60,10 @@ const PRESETS: &[(&str, (u8, u8, u8))] = &[
     // Nominal white, deliberately left untuned as a reference point: it reads
     // greenish on the strip and sky-blue on the GPU. Use coolwhite for a real white.
     ("white", (0xFF, 0xFF, 0xFF)),
+    // Static black. Not the same as `off`, which selects the controller's own
+    // off mode; this is "display black". Handy in a theme when you want one
+    // device dark and the other lit.
+    ("black", (0x00, 0x00, 0x00)),
     ("red", (0xFF, 0x00, 0x00)),
     ("orange", (0xFF, 0x3A, 0x00)),
     ("amber", (0xFF, 0x87, 0x00)),
@@ -376,30 +380,9 @@ fn with_retry<T, E: Retryable>(wait: bool, mut f: impl FnMut() -> Result<T, E>) 
     Err(last)
 }
 
-fn transient(msg: impl Into<String>) -> gpu::Error {
-    gpu::Error { msg: msg.into(), permanent: false }
-}
-
 // ---------------------------------------------------------------------------
 // Multi-target dispatch
 // ---------------------------------------------------------------------------
-
-/// Confirm every requested target is present and usable. Strictly read-only —
-/// this is phase 1 of the two-phase apply below.
-fn check_targets(target: Target) -> Result<(), gpu::Error> {
-    if target.mb() {
-        let api = HidApi::new().map_err(|e| transient(format!("hidapi init failed: {e}")))?;
-        let dev = open(&api).map_err(transient)?;
-        let cfg = read_config(&dev).ok_or_else(|| transient("could not read config table"))?;
-        if header_count(&cfg) == 0 {
-            return Err(transient("config table reported no addressable headers"));
-        }
-    }
-    if target.gpu() {
-        gpu::detect()?.prepare()?;
-    }
-    Ok(())
-}
 
 /// Set a solid color on every requested target.
 ///
@@ -408,25 +391,73 @@ fn check_targets(target: Target) -> Result<(), gpu::Error> {
 /// re-issue the motherboard's flash commit on every attempt while waiting for
 /// the GPU to come up — hammering flash that has finite write cycles.
 fn set_solid_targets(target: Target, wait: bool, mode: u8, paint: Paint) -> Result<(), String> {
-    with_retry(wait, || check_targets(target))?;
-
     // Label each line only when there's more than one device to tell apart, so
     // plain `jdrgb warmwhite` prints exactly what it always has.
     let labelled = target == Target::All;
+    let tries = if wait { 120 } else { 1 };
 
-    if target.mb() {
-        let color = paint.rgb(false);
-        set_solid(mode, color)?;
-        report(labelled.then_some("mb"), mode, color);
+    // Each target is applied the moment *it* is ready and then marked done, so a
+    // device that never appears can't hold up one that's sitting there working.
+    // Marking done on success is also what stops the retry loop from re-issuing
+    // the motherboard's flash commit while it waits on the GPU.
+    let mut mb_ok = !target.mb(); // nothing to do counts as done
+    let mut gpu_ok = !target.gpu();
+    let mut gpu_hopeless = false;
+    let (mut mb_err, mut gpu_err) = (String::new(), String::new());
+
+    for attempt in 0..tries {
+        if !mb_ok {
+            let color = paint.rgb(false);
+            match set_solid(mode, color) {
+                Ok(()) => {
+                    report(labelled.then_some("mb"), mode, color);
+                    mb_ok = true;
+                }
+                Err(e) => mb_err = e,
+            }
+        }
+        if !gpu_ok && !gpu_hopeless {
+            let color = paint.rgb(true);
+            match apply_gpu_solid(mode, color) {
+                Ok(()) => {
+                    report(labelled.then_some("gpu"), mode, color);
+                    gpu_ok = true;
+                }
+                Err(e) => {
+                    // Wrong card or a bad signature will never come right, so
+                    // don't spend the rest of the timeout on it.
+                    gpu_hopeless = e.permanent;
+                    gpu_err = e.msg;
+                }
+            }
+        }
+        if mb_ok && (gpu_ok || gpu_hopeless) {
+            break;
+        }
+        if attempt + 1 < tries {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
     }
-    if target.gpu() {
-        let color = paint.rgb(true);
-        let mut card = gpu::detect().map_err(|e| e.msg)?;
-        card.prepare().map_err(|e| e.msg)?;
-        card.apply_solid(mode, color).map_err(|e| e.msg)?;
-        report(labelled.then_some("gpu"), mode, color);
+
+    let mut failures = Vec::new();
+    if !mb_ok {
+        failures.push(format!("mb: {mb_err}"));
     }
-    Ok(())
+    if !gpu_ok {
+        failures.push(format!("gpu: {gpu_err}"));
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+/// Discover, validate, and write the GPU exactly once.
+fn apply_gpu_solid(mode: u8, color: (u8, u8, u8)) -> Result<(), gpu::Error> {
+    let mut card = gpu::detect()?;
+    card.prepare()?;
+    card.apply_solid(mode, color)
 }
 
 fn report(label: Option<&str>, mode: u8, (r, g, b): (u8, u8, u8)) {
@@ -644,8 +675,12 @@ fn set_from_config(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Parse a config file: one `RRGGBB` per line, line N = LED N. `#` starts a
-/// comment; blank lines are skipped.
+/// Parse a config file: one `RRGGBB` hex or preset name per line, line N = LED N.
+/// `#` starts a comment; blank lines are skipped.
+///
+/// Preset names resolve against the strip, since per-LED patterns are
+/// motherboard-only. `black` is the useful one here — it's how you light just
+/// part of the strip and leave the rest dark.
 fn read_led_config(path: &str) -> Result<Vec<(u8, u8, u8)>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
     let mut colors = Vec::new();
@@ -654,7 +689,9 @@ fn read_led_config(path: &str) -> Result<Vec<(u8, u8, u8)>, String> {
         if line.is_empty() {
             continue;
         }
-        let color = parse_hex(line).ok_or_else(|| format!("{path}:{}: invalid color '{line}'", n + 1))?;
+        let color = parse_paint(line)
+            .map(|p| p.rgb(false))
+            .ok_or_else(|| format!("{path}:{}: invalid color or preset '{line}'", n + 1))?;
         colors.push(color);
     }
     if colors.is_empty() {
@@ -667,7 +704,9 @@ fn read_led_config(path: &str) -> Result<Vec<(u8, u8, u8)>, String> {
 fn write_template(path: &str) -> Result<(), String> {
     let (r, g, b) = DEFAULT_COLOR;
     let mut out = String::from(
-        "# jdrgb per-LED config: one RRGGBB hex color per line, top = LED 0.\n\
+        "# jdrgb per-LED config: one color per line, top = LED 0.\n\
+         # Each line is an RRGGBB hex value or a preset name (see `jdrgb presets`).\n\
+         # Use `black` to leave an LED dark and light only part of the strip.\n\
          # '#' starts a comment; blank lines are ignored.\n\n",
     );
     for i in 0..STRIP_LEDS {
@@ -1115,6 +1154,18 @@ fn probe_gpu() -> Result<(), String> {
     card.read_identity().map_err(|e| e.msg)?;
     println!("  ENE firmware:   {:?}", card.ene_name);
     println!("  LED count:      {} (config table offset 0x03)", card.raw_led_count);
+
+    if let Ok((mode, direct)) = card.mode_state() {
+        let name = match mode {
+            0 => "off",
+            1 => "static",
+            2 => "breathing",
+            3 => "flashing",
+            4 => "spectrum cycle",
+            _ => "other",
+        };
+        println!("  mode:           {mode} ({name})   direct flag: {direct}");
+    }
     println!("  config table:");
     for (row, chunk) in card.config_table().chunks(16).enumerate() {
         let bytes: Vec<String> = chunk.iter().map(|b| format!("{b:02X}")).collect();
