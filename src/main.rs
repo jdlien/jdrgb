@@ -1243,6 +1243,12 @@ fn probe_gpu() -> Result<(), String> {
         };
         println!("  mode:           {mode} ({name})   direct flag: {direct}");
     }
+
+    if let Ok(colors) = card.effect_colors() {
+        let hex: Vec<String> =
+            colors.iter().map(|&(r, g, b)| format!("#{r:02X}{g:02X}{b:02X}")).collect();
+        println!("  current color:  {}", hex.join(" "));
+    }
     println!("  config table:");
     for (row, chunk) in card.config_table().chunks(16).enumerate() {
         let bytes: Vec<String> = chunk.iter().map(|b| format!("{b:02X}")).collect();

@@ -387,6 +387,21 @@ impl Gpu {
         Ok((self.ene_read(REG_MODE)?, self.ene_read(REG_DIRECT)?))
     }
 
+    /// Read back the colors currently in the effect bank — what the LEDs are
+    /// actually showing, straight from the chip rather than from what we think
+    /// we last sent. Same R, B, G byte order as the write path.
+    pub fn effect_colors(&self) -> Result<Vec<(u8, u8, u8)>> {
+        let mut out = Vec::new();
+        for led in 0..self.raw_led_count as usize {
+            let base = REG_COLORS_EFFECT_V2 + (led * 3) as u16;
+            let r = self.ene_read(base)?;
+            let b = self.ene_read(base + 1)?;
+            let g = self.ene_read(base + 2)?;
+            out.push((r, g, b));
+        }
+        Ok(out)
+    }
+
     /// Paint every LED one color in static mode.
     pub fn apply_solid(&self, mode: u8, color: (u8, u8, u8)) -> Result<()> {
         self.apply_colors(mode, &[color])
