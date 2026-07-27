@@ -34,9 +34,9 @@ $TaskName = "jdrgb"
 if ($Gpu -and $All) {
     throw "-Gpu and -All are mutually exclusive."
 }
-if ($Config -and ($Gpu -or $All)) {
-    throw "-Config is motherboard-only (per-LED patterns need the addressable strip); drop -Gpu/-All."
-}
+# -Config combined with -Gpu/-All is fine: a config can carry a `gpu:` line, so
+# one file describes the whole machine. If it has no `gpu:` line, jdrgb says so
+# rather than failing silently.
 
 # --- Self-elevate if not running as Administrator ---------------------------
 $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -77,7 +77,7 @@ try {
         $confTarget = Join-Path $InstallDir "leds.conf"
         Copy-Item -Path $Config -Destination $confTarget -Force
         Write-Host "Installed config: $confTarget"
-        $taskArgs = "load `"$confTarget`" --wait"
+        $taskArgs = "load `"$confTarget`" --wait$targetFlag"
     } elseif ($Color) {
         $taskArgs = "$Color --wait$targetFlag"
     }
