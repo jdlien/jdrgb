@@ -398,13 +398,23 @@ impl Gpu {
     ///
     /// Fewer colors than LEDs cycle to fill; more are ignored.
     ///
-    /// Verified by photograph on the TUF 5090: the four LEDs light the left tick
-    /// marks, the left half of the TUF logo, the right of the logo plus the right
-    /// ticks, and the five dots along the bottom. The zones are distinguishable
-    /// but bleed into each other badly through the shared diffuser — sending pure
-    /// `FF0000` renders pink and pure `00FF00` renders teal, despite neither
-    /// having any blue. Saturated per-LED patterns go muddy; soft gradients
-    /// between neighbouring hues are what this actually looks good doing.
+    /// Photographed on the TUF 5090 with red/green/blue/white on LEDs 0-3. The
+    /// shroud does show four distinguishable regions, but they are *not* four
+    /// isolated zones: the TUF logo rendered a smooth green-to-blue gradient
+    /// rather than two flat halves, and both left tick marks took one color while
+    /// both right ticks took another. That reads as four point sources behind one
+    /// continuous light guide, each feature picking up whichever lamp is nearest,
+    /// rather than a per-feature mapping.
+    ///
+    /// Which lamp sits where is not established — inferring it would need one LED
+    /// lit at a time. The LEDs are not on the main PCB (a back-side teardown shows
+    /// only status LEDs and what looks like the harness header), so the layout
+    /// can't be read off the board either.
+    ///
+    /// The bleed is severe: pure `FF0000` renders pink and pure `00FF00` renders
+    /// teal, despite neither having any blue in it. Saturated per-LED patterns go
+    /// muddy; soft gradients between neighbouring hues are what this actually
+    /// looks good doing, the blending working in your favour.
     ///
     /// The final two writes are not optional: a stale "direct" flag overrides the
     /// effect mode entirely, so the colors would land but never show.

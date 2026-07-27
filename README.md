@@ -164,14 +164,16 @@ the build instead of silently doing nothing.
 
 ### GPU zones
 
-The card has four LEDs and they *are* individually addressable, lighting the left
-tick marks, the left half of the TUF logo, the right of the logo plus the right
-ticks, and the five dots along the bottom.
+The card has four LEDs and they *are* individually addressable — driving
+red/green/blue/white produces four distinguishable regions across the shroud.
 
-They bleed into each other badly, though. Sending pure `#FF0000` renders pink and
-pure `#00FF00` renders teal — neither has any blue in it — because the zones share
-a diffuser and this card's blue dominates anything it touches. Saturated per-LED
-patterns come out muddy.
+They're not isolated zones, though. The TUF logo renders a smooth green-to-blue
+*gradient* rather than two flat halves, and both left tick marks take one color
+while both right ticks take another. That looks like four point sources behind one
+continuous light guide, each feature picking up whichever lamp is nearest.
+
+The bleed is severe: pure `#FF0000` renders pink and pure `#00FF00` renders teal,
+neither having any blue in it. Saturated per-LED patterns come out muddy.
 
 Soft gradients between neighbouring hues are what it's actually good at, since the
 blending works in your favour:
