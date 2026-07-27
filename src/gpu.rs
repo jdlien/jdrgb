@@ -459,6 +459,13 @@ impl Gpu {
 
     /// Commit whatever is currently live to the controller's flash.
     ///
+    /// Confirmed working on this card: after a full shutdown with the plug
+    /// pulled, it came back holding the saved color with no boot task installed
+    /// and no vendor software present. Worth recording, because the common claim
+    /// is that ASUS GPUs always revert to their firmware rainbow on power loss —
+    /// this one doesn't, so Armoury Crate reasserting it every boot was never
+    /// necessary.
+    ///
     /// Deliberately separate from `apply_solid` and never called automatically:
     /// flash has finite write cycles, so this belongs in a deliberate one-shot
     /// command, not in anything that runs at boot.

@@ -221,18 +221,35 @@ program exits.
 
 ### GPU persistence
 
-The GPU is different. Its ENE controller applies a color to volatile registers,
-so it reverts to the firmware's rainbow when the card loses power — which is why
-Armoury Crate had to reassert it at every boot. The boot task below does the same
-job without the bloat.
+**The GPU's flash save works.** This was the open question for most of the build —
+the widely repeated claim is that ASUS GPUs revert to their firmware rainbow on
+power loss, and `jdrgb --gpu save` was written expecting to find out it didn't
+stick. It does: after a full shutdown with the plug pulled, the card came back
+warm white with no boot task installed and no vendor software present.
 
-The controller *does* have a save-to-flash command, exposed as `jdrgb --gpu save`.
-It's deliberately a separate, manual command and is never part of the boot task:
-flash has finite write cycles, so committing on every startup would be a bad
-trade. Run it once by hand, then test with a full power-off at the PSU — a warm
-reboot may not drop power to the slot.
+So Armoury Crate reasserting the color at every boot was never necessary. One
+`save` covers it, including during POST and in the BIOS, where nothing is running
+to set anything.
 
-## Run at boot (no login required)
+```powershell
+jdrgb --gpu warmwhite     # set what you want
+jdrgb --gpu save          # commit it to the controller's flash
+```
+
+`save` is deliberately a separate, manual command and is never part of the boot
+task: flash has finite write cycles, so committing on every startup would be a bad
+trade for something you change once a year. Re-run it whenever you change the
+color, or flash keeps serving the old one at POST.
+
+Verify what's actually stored with `jdrgb --gpu probe`, which reads the color back
+off the chip rather than reporting what jdrgb last sent.
+
+The motherboard behaves the same way — jdrgb commits to the Aura controller's
+flash on every solid set. **Which means neither device needs the boot task below**
+for ordinary use. It's there as insurance for the cases that clear the
+controllers: a BIOS update, a CMOS reset, or reinstalling vendor software.
+
+## Run at boot (optional — see GPU persistence above)
 
 `install.ps1` registers a Scheduled Task that runs as the `SYSTEM` account — so
 the color is set during boot, before anyone logs in. It copies the binary to
