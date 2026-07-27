@@ -224,8 +224,16 @@ program exits.
 **The GPU's flash save works.** This was the open question for most of the build —
 the widely repeated claim is that ASUS GPUs revert to their firmware rainbow on
 power loss, and `jdrgb --gpu save` was written expecting to find out it didn't
-stick. It does: after a full shutdown with the plug pulled, the card came back
-warm white with no boot task installed and no vendor software present.
+stick.
+
+Tested properly: set the card to green *without* saving, so flash held warm white
+while the live registers held green. Then a full shutdown with the PSU switched
+off for 30 seconds. It came back warm white — instantly, before POST completed,
+with no boot task installed and no vendor software present. The green was gone, so
+power really was lost; the warm white came from flash.
+
+That also shows setting and saving are cleanly independent: preview as much as you
+like, and only commit when you mean it.
 
 So Armoury Crate reasserting the color at every boot was never necessary. One
 `save` covers it, including during POST and in the BIOS, where nothing is running

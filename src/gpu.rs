@@ -459,12 +459,16 @@ impl Gpu {
 
     /// Commit whatever is currently live to the controller's flash.
     ///
-    /// Confirmed working on this card: after a full shutdown with the plug
-    /// pulled, it came back holding the saved color with no boot task installed
-    /// and no vendor software present. Worth recording, because the common claim
-    /// is that ASUS GPUs always revert to their firmware rainbow on power loss —
-    /// this one doesn't, so Armoury Crate reasserting it every boot was never
-    /// necessary.
+    /// Confirmed working on this card, by a test designed to rule out the card
+    /// simply never losing power: the LEDs were set to green *without* saving, so
+    /// flash held warm white while the live registers held green. After a full
+    /// shutdown with the PSU switched off for 30 seconds it came back warm white,
+    /// with no boot task installed and no vendor software present. The green was
+    /// gone, so power really was lost; the warm white came from flash.
+    ///
+    /// Worth recording, because the common claim is that ASUS GPUs always revert
+    /// to their firmware rainbow on power loss — this one doesn't, so Armoury
+    /// Crate reasserting it every boot was never necessary.
     ///
     /// Deliberately separate from `apply_solid` and never called automatically:
     /// flash has finite write cycles, so this belongs in a deliberate one-shot
