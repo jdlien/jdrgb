@@ -41,7 +41,7 @@ jdrgb presets         list the named color presets
 jdrgb load [file]     per-LED colors from a config file (default leds.conf)
 jdrgb template [file] write a starter config, one line per LED
 jdrgb rainbow [n]     per-LED rainbow across n LEDs (default 38, white end-caps)
-jdrgb tune [color]    dial in a color live (preset/hex, or the last-set color)
+jdrgb tune [color]    dial in a color live (preset/hex, or that device's last)
 jdrgb preview         slideshow all presets (+/- speed, n/N next/prev, s stop, q quit)
 jdrgb probe           show firmware + config table (diagnostics)
 jdrgb --gpu save      commit the GPU's current color to its flash
@@ -107,8 +107,8 @@ Nothing else is consistent — green against red moves both ways, and only sligh
 
 | preset | strip | GPU |
 |---|---|---|
-| `coolwhite` | `#FFB0D0` | `#C79E38` |
-| `warmwhite` | `#FA9536` | `#FF8512` |
+| `coolwhite` | `#FFB0D0` | `#D29432` |
+| `warmwhite` | `#FA9536` | `#FF560A` |
 | `orange` | `#FF3A00` | `#FF2000` |
 | `amber` | `#FF8700` | `#FF5400` |
 | `yellow` | `#FFD000` | `#FF8C00` |
@@ -119,9 +119,9 @@ Nothing else is consistent — green against red moves both ways, and only sligh
 | `cyan` | `#00FFFF` | `#00FF62` |
 | `azure` | `#0080FF` | `#00FFB6` |
 | `cobalt` | `#0040FF` | `#00C0FF` |
-| `indigo` | `#4000FF` | `#BB00FF` |
-| `purple` | `#8000FF` | `#FF007F` |
-| `violet` | `#BF00FF` | `#FF0062` |
+| `indigo` | `#2700FF` | `#BB00FF` |
+| `purple` | `#4000FF` | `#FF007F` |
+| `violet` | `#6E00FF` | `#FF0062` |
 | `magenta` | `#FF00FF` | `#FF0026` |
 | `hotpink` | `#FF0080` | `#FF0011` |
 | `pink` | `#D52A66` | `#E71F18` |
@@ -129,7 +129,7 @@ Nothing else is consistent — green against red moves both ways, and only sligh
 That one effect explains corrections that look opposite. Where blue is the minor
 channel it gets cut outright (`magenta` 255 → 38). Where blue is already dominant
 and pinned at max, the same reduction has to be expressed by raising the others
-instead (`azure` green 128 → 255, `indigo` red 64 → 187). Same rule, different
+instead (`azure` green 128 → 255, `indigo` red 39 → 187). Same rule, different
 arithmetic.
 
 The whites diverge most because they carry all three channels, so the blue excess
@@ -144,7 +144,7 @@ literal**. That split is what keeps `tune` honest: the hex it prints reproduces
 exactly what you were looking at, on whichever device you were looking at.
 
 ```powershell
-jdrgb --all warmwhite   # strip #FA9536, GPU #FF8512 — same look, different values
+jdrgb --all warmwhite   # strip #FA9536, GPU #FF560A — same look, different values
 jdrgb --gpu FA9536      # literal: no substitution
 ```
 
@@ -202,14 +202,28 @@ it's dialed in.
 
 ### Tuning a color
 
-`jdrgb tune [color]` steps a color live on the strip in HSL — `h`/`s`/`l` nudge
-each channel down, `H`/`S`/`L` up (hold a key to ramp). It shows the current HSL,
-RGB, and hex in a compact status line (cyan keys, yellow labels, bold-white
-values, plus a live swatch), and `q` quits keeping the color and printing its
-hex. Live steps skip the flash-save; the final pick is committed. With no
-argument it starts from the last solid color set (remembered in a small state
-file under `%LOCALAPPDATA%\jdrgb`), or the default if the strip was left
-multi-colored by `rainbow`/`load`.
+`jdrgb tune [color]` steps a color live in HSL — `h`/`s`/`l` nudge each channel
+down, `H`/`S`/`L` up (hold a key to ramp). It shows the current HSL, RGB, and hex
+in a compact status line (cyan keys, yellow labels, bold-white values, plus a
+live swatch), and `q` quits keeping the color and printing its hex. Live steps
+skip the flash-save; the final pick is committed. With no argument it starts from
+the last solid color set, or the default if that device was left multi-colored by
+`rainbow`/`load`.
+
+The last-set color is remembered per device in a small state file under
+`%LOCALAPPDATA%\jdrgb`, with a separate slot for the strip and the GPU:
+
+```
+mb=FFB0D0
+gpu=D29432
+```
+
+The split matters because the same look is a *different* RGB on each (see the
+calibration table above). A shared slot would hand `jdrgb --gpu tune` the strip's
+value, which on the card doesn't render as anything like what was on screen. So
+`--gpu tune` resumes the GPU's last color and `jdrgb tune` the strip's, and each
+falls back to its own calibrated `coolwhite` when nothing has been recorded.
+Under `--all`, `preview` writes each device the value that device actually got.
 
 To change the built-in default, edit `DEFAULT_COLOR` in `src/main.rs`.
 
