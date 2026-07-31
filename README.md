@@ -81,7 +81,7 @@ warm tone.
 ```
 coolwhite  warmwhite  white  black  red  vermilion  orange  amber  yellow
 chartreuse  lime  green  seagreen  teal  turquoise  cyan  sky  azure  cobalt
-blue  indigo  purple  violet  magenta  cerise  hotpink  rose  pink
+sapphire  blue  indigo  purple  violet  magenta  cerise  hotpink  rose  pink
 ```
 
 #### `black` vs `off`
@@ -126,6 +126,7 @@ Nothing else is consistent — green against red moves both ways, and only sligh
 | `sky` | `#00BFFF` | `#00FF8C` | *interp* |
 | `azure` | `#0080FF` | `#00FFB6` |
 | `cobalt` | `#0040FF` | `#00C0FF` |
+| `sapphire` | `#0020FF` | `#0060FF` | *interp* |
 | `indigo` | `#2700FF` | `#BB00FF` |
 | `purple` | `#4000FF` | `#FF007F` |
 | `violet` | `#6E00FF` | `#FF0062` |
@@ -164,7 +165,7 @@ looked at. `jdrgb presets` marks the calibrated ones with a `gpu` column.
 
 #### Interpolated presets
 
-Five entries are marked *interp*. They were not dialled in by eye — they were
+Six entries are marked *interp*. They were not dialled in by eye — they were
 derived from the ones that were.
 
 Each calibrated pair is a record of two values you judged to *look alike*, so the
@@ -173,18 +174,38 @@ well-behaved: monotonic across all 18 originally-tuned pairs, and purely a matte
 of hue, since every saturated value in both tables sits at full saturation. That
 makes it something you can interpolate through rather than guess at.
 
-The five fill the widest gaps in the wheel, taking the largest spacing from 30°
-down to 20° across 23 saturated hues. All were placed in stretches where the
-slope agrees between neighbouring samples. The volatile region is
-`blue -> indigo -> purple`, where the slope runs 3.0 → 7.8 → 0.6 over about 25° —
-interpolating there would be guesswork, but it's already the densest part of the
-wheel and needed nothing.
+They fill the widest gaps, taking the largest spacing from 30° down to 20° across
+24 saturated hues. Each sits where the slope agrees between neighbouring samples.
+The volatile region is `blue -> indigo -> purple`, where it runs 3.0 → 7.8 → 0.6
+over about 25° — interpolating there would be guesswork, but it's already the
+densest part of the wheel and needed nothing.
 
 The method only works on the full-saturation ring, which is where all the data
 lives. A darker or muted color — a proper crimson, say — sits off that ring
 entirely and would have to be tuned by eye on both devices.
 
 Confirm one in `preview`, then drop its `interp` marker; re-tune it if it's off.
+
+##### What the gap numbers assume
+
+`sapphire` is there because `cobalt -> blue` looked visibly wide while measuring
+as an ordinary 15° step — the smallest class of gap left. The measurement was
+wrong, in a way worth recording.
+
+Gap analysis reads each preset's appearance from `SWATCH`, falling back to its
+wire value where no entry exists. That fallback is an assumption, not data:
+**untuned means unmeasured, not undistorted.** The tuned neighbours give it away.
+`indigo` sits at wire 249 to appear at 255 and `purple` at wire 255 to appear at
+270 — an appearance/wire slope of 1.6–2.5. The strip expands hue through that
+region, and the expansion doesn't begin abruptly at `blue`. At a slope near 1.6,
+`cobalt -> blue` is perceptually ~24°, the widest gap remaining.
+
+`cyan`, `azure` and `cobalt` are all untuned too, so the same assumption is
+load-bearing across that whole stretch, and `sky` and `turquoise` may be slightly
+misplaced for it. The fix isn't more presets — it's `jdrgb tune azure` (and
+`cobalt`, `blue`), recording what they actually look like in `SWATCH`. That would
+hand the interpolator real data exactly where the strip is least linear, instead
+of a straight line it assumed.
 
 #### The third table: what a preset looks like
 
