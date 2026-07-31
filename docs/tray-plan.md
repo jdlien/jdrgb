@@ -74,9 +74,14 @@ All measured on this machine, current source (see Appendix A for method):
   pure FFI declarations; unreferenced ones emit no code and create no imports.
 - **Startup: no change.** ~4.5 ms warm, which is essentially all Windows
   process creation. No new DLL imports for the CLI.
-- **Inlining: no change.** The release profile already has `lto = true` (fat)
-  and `codegen-units = 1`, so a module boundary costs nothing, and LTO
-  reachability drops tray-only code from `jdrgb.exe`.
+- **The crate split itself costs ~1.5 KB.** Measured after the fact: 246,272 →
+  247,808 bytes, +0.6%. Predicted to be free on the reasoning that `lto = true`
+  (fat) plus `codegen-units = 1` makes a crate boundary equivalent to a module
+  boundary. That reasoning was wrong, or at least incomplete. LTO *does* still
+  drop tray-only code — gating the new `preset_for_rgb` out of the build changed
+  nothing — so the delta is the boundary itself, not dead code riding along.
+  1,536 is exactly 3× the 512-byte PE file alignment, so the true code delta is
+  somewhere between 1 and 1,536 bytes.
 
 Real costs: `cargo build --release` links two binaries instead of one, and
 releases ship two exes.
@@ -125,7 +130,8 @@ above needs `pub`, including the `Last` variants. Nothing here is a behavior
 change; the existing unit tests (`src/main.rs:1762`) that cover these move with
 them.
 
-Verify: `cargo test` passes and `jdrgb.exe` is still 246,272 bytes.
+Verify: `cargo test` passes and `jdrgb.exe` stays within a few KB. *Done:* 29
+tests pass, binary is 247,808 bytes (+1,536 from the split — see above).
 
 ### Phase 2 — tray shell
 
@@ -371,7 +377,11 @@ Each is easy to add later and none is needed to make the thing useful.
 Measurements taken while writing this plan, on the current source:
 
 - **Feature cost is zero.** Baseline `jdrgb.exe` is 246,272 bytes. With all six
-  `windows-sys` features the tray needs added: 246,272 bytes, unchanged.
+  `windows-sys` features the tray needs added: 246,272 bytes, unchanged. This
+  covers the *features* only — it is not a measurement of the crate split, which
+  was predicted free and measured at +1,536 bytes. Two separate claims; only the
+  first was ever measured up front, and conflating them is how the wrong
+  prediction got stated with a measured number's confidence.
 - **The build is not bit-reproducible.** Three builds of unchanged source gave
   three distinct SHA-256 hashes at identical size (PE timestamp / debug GUID).
   Compare sizes, not hashes, when checking for bloat.

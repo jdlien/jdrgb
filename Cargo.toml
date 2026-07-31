@@ -4,6 +4,20 @@ version = "0.1.0"
 edition = "2021"
 description = "Minimal one-shot static-color setter for the ASUS Aura USB LED controller (0B05:19AF) and ASUS GPU ENE controller"
 
+[lib]
+name = "jdrgb"
+path = "src/lib.rs"
+
+# Two binaries because a PE has one subsystem: the CLI must be a console app,
+# the tray must not be, and they share the color tables via the lib above.
+[[bin]]
+name = "jdrgb"
+path = "src/main.rs"
+
+[[bin]]
+name = "jdrgb-tray"
+path = "src/tray/main.rs"
+
 [dependencies]
 hidapi = "2"
 windows-sys = { version = "0.61", features = [
