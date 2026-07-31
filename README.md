@@ -156,6 +156,35 @@ presets actually dialled in by eye on the GPU belong there; everything else fall
 back to the shared value, so the table never claims a calibration nobody has
 looked at. `jdrgb presets` marks the calibrated ones with a `gpu` column.
 
+#### The third table: what a preset looks like
+
+Tuned values are wrong on a *monitor* for the same reason they're right on the
+hardware. `coolwhite` is `#FFB0D0` because that renders as clean white on the
+strip — but drawn on screen it's pink. So a terminal swatch painted from the
+device value shows what jdrgb is **sending**, when the useful thing is what
+you'll **see**.
+
+`SWATCH` in `src/main.rs` is the third view: nominal sRGB, what the name means to
+your eye. `preview` uses it, so in this line —
+
+```
+[▓▓▓▓▓]  coolwhite  #FFB0D0   (1/23)   dwell 4.0s
+```
+
+— the block is a clean white while the hex stays `#FFB0D0`. They disagree on
+purpose: appearance on the left, wire value on the right.
+
+Unlike the other two tables it takes no device argument. Both calibrations exist
+to produce the *same* color, so appearance is the one property that doesn't vary
+by target. It's display-only and never reaches hardware, so a wrong value here is
+cosmetic — tune it against your monitor the way the device tables were tuned
+against the LEDs.
+
+`tune` keeps showing its literal value, since a hand-dialled hex has no intended
+appearance to look up — the number *is* the intent. Mapping arbitrary values to
+screen colors would need a real per-device profile, which is a lot of work for a
+swatch.
+
 To add one, tune it and paste the hex it prints:
 
 ```powershell

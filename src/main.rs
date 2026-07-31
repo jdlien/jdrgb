@@ -143,6 +143,52 @@ const GPU_PRESETS: &[(&str, (u8, u8, u8))] = &[
     ("pink", (0xE7, 0x1F, 0x18)),       // D52A66
 ];
 
+/// What each preset is *meant to look like*, for terminal swatches only.
+///
+/// PRESETS and GPU_PRESETS hold values tuned so the LEDs render correctly, which
+/// makes them wrong on a monitor — `coolwhite`'s #FFB0D0 draws as pink and
+/// `warmwhite`'s #FA9536 as orange. A swatch painted from those shows what we're
+/// *sending*, when the useful thing is what you'd *see*. That's backwards for a
+/// preview, whose whole job is to help you recognise a color before it lands.
+///
+/// So this is the third view of a preset: nominal sRGB, what the name denotes on
+/// a screen. Display only — it never reaches a device, so a wrong value here is
+/// a cosmetic bug and nothing more.
+///
+/// Deliberately sparse, like GPU_PRESETS: only names whose tuned value misleads
+/// on screen need an entry. Pure hues (`red`, `cyan`, `magenta`) already look
+/// like themselves. Note several entries match what PRESETS held before the
+/// strip was tuned by eye — the tuning moved the hardware value away from the
+/// nominal one, which is exactly the divergence this table records.
+///
+/// Adjust by eye against your monitor, the same way the device tables were
+/// adjusted against the hardware.
+const SWATCH: &[(&str, (u8, u8, u8))] = &[
+    ("coolwhite", (0xF5, 0xF8, 0xFF)), // a clean white, faintly cool
+    ("warmwhite", (0xFF, 0xD9, 0xB3)), // ~2700K warm white
+    ("orange", (0xFF, 0x7F, 0x00)),
+    ("amber", (0xFF, 0xBF, 0x00)),
+    ("yellow", (0xFF, 0xFF, 0x00)),
+    ("chartreuse", (0xAA, 0xFF, 0x00)),
+    ("lime", (0x55, 0xFF, 0x00)),
+    // The blue->magenta ramp, evenly spaced in hue as the names imply.
+    ("indigo", (0x40, 0x00, 0xFF)),
+    ("purple", (0x80, 0x00, 0xFF)),
+    ("violet", (0xBF, 0x00, 0xFF)),
+    ("pink", (0xFF, 0x9E, 0xB5)), // soft, not the saturated value the strip needs
+];
+
+/// The on-screen appearance of a preset, falling back to the strip's value for
+/// anything that already looks like itself.
+fn swatch_rgb(name: &str) -> (u8, u8, u8) {
+    SWATCH
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|&(_, rgb)| rgb)
+        .or_else(|| lookup_preset(name))
+        .unwrap_or(DEFAULT_COLOR)
+}
+
 /// A color on its way to a device.
 ///
 /// Preset names stay unresolved until the moment of writing, because the right
@@ -1290,13 +1336,19 @@ fn preview(target: Target) -> Result<(), String> {
     Ok(())
 }
 
-/// `focus_gpu` picks which device's calibration the swatch and hex show — the
-/// GPU only when it's the sole target, since that's the value being looked at.
+/// The swatch shows the preset's intended appearance and the hex shows the value
+/// actually being sent, so the two deliberately differ. `focus_gpu` picks which
+/// device's value the hex reports — the GPU only when it's the sole target.
+///
+/// The swatch takes no device argument on purpose: both calibrations exist to
+/// make the same color, so "what it looks like" is the one thing that doesn't
+/// vary by target.
 fn draw_preview(idx: usize, total: usize, dwell_ms: u64, paused: bool, pal: &Palette, focus_gpu: bool) {
     let name = PRESETS[idx].0;
     let (r, g, b) = Paint::Preset(name).rgb(focus_gpu);
     let swatch = if pal.enabled {
-        format!("[\x1b[48;2;{r};{g};{b}m     \x1b[0m]  ")
+        let (sr, sg, sb) = swatch_rgb(name);
+        format!("[\x1b[48;2;{sr};{sg};{sb}m     \x1b[0m]  ")
     } else {
         String::new()
     };
@@ -1715,6 +1767,30 @@ mod tests {
         let p = Paint::Literal((0xFA, 0x95, 0x36));
         assert_eq!(p.rgb(false), (0xFA, 0x95, 0x36));
         assert_eq!(p.rgb(true), (0xFA, 0x95, 0x36));
+    }
+
+    #[test]
+    fn every_swatch_names_a_real_preset() {
+        for &(name, _) in SWATCH {
+            assert!(lookup_preset(name).is_some(), "SWATCH has no matching preset: {name}");
+        }
+    }
+
+    #[test]
+    fn swatches_never_reach_a_device() {
+        // The appearance table is display-only. If a preset's swatch ever became
+        // its painted value, tuning the hardware would silently change what gets
+        // sent — so assert the two stay independent where they differ.
+        let p = Paint::Preset("coolwhite");
+        assert_ne!(swatch_rgb("coolwhite"), p.rgb(false));
+        assert_eq!(p.rgb(false), (0xFF, 0xB0, 0xD0));
+        assert_eq!(p.rgb(true), (0xD2, 0x94, 0x32));
+    }
+
+    #[test]
+    fn uncalibrated_swatch_falls_back_to_the_preset() {
+        // `red` needs no appearance entry — it already looks like itself.
+        assert_eq!(swatch_rgb("red"), (0xFF, 0x00, 0x00));
     }
 
     #[test]
