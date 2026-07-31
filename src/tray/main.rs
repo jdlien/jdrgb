@@ -77,7 +77,6 @@ const ID_EXIT: u32 = 4;
 const ID_TARGET_MB: u32 = 5;
 const ID_TARGET_GPU: u32 = 6;
 const ID_TARGET_ALL: u32 = 7;
-const ID_TARGET_CAPTION: u32 = 8;
 /// Preset *i* is `ID_PRESET_BASE + i`. Kept well clear of the fixed ids above.
 const ID_PRESET_BASE: u32 = 0x100;
 
@@ -663,10 +662,12 @@ unsafe fn show_menu(app: *mut App, x: i32, y: i32) {
         AppendMenuW(menu, MF_SEPARATOR, 0, core::ptr::null());
     }
 
-    // Three options don't earn a submenu either. The disabled caption is what
-    // stops "Strip / GPU / Both" reading as three more colours.
+    // Three options don't earn a submenu either, and they don't need a caption
+    // to say so: a radio mark in the gutter where the colours carry a swatch,
+    // Title Case where the colours are lowercase, and a separator between. A
+    // disabled "Target" label above them was greyed-out furniture saying what
+    // the items already said.
     unsafe {
-        add_item(menu, ID_TARGET_CAPTION, "Target", None, false);
         add_item(menu, ID_TARGET_MB, "Strip", None, true);
         add_item(menu, ID_TARGET_GPU, "GPU", None, true);
         add_item(menu, ID_TARGET_ALL, "Both", None, true);

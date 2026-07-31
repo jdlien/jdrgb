@@ -366,7 +366,8 @@ all 29 inline was too tall to be pleasant. A curated ten covers the common case
 at one click and leaves `All Colors` for everything else.
 
 ```
-  ● warmwhite            <- disabled status line, swatch + current color name
+  ● Strip: rose          <- one status row per device, each with its own
+  ● GPU: purple             swatch; enabled, and clicking re-sends that one
   ─────────────
   warmwhite              <- FAVOURITES, each with its swatch;
   coolwhite                 the current one is bold (SetMenuDefaultItem)
@@ -383,10 +384,9 @@ at one click and leaves `All Colors` for everything else.
   ─────────────
   ○ Off                  <- hollow ring, never a black disc
   ─────────────
-  Target                 <- disabled caption, so the three below don't
-  Strip                     read as three more colors
-  GPU
-  Both                   <- radio-marked
+  Strip                  <- radio-marked; no caption needed, since the mark
+  GPU                       sits where the colors carry a swatch and these
+  Both                      are Title Case where the colors are lowercase
   ─────────────
   Exit
 ```
