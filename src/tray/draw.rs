@@ -61,8 +61,8 @@ const RIM_LUMA_LO: f32 = 0.12;
 /// True when a fill is close enough to neutral, and far enough towards one end
 /// of the range, to disappear into a menu background.
 fn needs_rim(rgb: (u8, u8, u8)) -> bool {
-    let l = luma(rgb);
-    chroma(rgb) < RIM_MAX_CHROMA && (l > RIM_LUMA_HI || l < RIM_LUMA_LO)
+    let outside_the_safe_band = !(RIM_LUMA_LO..=RIM_LUMA_HI).contains(&luma(rgb));
+    chroma(rgb) < RIM_MAX_CHROMA && outside_the_safe_band
 }
 
 /// The rim colour for a given fill, or the fill itself where no rim is wanted —
@@ -342,8 +342,7 @@ mod tests {
                 for y in 0..DOT {
                     for x in 0..DOT {
                         let v = px[(y * DOT + x) as usize];
-                        let (a, r, g, b) =
-                            ((v >> 24) as u32, (v >> 16) as u8, (v >> 8) as u8, v as u8);
+                        let (a, r, g, b) = (v >> 24, (v >> 16) as u8, (v >> 8) as u8, v as u8);
                         let inv = 255 - a;
                         let d = (((cy + y) * w + cx + x) * 3) as usize;
                         // Source is premultiplied, so this is a plain over.

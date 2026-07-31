@@ -3,7 +3,10 @@
 A tiny, single-purpose CLI that sets the LEDs on an **ASUS ProArt X870E-CREATOR**
 motherboard and an **ASUS TUF RTX 5090** to a static color and exits. No driver,
 no daemon, no admin rights to run, nothing resident in memory. The release binary
-is ~160 KB and runs in tens of milliseconds.
+is ~240 KB and starts in about 5 ms.
+
+There is also an optional [tray menu](#the-tray-menu-optional) — a separate
+binary, so the CLI above stays exactly what it says it is.
 
 Built because all I want is "warm white, always" instead of the firmware's
 default pulsing rainbow — and OpenRGB, while it works, is far more than that
@@ -403,6 +406,44 @@ Remove everything with:
 ```powershell
 .\uninstall.ps1
 ```
+
+## The tray menu (optional)
+
+`jdrgb-tray.exe` is a notification-area menu for picking a preset without
+opening a terminal. The icon *is* the current color — a filled dot, or a hollow
+ring when the LEDs are off.
+
+```powershell
+.\install.ps1 -Tray -All -Color warmwhite
+```
+
+It is a **second binary, and a second task**. Two binaries because a PE has
+exactly one subsystem: `jdrgb.exe` has to stay a console app, and a tray app
+must not be one. They share the color tables through a small library, so the
+menu draws from the same `SWATCH` values as `jdrgb presets` — a preset tuned by
+eye shows up in both without a second edit.
+
+Two tasks because the boot task runs as `SYSTEM` in session 0, which has no
+interactive desktop and therefore no notification area. The tray gets its own
+per-user logon task, unelevated. The boot task is untouched, and still fires
+before anyone logs in.
+
+The tray never touches the hardware. Every click spawns `jdrgb.exe`, which
+means a wedged controller can't take the menu down with it, and any error you'd
+have seen in a terminal arrives as a balloon instead.
+
+It defaults to **both devices**, where the CLI defaults to the strip. Every
+existing `jdrgb COLOR` invocation has to keep meaning what it always meant; a
+menu has no such history, and "set the lights" means all of them. Change it
+under `Target`.
+
+### What it can't know
+
+The boot task runs as `SYSTEM`, so it records its state under `SYSTEM`'s
+`%LOCALAPPDATA%`, not yours. The tray reads *your* copy. So immediately after a
+boot the menu says "not set from here" rather than naming the color you're
+looking at — it knows what you set from the tray or from a terminal, and
+nothing else. The first pick from the menu syncs it up.
 
 ## How it works
 

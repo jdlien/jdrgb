@@ -9,6 +9,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $TaskName = "jdrgb"
+$TrayTaskName = "jdrgb-tray"
 
 # --- Self-elevate if not running as Administrator ---------------------------
 $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -20,11 +21,13 @@ if (-not $admin) {
     return
 }
 
-if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-    Write-Host "Removed scheduled task '$TaskName'."
-} else {
-    Write-Host "No scheduled task '$TaskName' found."
+foreach ($name in @($TaskName, $TrayTaskName)) {
+    if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
+        Unregister-ScheduledTask -TaskName $name -Confirm:$false
+        Write-Host "Removed scheduled task '$name'."
+    } else {
+        Write-Host "No scheduled task '$name' found."
+    }
 }
 
 # --- Remove only what install.ps1 put there ---------------------------------
@@ -34,7 +37,7 @@ if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
 # Instead: resolve the path, require our own binary in it as proof it's really an
 # install, delete the known artifacts by literal path, and only drop the
 # directory itself once it's empty.
-$Artifacts = @("jdrgb.exe", "leds.conf")
+$Artifacts = @("jdrgb.exe", "jdrgb-tray.exe", "leds.conf")
 
 $resolved = $null
 try { $resolved = (Resolve-Path -LiteralPath $InstallDir -ErrorAction Stop).ProviderPath } catch {}
@@ -47,6 +50,23 @@ elseif (-not (Test-Path -LiteralPath (Join-Path $resolved "jdrgb.exe"))) {
     Write-Warning "If this really is the install directory, remove it by hand."
 }
 else {
+    # A running tray holds its own image open, so it has to go before the file
+    # can. Matched by full path, not by name: `Stop-Process -Name jdrgb-tray`
+    # would also kill a copy someone is running from a build directory.
+    $trayExe = Join-Path $resolved "jdrgb-tray.exe"
+    Get-Process -Name "jdrgb-tray" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -eq $trayExe } |
+        ForEach-Object {
+            # taskkill without /F posts WM_CLOSE, which the tray answers by
+            # removing its icon and then exiting. Kill() outright would leave a
+            # ghost icon in the notification area until something forced a
+            # refresh. CloseMainWindow() is no use here — the tray's window is
+            # never shown, so it has no MainWindowHandle to close.
+            & taskkill.exe /PID $_.Id 2>&1 | Out-Null
+            if (-not $_.WaitForExit(3000)) { $_.Kill() }
+            Write-Host "Stopped the running tray."
+        }
+
     foreach ($name in $Artifacts) {
         $file = Join-Path $resolved $name
         if (Test-Path -LiteralPath $file) {

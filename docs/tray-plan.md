@@ -1,6 +1,8 @@
 # Plan: `jdrgb-tray` — a tray helper for picking preset colors
 
-Status: proposed, not started.
+Status: **built.** Kept as the design record. Where the build disagreed with the
+plan, the plan has been corrected in place and the change noted — see
+"What changed during the build" at the end for the list.
 
 ## Goal
 
@@ -62,8 +64,12 @@ path = "src/tray/main.rs"
 
 `windows-sys` features the tray adds: `Win32_UI_WindowsAndMessaging`,
 `Win32_UI_Shell`, `Win32_UI_HiDpi`, `Win32_Graphics_Gdi`,
-`Win32_System_Threading` (`CreateMutexW`), `Win32_Graphics_Dwm`
-(`DwmSetWindowAttribute`, used by the dark-mode helper).
+`Win32_System_Threading` and `Win32_Security` (between them, `CreateMutexW`,
+which takes a `SECURITY_ATTRIBUTES` pointer).
+
+Not `Win32_Graphics_Dwm`, as first drafted. `DwmSetWindowAttribute` only themes
+a title bar, and this window is never shown. Dark menus come from the
+process-wide `SetPreferredAppMode` + `FlushMenuThemes` ordinals alone.
 
 ## Measured cost to the CLI
 
@@ -185,13 +191,20 @@ for y in 0..size {
 }
 ```
 
-**A bare filled circle is not enough.** `white` and `coolwhite` vanish against a
-light menu; `black` disappears against a dark one; and `black` and `off` are
-indistinguishable. Draw a ring: composite the fill over a 1px border at ~50%
-grey, or ring it in the swatch color's own luminance-inverted tone. Still no
-image assets — it is one more distance comparison in the same loop. Give `off`
-a distinct treatment (hollow ring, or a diagonal slash) so it never reads as
-`black`.
+**Rims, but only where they earn their place.** The first draft rimmed every
+swatch, and it looked fussy. Menu backgrounds are neutral greys, and a saturated
+color reads cleanly against a neutral of *any* lightness — an RGB strip set to
+grey isn't really a thing, so most of the palette is never at risk. Only the
+near-neutral extremes need an outline: `coolwhite` and `white` dissolve into a
+light menu, `black` into a dark one.
+
+The policy is three constants in `draw.rs` (`RIM_MAX_CHROMA`, `RIM_LUMA_HI`,
+`RIM_LUMA_LO`) and a test pins down exactly which presets they select, so tuning
+a color into that corner shows up in the test rather than in the menu. Rim
+everything by setting the chroma bound above 1.0; rim nothing by setting it to 0.
+
+`off` is a hollow ring — the one case where the shape, not the color, carries
+the meaning.
 
 Other notes:
 
@@ -344,27 +357,43 @@ Recommend (1) for v1, with (3) as the principled fix if it grates.
 
 ## Menu shape
 
-29 presets flat is ~810 px and would get scroll arrows on a 1080p display.
+Everything at the top level. The first draft put the colors behind a `Color`
+submenu to keep the menu under ~810 px, and that was the wrong trade: picking a
+color is the *only* thing this exists to do, so it should not cost an extra hop.
+Same for `Target` — three options don't earn a submenu either.
 
 ```
   ● warmwhite            <- disabled status line, swatch + current color name
   ─────────────
-  Color            >     <- submenu, all 29 with swatches
-  Target           >     <- Strip / GPU / Both, radio-marked
-  Off
+  coolwhite              <- all 29, each with its swatch;
+  warmwhite                 the current one is bold (SetMenuDefaultItem)
+  ...
+  pink
+  ─────────────
+  ○ Off                  <- hollow ring, never a black disc
+  ─────────────
+  Target                 <- disabled caption, so the three below don't
+  Strip                     read as three more colors
+  GPU
+  Both                   <- radio-marked
   ─────────────
   Reapply
   Exit
 ```
 
+If it ever outgrows a screen, `MFT_MENUBARBREAK` on one item splits the list
+into columns without moving anything.
+
 `Reapply` re-sends the last known color — useful after a controller reset. When
 state is unknown, `Multi`, or mixed across devices, it falls back to the default
 preset and the status line says so rather than showing a stale color.
 
-Target selection is tray-local UI state, not a property of jdrgb. Persist it in
-`%LOCALAPPDATA%\jdrgb\` or HKCU — **not** beside the executable, which lives in
+Target selection is tray-local UI state, not a property of jdrgb. It lives in
+`%LOCALAPPDATA%\jdrgb\tray-target` — **not** beside the executable, which is in
 an administrator-only-writable directory by deliberate design
-(`install.ps1:73`).
+(`install.ps1:73`). It defaults to **both devices**: the CLI defaults to the
+strip because every existing invocation must keep behaving the same, but a menu
+carries no such history.
 
 ## Non-goals for v1
 
@@ -397,3 +426,30 @@ Measurements taken while writing this plan, on the current source:
 - **`PRESETS` has 29 entries** (`src/main.rs:68`), not 30.
 - **README drift, unrelated:** the README says the release binary is ~160 KB.
   It is 246 KB. Worth fixing.
+
+## What changed during the build
+
+Everything above is the corrected text. What it used to say, and why it moved:
+
+1. **`off` was indistinguishable from `black`.** Not anticipated at all. Both
+   write `000000`, so the state file couldn't tell them apart and the tray
+   showed a black disc for a controller sitting in its own off mode — the one
+   distinction the README goes out of its way to document. Fixed properly rather
+   than in the tray: `Last` grew an `Off` variant and the CLI records it, so
+   every reader of the state file gets the distinction. `load_last` treats it
+   like `Multi`, since black is a useless place to resume tuning from.
+   *Found by using it, not by review.*
+2. **Colors and target moved to the top level**, from submenus. See above.
+3. **Rims narrowed** from every swatch to three. See above.
+4. **The tray defaults to both devices**, not the strip.
+5. **The crate split cost 1,536 bytes**, predicted to be free.
+6. **`Win32_Graphics_Dwm` isn't needed**; `Win32_Security` is.
+7. **`println!` under `windows_subsystem = "windows"` was a phantom hazard** —
+   measured, not assumed. See Appendix A.
+
+Still true as planned, and worth noting because they were the risky calls: the
+notification icon really does land on a secondary monitor here, so
+`Shell_NotifyIconGetRect` for its DPI was not over-engineering; `MIIM_BITMAP`
+keeps the Windows 11 rounded menu styling that owner-draw would have lost; and
+`taskkill` without `/F` gives the tray a clean `WM_CLOSE` teardown, verified,
+so uninstall doesn't leave a ghost icon.

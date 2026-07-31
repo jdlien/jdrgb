@@ -16,6 +16,13 @@
   Set the GPU LEDs instead of the motherboard strip.
 .PARAMETER All
   Set both the motherboard strip and the GPU LEDs.
+.PARAMETER Tray
+  Also install jdrgb-tray.exe and start it at logon: a notification-area menu
+  for picking a preset colour. This is a second, separate task — the boot task
+  runs as SYSTEM in session 0 and cannot show a tray icon.
+.PARAMETER TrayUser
+  Internal. The SID of the user the tray task belongs to, captured before
+  elevation. Not meant to be passed by hand.
 #>
 [CmdletBinding()]
 param(
@@ -24,11 +31,14 @@ param(
     [string]$InstallDir = "$env:ProgramFiles\jdrgb",
     [switch]$NoWake,
     [switch]$Gpu,
-    [switch]$All
+    [switch]$All,
+    [switch]$Tray,
+    [string]$TrayUser = ""
 )
 
 $ErrorActionPreference = "Stop"
 $TaskName = "jdrgb"
+$TrayTaskName = "jdrgb-tray"
 
 # --- Reject combinations that would install a permanently failing task -------
 if ($Gpu -and $All) {
@@ -49,6 +59,15 @@ if (-not $admin) {
     if ($NoWake) { $argList += "-NoWake" }
     if ($Gpu)    { $argList += "-Gpu" }
     if ($All)    { $argList += "-All" }
+    if ($Tray)   {
+        # Carry the *invoking* user's SID across the elevation boundary. If UAC
+        # is answered with a different administrator's credentials, the elevated
+        # process is that administrator — so reading the identity over there
+        # would register the tray for the wrong account, and it would never
+        # appear for the person who ran this.
+        $sid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+        $argList += @("-Tray", "-TrayUser", $sid)
+    }
     if ($PSBoundParameters.ContainsKey("InstallDir")) { $argList += @("-InstallDir", "`"$InstallDir`"") }
     Start-Process -FilePath (Get-Process -Id $PID).Path -Verb RunAs -ArgumentList $argList
     return
@@ -94,6 +113,26 @@ try {
     $target = Join-Path $InstallDir "jdrgb.exe"
     Copy-Item -Path $source -Destination $target -Force
     Write-Host "Installed binary: $target"
+
+    $trayTarget = Join-Path $InstallDir "jdrgb-tray.exe"
+    if ($Tray) {
+        $traySource = Join-Path $PSScriptRoot "target\release\jdrgb-tray.exe"
+        if (-not (Test-Path $traySource)) {
+            throw "jdrgb-tray.exe not found at $traySource. Build it first: cargo build --release"
+        }
+        # A running tray holds a lock on its own image, so an upgrade has to
+        # stop it first. Matched on the full path so a development copy running
+        # from target\release is left alone. taskkill without /F posts WM_CLOSE,
+        # which the tray answers by removing its icon before exiting.
+        Get-Process -Name "jdrgb-tray" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -eq $trayTarget } |
+            ForEach-Object {
+                & taskkill.exe /PID $_.Id 2>&1 | Out-Null
+                if (-not $_.WaitForExit(3000)) { $_.Kill() }
+            }
+        Copy-Item -Path $traySource -Destination $trayTarget -Force
+        Write-Host "Installed binary: $trayTarget"
+    }
 
     # Task components. A config file wins over a single color.
     $targetFlag = if ($Gpu) { " --gpu" } elseif ($All) { " --all" } else { "" }
@@ -155,6 +194,42 @@ try {
         $info = Get-ScheduledTaskInfo -TaskName $TaskName
         $running = (Get-ScheduledTask -TaskName $TaskName).State -eq "Running"
     } while ($running -and (Get-Date) -lt $deadline)
+
+    # --- The tray, which needs a task of its own ----------------------------
+    # The boot task above runs as SYSTEM so it can fire before anyone logs in.
+    # That is exactly why it cannot host the tray: a SYSTEM task runs in session
+    # 0, which has no interactive desktop and therefore no notification area.
+    # So the tray gets a second task, running as the user, unelevated.
+    if ($Tray) {
+        $sid = if ($TrayUser) { $TrayUser } else { ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value }
+        try {
+            $who = (New-Object Security.Principal.SecurityIdentifier($sid)).Translate([Security.Principal.NTAccount]).Value
+        } catch { $who = $sid }
+
+        $trayAction = New-ScheduledTaskAction -Execute $trayTarget
+        # Nothing the tray does needs elevation — it spawns jdrgb.exe, which
+        # talks to the controller over userspace HID and NVAPI.
+        $trayPrincipal = New-ScheduledTaskPrincipal -UserId $sid -LogonType Interactive -RunLevel Limited
+        # No execution time limit: unlike the boot task this is meant to stay
+        # resident, and the default would terminate it after three days.
+        $traySettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                            -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero)
+        $trayTrigger = New-ScheduledTaskTrigger -AtLogOn -User $sid
+
+        Register-ScheduledTask -TaskName $TrayTaskName -Action $trayAction -Trigger $trayTrigger `
+            -Principal $trayPrincipal -Settings $traySettings -Force `
+            -Description "jdrgb tray menu for picking a preset color." | Out-Null
+        Write-Host "Registered task '$TrayTaskName' to start at logon for $who."
+
+        # Start it now rather than making them log out to see it.
+        Start-ScheduledTask -TaskName $TrayTaskName
+        Start-Sleep -Milliseconds 800
+        if (Get-Process -Name "jdrgb-tray" -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $trayTarget }) {
+            Write-Host "Tray is running — look for the coloured dot in the notification area."
+        } else {
+            Write-Warning "The tray task was registered but the process isn't running yet; it will start at your next logon."
+        }
+    }
 
     $what = if ($Config) { "config '$confTarget'" } elseif ($Color) { "color '$Color'" } else { "default preset" }
     $where = if ($Gpu) { "the GPU" } elseif ($All) { "the motherboard strip and the GPU" } else { "the motherboard strip" }
