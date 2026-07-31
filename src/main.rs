@@ -94,6 +94,11 @@ const PRESETS: &[(&str, (u8, u8, u8))] = &[
     ("sky", (0x00, 0xBF, 0xFF)),    // interpolated
     ("azure", (0x00, 0x80, 0xFF)),  // bright sky blue
     ("cobalt", (0x00, 0x40, 0xFF)), // mid blue, bridges azure->blue in hue + brightness
+    // Interpolated. By wire value cobalt->blue is an ordinary 15° step, but it
+    // reads much wider, because the strip starts expanding hue here — the tuned
+    // indigo/purple values imply an appearance/wire slope near 1.6-2.5 just
+    // above blue, which would make this gap perceptually ~24°.
+    ("sapphire", (0x00, 0x20, 0xFF)),
     ("blue", (0x00, 0x00, 0xFF)),
     ("indigo", (0x27, 0x00, 0xFF)),
     ("purple", (0x40, 0x00, 0xFF)),
@@ -157,6 +162,7 @@ const GPU_PRESETS: &[(&str, (u8, u8, u8))] = &[
     ("sky", (0x00, 0xFF, 0x8C)),        // 00BFFF  interp
     ("azure", (0x00, 0xFF, 0xB6)),      // 0080FF
     ("cobalt", (0x00, 0xC0, 0xFF)),     // 0040FF
+    ("sapphire", (0x00, 0x60, 0xFF)),   // 0020FF  interp
     ("indigo", (0xBB, 0x00, 0xFF)),     // 2700FF
     ("purple", (0xFF, 0x00, 0x7F)),     // 4000FF
     ("violet", (0xFF, 0x00, 0x62)),     // 6E00FF
