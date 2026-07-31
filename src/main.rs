@@ -328,7 +328,7 @@ fn set_solid_targets(target: Target, wait: bool, mode: u8, paint: Paint) -> Resu
             match apply_gpu_solid(mode, color) {
                 Ok(()) => {
                     report(labelled.then_some("gpu"), mode, color);
-                    record(true, Last::Color(color));
+                    record(true, last_for(mode, color));
                     gpu_ok = true;
                 }
                 Err(e) => {
@@ -358,6 +358,20 @@ fn set_solid_targets(target: Target, wait: bool, mode: u8, paint: Paint) -> Resu
         Ok(())
     } else {
         Err(failures.join("; "))
+    }
+}
+
+/// What to record for a solid write.
+///
+/// `off` and `black` both put (0,0,0) on the wire, so the color alone can't tell
+/// them apart — but they are different controller states, and anything reading
+/// the state file back would otherwise report `black` for a device that is in
+/// its own off mode.
+fn last_for(mode: u8, color: (u8, u8, u8)) -> Last {
+    if mode == MODE_OFF {
+        Last::Off
+    } else {
+        Last::Color(color)
     }
 }
 
@@ -498,7 +512,7 @@ fn set_solid(mode: u8, color: (u8, u8, u8)) -> Result<(), String> {
         return Err("config table reported no addressable headers".into());
     }
     apply_solid(&dev, headers, mode, color, true)?;
-    record(false, Last::Color(color));
+    record(false, last_for(mode, color));
     Ok(())
 }
 

@@ -24,6 +24,14 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Console",
     "Win32_System_LibraryLoader", # LoadLibraryA/GetProcAddress for nvapi64.dll
     "Win32_Foundation",
+    # jdrgb-tray only. These cost jdrgb.exe nothing: windows-sys is pure FFI
+    # declarations, and an unreferenced one emits no code and no import.
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_UI_HiDpi",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Threading",
+    "Win32_Security", # CreateMutexW takes a SECURITY_ATTRIBUTES pointer
 ] }
 
 [profile.release]

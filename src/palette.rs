@@ -276,10 +276,17 @@ pub fn state_path() -> Option<std::path::PathBuf> {
 /// What one device was last set to. Absent from the file means "never recorded",
 /// which is different from `Multi` — the first falls back to the default, the
 /// second means there's no single color to pick up from.
+///
+/// `Off` is not `Color((0,0,0))`. They look identical but are different
+/// controller states — mode register 0 versus 1, confirmed by reading it back —
+/// and the difference is visible to anything that reads this file. Recording
+/// `off` as black would make a tray menu claim the `black` preset was active
+/// when the controller is actually in its own off mode.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Last {
     Color((u8, u8, u8)),
     Multi,
+    Off,
 }
 
 impl Last {
@@ -287,12 +294,15 @@ impl Last {
         match self {
             Last::Color((r, g, b)) => format!("{r:02X}{g:02X}{b:02X}"),
             Last::Multi => "multi".to_string(),
+            Last::Off => "off".to_string(),
         }
     }
 
     pub fn decode(s: &str) -> Option<Last> {
         if s.eq_ignore_ascii_case("multi") {
             Some(Last::Multi)
+        } else if s.eq_ignore_ascii_case("off") {
+            Some(Last::Off)
         } else {
             parse_hex(s).map(Last::Color)
         }
@@ -358,7 +368,11 @@ pub fn record(gpu: bool, last: Last) {
     let _ = std::fs::write(path, encode_state(mb, gpu_slot));
 }
 
-/// The last solid color set on one device, if it isn't multi-colored.
+/// The last solid color set on one device, if there is one to resume from.
+///
+/// `Off` yields None alongside `Multi`: black is a useless place to start
+/// tuning — nothing is lit, and HSL has no hue there to step through — so the
+/// caller's default preset is a better answer than the literal last value.
 pub fn load_last(gpu: bool) -> Option<(u8, u8, u8)> {
     let (mb, gpu_slot) = load_state();
     match if gpu { gpu_slot } else { mb } {
@@ -522,6 +536,28 @@ mod tests {
         assert_eq!(gpu, None);
         let (mb, _) = parse_state(&encode_state(Some(Last::Multi), None));
         assert_eq!(mb, Some(Last::Multi));
+    }
+
+    /// `off` and `black` put the same bytes on the wire but leave the
+    /// controller in different modes, so the file has to keep them apart. A
+    /// reader that saw only the color would report `black` for a device that
+    /// is actually off.
+    #[test]
+    fn off_survives_the_round_trip_as_itself() {
+        let text = encode_state(Some(Last::Off), Some(Last::Color((0, 0, 0))));
+        let (mb, gpu) = parse_state(&text);
+        assert_eq!(mb, Some(Last::Off));
+        assert_eq!(gpu, Some(Last::Color((0, 0, 0))));
+        assert_ne!(mb, gpu);
+    }
+
+    /// Neither `off` nor `multi` offers a color to resume tuning from, and
+    /// black is a useless starting point besides — no hue to step through.
+    #[test]
+    fn off_offers_nothing_to_resume_from() {
+        assert_eq!(Last::decode("off"), Some(Last::Off));
+        assert_eq!(Last::decode("OFF"), Some(Last::Off));
+        assert_eq!(Last::Off.encode(), "off");
     }
 
     #[test]
