@@ -17,7 +17,9 @@
 use std::ffi::c_void;
 use std::mem::offset_of;
 
-use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LoadLibraryExA, LOAD_LIBRARY_SEARCH_SYSTEM32,
+};
 
 // ---- Device -----------------------------------------------------------------
 
@@ -171,9 +173,19 @@ struct Nvapi {
 
 fn load_nvapi() -> Result<Nvapi> {
     unsafe {
-        let lib = LoadLibraryA(c"nvapi64.dll".as_ptr() as *const u8);
+        // System32 only, never the search path. A bare LoadLibrary searches the
+        // directory the .exe lives in first, so anyone who could drop a
+        // nvapi64.dll next to jdrgb.exe would get their code run — and the
+        // installed copy runs as SYSTEM from the scheduled task. The real
+        // nvapi64.dll is installed to System32 by the NVIDIA driver, so nothing
+        // legitimate is lost by refusing to look anywhere else.
+        let lib = LoadLibraryExA(
+            c"nvapi64.dll".as_ptr() as *const u8,
+            std::ptr::null_mut(),
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        );
         if lib.is_null() {
-            return Err(Error::transient("nvapi64.dll not loadable (no NVIDIA driver yet?)"));
+            return Err(Error::transient("nvapi64.dll not loadable from System32 (no NVIDIA driver yet?)"));
         }
 
         let query = GetProcAddress(lib, c"nvapi_QueryInterface".as_ptr() as *const u8)

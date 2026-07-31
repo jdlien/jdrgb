@@ -56,9 +56,12 @@ jdrgb --help
 ### Targets
 
 Without `--gpu` or `--all`, everything targets the motherboard strip exactly as
-it always has. `rainbow`, `load`, and `template` are motherboard-only — the GPU
-zone is 4 LEDs, so a 38-LED per-LED pattern there is meaningless, and passing
-`--gpu` with them is an error rather than a partial apply.
+it always has. `rainbow` and `template` are motherboard-only — the GPU zone is
+4 LEDs, so a 38-LED per-LED pattern there is meaningless, and passing `--gpu`
+with them is an error rather than a partial apply.
+
+`load` is the exception: a config file can carry a `gpu:` line, so one file
+describes the whole machine. `jdrgb load theme.conf --all` paints both.
 
 ```powershell
 jdrgb warmwhite         # motherboard strip (unchanged behavior)
@@ -309,9 +312,9 @@ resume from sleep**.
 ```
 
 `-Config` copies your file to `C:\Program Files\jdrgb\leds.conf` and points the
-boot task at it (`jdrgb load … --wait`). It's motherboard-only, so combining it
-with `-Gpu`/`-All` is rejected rather than installing a task that would fail on
-every boot.
+boot task at it (`jdrgb load … --wait`). It combines with `-Gpu`/`-All`, since a
+config's `gpu:` line can carry the card's colors — if the file has no `gpu:`
+line, jdrgb says so rather than failing silently.
 
 It also adds a resume-from-sleep trigger so the color reasserts after waking.
 

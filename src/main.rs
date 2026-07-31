@@ -44,6 +44,16 @@ const MODE_DIRECT: u8 = 0xFF;
 
 const LEDS_PER_PACKET: usize = 20; // 20 * 3 bytes = 60, fits one report
 
+/// Ceiling on the addressable header count the board may report.
+///
+/// The effect-color packet addresses headers with a 16-bit mask (`1u16 << ch`),
+/// so 16 is the protocol's own limit, not an arbitrary one. This board reports
+/// 3. A larger number could only come from a corrupt read or a device
+/// impersonating the controller, and shifting past the mask width would write at
+/// wrapped positions — so it's refused, the same way the GPU refuses an
+/// implausible LED count.
+const MAX_HEADERS: u8 = 16;
+
 /// Default: `coolwhite`, hand-tuned by eye so the strip renders a clean white.
 /// (Nominal #FFFFFF reads greenish on this strip; this tuned value looks pink on
 /// a screen but renders as a proper cool white, so it's the default.)
@@ -235,6 +245,7 @@ fn mb_only(command: &Command) -> Option<&'static str> {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let wait = args.iter().any(|a| a == "--wait");
+    let force = args.iter().any(|a| a == "--force");
 
     let target = match (args.iter().any(|a| a == "--gpu"), args.iter().any(|a| a == "--all")) {
         (true, true) => {
@@ -251,7 +262,7 @@ fn main() -> ExitCode {
     // --help and --version, which parse() handles as positional words.
     let positional: Vec<&str> = args
         .iter()
-        .filter(|a| !matches!(a.as_str(), "--wait" | "--gpu" | "--all"))
+        .filter(|a| !matches!(a.as_str(), "--wait" | "--gpu" | "--all" | "--force"))
         .map(String::as_str)
         .collect();
 
@@ -288,7 +299,7 @@ fn main() -> ExitCode {
         }),
         Command::Load(path) => with_retry(wait, || set_from_config(&path, target))
             .map(|()| println!("jdrgb: loaded {path}")),
-        Command::Template(path) => write_template(&path).map(|()| {
+        Command::Template(path) => write_template(&path, force).map(|()| {
             println!("jdrgb: wrote {path} ({STRIP_LEDS} LEDs) — edit it, then `jdrgb load {path}`");
         }),
         // Tuning needs one concrete starting RGB even with --all, so a preset
@@ -544,6 +555,13 @@ fn open(api: &HidApi) -> Result<(HidDevice, [u8; 60]), String> {
     for info in candidates {
         match info.open_device(api) {
             Ok(dev) => match read_config(&dev) {
+                Some(cfg) if header_count(&cfg) > MAX_HEADERS => {
+                    return Err(format!(
+                        "config table reported {} addressable headers (protocol allows {MAX_HEADERS}) \
+                         — refusing to write",
+                        header_count(&cfg)
+                    ))
+                }
                 Some(cfg) => return Ok((dev, cfg)),
                 None => {
                     last = "opened the controller but it didn't respond \
@@ -838,7 +856,12 @@ fn read_led_config(path: &str) -> Result<LedConfig, String> {
 }
 
 /// Write a starter config with one line per LED, pre-filled with the preset.
-fn write_template(path: &str) -> Result<(), String> {
+///
+/// Refuses an existing file unless `force`. A config is hand-tuned per LED and
+/// slow to rebuild, and `leds.conf` is both the default template target and the
+/// default `load` target — so the obvious typo overwrites exactly the file worth
+/// keeping. `create_new` makes the check atomic rather than a racy exists-test.
+fn write_template(path: &str, force: bool) -> Result<(), String> {
     let (r, g, b) = DEFAULT_COLOR;
     let mut out = String::from(
         "# jdrgb config: one color per line for the strip, top = LED 0.\n\
@@ -856,7 +879,20 @@ fn write_template(path: &str) -> Result<(), String> {
     for i in 0..STRIP_LEDS {
         out.push_str(&format!("{r:02X}{g:02X}{b:02X}   # LED {i}\n"));
     }
-    std::fs::write(path, out).map_err(|e| format!("cannot write {path}: {e}"))
+    if force {
+        return std::fs::write(path, out).map_err(|e| format!("cannot write {path}: {e}"));
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => {
+                format!("{path} already exists — pass --force to overwrite it")
+            }
+            _ => format!("cannot write {path}: {e}"),
+        })?;
+    f.write_all(out.as_bytes()).map_err(|e| format!("cannot write {path}: {e}"))
 }
 
 /// Fully-saturated, full-value HSV (hue in degrees) to RGB.
@@ -1621,7 +1657,8 @@ fn print_help() {
          \n\
          TARGETS:\n\
          \x20 Without --gpu/--all, everything targets the motherboard strip, as always.\n\
-         \x20 rainbow/load/template are motherboard-only (the GPU has a handful of LEDs).\n\
+         \x20 rainbow/template are motherboard-only (the GPU has a handful of LEDs).\n\
+         \x20 load works on both: a config's `gpu:` line carries the GPU's colors.\n\
          \x20 `save` writes the GPU controller's non-volatile flash so the color holds\n\
          \x20 with nothing running — do it once by hand, never on a schedule.\n",
         ver = env!("CARGO_PKG_VERSION"),
@@ -1672,6 +1709,16 @@ mod tests {
         let p = Paint::Literal((0xFA, 0x95, 0x36));
         assert_eq!(p.rgb(false), (0xFA, 0x95, 0x36));
         assert_eq!(p.rgb(true), (0xFA, 0x95, 0x36));
+    }
+
+    #[test]
+    fn header_mask_cannot_shift_past_its_width() {
+        // MAX_HEADERS exists to keep `1u16 << ch` inside the mask. If someone
+        // widens one without the other, this catches it.
+        assert_eq!(MAX_HEADERS as u32, u16::BITS);
+        for ch in 0..MAX_HEADERS {
+            assert!(1u16.checked_shl(ch as u32).is_some(), "header {ch} shifts past the mask");
+        }
     }
 
     #[test]
