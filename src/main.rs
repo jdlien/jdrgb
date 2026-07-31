@@ -13,6 +13,7 @@
 //! Protocol ported from OpenRGB's AuraMainboardController (GPL-2.0-or-later) and
 //! cross-checked against liquidctl's aura_led.py. See README for lineage.
 
+use std::cell::Cell;
 use std::io::{Read, Write};
 use std::process::ExitCode;
 
@@ -605,10 +606,41 @@ fn set_solid(mode: u8, color: (u8, u8, u8)) -> Result<(), String> {
 /// single LED-slot; the hardware fills the whole strip. With `commit`, the
 /// controller saves it (survives with nothing running); without, it's a live
 /// preview only — handy for rapid updates without hammering the flash.
-fn apply_solid(dev: &HidDevice, headers: u8, mode: u8, (r, g, b): (u8, u8, u8), commit: bool) -> Result<(), String> {
-    write(dev, &[CMD, 0x52, 0x53, 0x00, 0x01])?; // select Gen1 protocol
+fn apply_solid(dev: &HidDevice, headers: u8, mode: u8, rgb: (u8, u8, u8), commit: bool) -> Result<(), String> {
+    apply_solid_stepped(dev, headers, mode, rgb, commit, true)
+}
+
+/// As above, but `select` can be dropped once the mode is already set.
+///
+/// This is what makes live stepping usable. The strip used to trail the GPU by
+/// roughly half a second on every repaint, despite being written *first*. The
+/// host-side writes were never the problem — they measure ~4ms each — so the
+/// delay was inside the controller: re-sending the protocol-select and the
+/// per-header channel+mode select made it restart the effect each time.
+///
+/// Skipping both on repeat paints (7 writes down to 3, colors only) cuts the lag
+/// to a few milliseconds and makes a held key ramp instead of crawl. Tested on
+/// the AULA3-AR32-0309 firmware with all 3 headers: they all still follow, so the
+/// channel does not need re-selecting for a color write to land.
+///
+/// Committing paints always re-select, so whatever gets saved to the controller's
+/// flash is written by the same full sequence as a one-shot `jdrgb COLOR`. The
+/// saving is rare, so the extra four packets cost nothing that matters.
+fn apply_solid_stepped(
+    dev: &HidDevice,
+    headers: u8,
+    mode: u8,
+    (r, g, b): (u8, u8, u8),
+    commit: bool,
+    select: bool,
+) -> Result<(), String> {
+    if select {
+        write(dev, &[CMD, 0x52, 0x53, 0x00, 0x01])?; // select Gen1 protocol
+    }
     for ch in 0..headers {
-        write(dev, &[CMD, CTRL_EFFECT, ch, 0x00, 0x00, mode])?; // select channel + mode
+        if select {
+            write(dev, &[CMD, CTRL_EFFECT, ch, 0x00, 0x00, mode])?; // select channel + mode
+        }
         let mask = 1u16 << ch; // one LED-slot per header, at position `ch`
         write(dev, &[CMD, CTRL_EFFECT_COLOR, (mask >> 8) as u8, (mask & 0xFF) as u8, 0x00, r, g, b])?;
     }
@@ -847,6 +879,9 @@ const SL_STEP: f32 = 0.01; // saturation/lightness per keypress (1%)
 struct Live<'a> {
     mb: Option<(HidDevice, u8)>, // device + addressable header count
     gpu: Option<gpu::Gpu>,
+    /// Whether the strip's effect mode has been selected already this session,
+    /// so repeat paints can send colors alone. See `apply_solid_stepped`.
+    mb_selected: Cell<bool>,
     _api: &'a HidApi,
 }
 
@@ -870,7 +905,7 @@ impl Live<'_> {
         } else {
             None
         };
-        Ok(Live { mb, gpu, _api: api })
+        Ok(Live { mb, gpu, mb_selected: Cell::new(false), _api: api })
     }
 
     /// Paint everywhere, resolving the color separately per device so a preset
@@ -879,7 +914,11 @@ impl Live<'_> {
     /// live stepping never touches its flash.
     fn paint(&self, paint: Paint, commit: bool) -> Result<(), String> {
         if let Some((dev, headers)) = &self.mb {
-            apply_solid(dev, *headers, MODE_STATIC, paint.rgb(false), commit)?;
+            // Live steps skip the select; a commit never does, so the state that
+            // reaches flash is built exactly like a one-shot set.
+            let select = !self.mb_selected.get() || commit;
+            apply_solid_stepped(dev, *headers, MODE_STATIC, paint.rgb(false), commit, select)?;
+            self.mb_selected.set(true);
         }
         if let Some(card) = &self.gpu {
             card.apply_solid(MODE_STATIC, paint.rgb(true)).map_err(|e| e.msg)?;

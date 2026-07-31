@@ -233,6 +233,23 @@ hardware latches *and saves* — the color holds with nothing running. The per-L
 latches; it's a static frame, not an animation, so it likewise holds after the
 program exits.
 
+#### Why live stepping doesn't crawl
+
+Setting a color takes seven packets: a protocol-select, then a channel+mode
+select and a color for each of the three headers. Sending all seven on every
+repaint made the strip trail the GPU by about **half a second** — badly enough
+that holding a key in `tune` didn't ramp, it crawled.
+
+The host writes were never the cost; they measure ~4ms each. The delay was in the
+controller, which appears to restart the effect whenever the mode is re-selected.
+So `tune` and `preview` send the full sequence once, then **colors only** — three
+packets instead of seven. The lag drops to a few milliseconds and a held key
+ramps properly. All three headers still follow, so a color write lands without
+the channel being re-selected first.
+
+Committing paints always re-select, so what reaches the controller's flash is
+built by the same full sequence as a one-shot `jdrgb COLOR`.
+
 ### GPU persistence
 
 **The GPU's flash save works.** This was the open question for most of the build —
