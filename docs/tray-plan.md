@@ -191,23 +191,31 @@ for y in 0..size {
 }
 ```
 
-**Rims, but only where they earn their place.** The first draft rimmed every
-swatch, and it looked fussy. Menu backgrounds are neutral greys, and a saturated
-color reads cleanly against a neutral of *any* lightness — an RGB strip set to
-grey isn't really a thing, so most of the palette is never at risk.
+**No rims on solids.** This took four passes and the last one found the actual
+problem, which was never about which colors look washed out.
 
-That leaves two: `coolwhite` and `white` dissolve into a light menu and need an
-outline. `black` looked like the mirror case and isn't — menu and taskbar greys
-never get near black, so a #000 disc is still a clear step at either theme.
+The plan called for rimming every swatch, on the theory that `white` dissolves
+into a light menu and `black` into a dark one. That narrowed to the near-neutral
+extremes, then dropped `black` (menu greys never approach black), leaving
+`coolwhite` and `white` outlined.
 
-The policy is three constants in `draw.rs` (`RIM_MAX_CHROMA`, `RIM_LUMA_HI`,
-`RIM_LUMA_LO`, the last set to 0.0 to switch the dark end off) and a test pins
-down exactly which presets they select, so tuning a color into that corner shows
-up in the test rather than in the menu. Rim everything by setting the chroma
-bound above 1.0; rim nothing by setting it to 0.
+Then the rimmed two started reading as *smaller circles* rather than outlined
+ones. That is structural, not a tuning error: the disc already spans the whole
+bitmap, so a rim can only be carved out of the fill. Every rimmed swatch is
+necessarily a smaller circle than the bare ones beside it, and when the rim also
+lands near the menu's own color the outline is invisible and only the shrinkage
+reads.
 
-`off` is a hollow ring — the one case where the shape, not the color, carries
-the meaning.
+Fixing it properly means growing the bitmap so the rim sits *outside* the fill —
+a real change, for a problem two presets have on a theme this machine doesn't
+use. So solids are bare, and a test asserts every solid covers exactly the same
+pixels, which is the property that was actually violated.
+
+`off` keeps its ring. That is the one case where the ring is the entire point
+rather than a decoration, and nothing is being shrunk to make room for it.
+
+Known consequence: on a light theme `white` and `coolwhite` are close to
+invisible. Accepted deliberately.
 
 Other notes:
 
@@ -460,9 +468,10 @@ Everything above is the corrected text. What it used to say, and why it moved:
    row reports what *jdrgb* last set, not what the hardware is showing. Nothing
    reads the color back, so if something else repaints the strip the label goes
    quietly stale; clicking it makes the claim true again.
-4. **Rims narrowed** from every swatch to two, in two steps: first to the
-   near-neutral extremes, then dropping `black` once it was clear a dark menu
-   is nowhere near black. See above.
+4. **Rims went away entirely**, over four passes, and the reason changed on the
+   last one: not "which colors need help" but "a rim is carved out of the fill,
+   so a rimmed swatch is a smaller circle." See above.
+   *Found by looking at it, not by reasoning about it.*
 5. **The tray defaults to both devices**, not the strip.
 6. **The crate split cost 1,536 bytes**, predicted to be free.
 7. **`Win32_Graphics_Dwm` isn't needed**; `Win32_Security` is.
