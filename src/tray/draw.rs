@@ -48,15 +48,19 @@ fn chroma((r, g, b): (u8, u8, u8)) -> f32 {
 // cleanly against a neutral of *any* lightness. An RGB strip set to grey isn't
 // really a thing, so most of the palette is never at risk.
 //
-// The exceptions are the near-neutrals at the ends of the range: `white` and
-// `coolwhite` dissolve into a light menu, `black` into a dark one. Those need
-// an outline or they read as a hole.
+// The exception is the near-neutrals at the light end: `white` and `coolwhite`
+// dissolve into a light menu and read as a hole without an outline.
+//
+// The dark end is deliberately switched off. `black` looked like it needed the
+// same treatment, but a #000 disc against a neutral dark menu is still a clear
+// step — the menu background never gets near black. Setting the low bound to
+// 0.0 disables that half, since luminance is never below it.
 //
 // To change the policy, these three numbers are the whole of it. Rim
 // everything: set MAX_CHROMA above 1.0. Rim nothing: set it to 0.0.
 const RIM_MAX_CHROMA: f32 = 0.25;
 const RIM_LUMA_HI: f32 = 0.85;
-const RIM_LUMA_LO: f32 = 0.12;
+const RIM_LUMA_LO: f32 = 0.0;
 
 /// True when a fill is close enough to neutral, and far enough towards one end
 /// of the range, to disappear into a menu background.
@@ -270,17 +274,19 @@ mod tests {
     }
 
     #[test]
-    fn a_black_swatch_has_a_light_rim() {
-        // The mirror case: invisible on a dark menu without it.
+    fn black_is_a_bare_disc() {
+        // It looks like the mirror of `white`, but it isn't: menu backgrounds
+        // are neutral greys that never approach black, so #000 stands on its
+        // own at both themes and an outline would just add noise.
         let size = 24;
         let px = pixels(size, Swatch::Solid((0x00, 0x00, 0x00)));
-        let rim_px = (0..size)
+        let brightest = (0..size)
             .map(|x| at(&px, size, x, size / 2))
             .filter(|&(a, ..)| a == 255)
             .map(|(_, r, ..)| r)
             .max()
             .unwrap();
-        assert!(rim_px > 0x80, "rim {rim_px:#04X} is not light against a black fill");
+        assert_eq!(brightest, 0, "black picked up an outline it doesn't need");
     }
 
     #[test]
@@ -417,7 +423,8 @@ mod tests {
     }
 
     /// Exactly which presets are rimmed, so tuning a colour into or out of the
-    /// near-neutral corner shows up here rather than in the menu.
+    /// near-neutral corner shows up here rather than in the menu. Two entries,
+    /// both at the light end — see the note on RIM_LUMA_LO.
     #[test]
     fn only_the_near_neutral_extremes_are_rimmed() {
         use jdrgb::palette::{PRESETS, swatch_rgb};
@@ -427,7 +434,7 @@ mod tests {
             .map(|&(n, _)| n)
             .filter(|n| needs_rim(swatch_rgb(n)))
             .collect();
-        assert_eq!(rimmed, vec!["coolwhite", "white", "black"]);
+        assert_eq!(rimmed, vec!["coolwhite", "white"]);
     }
 
     #[test]

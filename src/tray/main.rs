@@ -14,7 +14,7 @@ mod worker;
 use std::sync::mpsc::Sender;
 
 use draw::Swatch;
-use jdrgb::palette::{DEFAULT_PRESET, Last, PRESETS, load_state, preset_for_rgb, swatch_rgb};
+use jdrgb::palette::{Last, PRESETS, load_state, preset_for_rgb, swatch_rgb};
 
 use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
@@ -51,9 +51,27 @@ const WM_APPLY_DONE: u32 = WM_APP + 2;
 const NIN_SELECT: u32 = 0x0400;
 const NIN_KEYSELECT: u32 = 0x0401;
 
+/// The handful worth reaching in one click, in the order they appear.
+///
+/// A shortlist, not a category: the full palette is one hop away under
+/// "All Colors", so this only has to be *useful*, not complete. Every name is
+/// checked against PRESETS by a test — a typo here would otherwise just quietly
+/// drop an entry from the menu.
+const FAVOURITES: &[&str] = &[
+    "warmwhite",
+    "coolwhite",
+    "red",
+    "vermilion",
+    "orange",
+    "green",
+    "seagreen",
+    "indigo",
+    "purple",
+    "rose",
+];
+
 const ID_STATUS: u32 = 1;
 const ID_OFF: u32 = 2;
-const ID_REAPPLY: u32 = 3;
 const ID_EXIT: u32 = 4;
 const ID_TARGET_MB: u32 = 5;
 const ID_TARGET_GPU: u32 = 6;
@@ -199,16 +217,6 @@ impl Current {
         }
     }
 
-    /// What `Reapply` should send. Nothing recoverable falls back to the
-    /// default preset rather than guessing.
-    fn reapply_arg(&self) -> String {
-        match self {
-            Current::Named(name) => (*name).to_string(),
-            Current::Hex((r, g, b)) => format!("{r:02X}{g:02X}{b:02X}"),
-            Current::Off => "off".to_string(),
-            _ => DEFAULT_PRESET.to_string(),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -569,14 +577,29 @@ unsafe fn show_menu(app: *mut App, x: i32, y: i32) {
     unsafe { add_item(menu, ID_STATUS, &current.label(), status_bmp, false) };
     unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, core::ptr::null()) };
 
-    // Colours at the top level rather than behind a submenu. It makes for a
-    // long menu, but picking one is the only thing this exists to do, and
-    // burying the single action behind an extra hop to save height is a bad
-    // trade. If it ever outgrows the screen, MFT_MENUBARBREAK on one item
-    // splits the list into columns without moving anything.
+    // A shortlist in the menu itself, the rest one hop away. All 29 at the top
+    // level was too tall to be pleasant, and burying every colour behind a
+    // submenu made the common case cost an extra hop — this is the middle.
+    // Both lists use the same ids, so a colour picked from either arrives at
+    // the same place.
+    let mut favourites = Vec::new();
+    for name in FAVOURITES {
+        if let Some(i) = PRESETS.iter().position(|&(p, _)| p == *name) {
+            let bmp = unsafe { (*app).swatches.as_ref().map(|s| s.presets[i]) };
+            unsafe { add_item(menu, ID_PRESET_BASE + i as u32, name, bmp, true) };
+            favourites.push(i);
+        }
+    }
+
+    let all = unsafe { CreatePopupMenu() };
     for (i, &(name, _)) in PRESETS.iter().enumerate() {
         let bmp = unsafe { (*app).swatches.as_ref().map(|s| s.presets[i]) };
-        unsafe { add_item(menu, ID_PRESET_BASE + i as u32, name, bmp, true) };
+        unsafe { add_item(all, ID_PRESET_BASE + i as u32, name, bmp, true) };
+    }
+    let all_label = wide("All Colors");
+    unsafe {
+        AppendMenuW(menu, MF_SEPARATOR, 0, core::ptr::null());
+        AppendMenuW(menu, MF_POPUP | MF_STRING, all as usize, all_label.as_ptr());
     }
 
     let off_bmp = unsafe { (*app).swatches.as_ref().map(|s| s.empty) };
@@ -605,16 +628,22 @@ unsafe fn show_menu(app: *mut App, x: i32, y: i32) {
 
     unsafe {
         AppendMenuW(menu, MF_SEPARATOR, 0, core::ptr::null());
-        add_item(menu, ID_REAPPLY, "Reapply", None, true);
         add_item(menu, ID_EXIT, "Exit", None, true);
     }
 
     // Mark the current preset by making it the default (bold). Deliberately not
     // MFS_CHECKED: a check mark and an item bitmap can end up competing for the
     // same gutter, and bold says "this is what you have" just as well.
+    //
+    // Applied to whichever menus actually list it — the shortlist holds only
+    // some colours, and SetMenuDefaultItem is per-menu.
     if let Some(name) = current_name {
         if let Some(i) = PRESETS.iter().position(|&(p, _)| p == name) {
-            unsafe { SetMenuDefaultItem(menu, ID_PRESET_BASE + i as u32, 0) };
+            let id = ID_PRESET_BASE + i as u32;
+            unsafe { SetMenuDefaultItem(all, id, 0) };
+            if favourites.contains(&i) {
+                unsafe { SetMenuDefaultItem(menu, id, 0) };
+            }
         }
     }
 
@@ -659,11 +688,6 @@ unsafe fn on_command(app: *mut App, id: u32) {
             unsafe { refresh_icon(app) };
         }
         ID_OFF => unsafe { apply(app, "off", "off") },
-        ID_REAPPLY => {
-            let target = unsafe { (*app).target };
-            let arg = Current::read(target).reapply_arg();
-            unsafe { apply(app, &arg, &arg) };
-        }
         _ if id >= ID_PRESET_BASE => {
             let i = (id - ID_PRESET_BASE) as usize;
             if let Some(&(name, _)) = PRESETS.get(i) {
@@ -773,18 +797,30 @@ mod tests {
         assert_eq!(Target::All.flag(), Some("--all"));
     }
 
+    /// A typo would silently drop the colour from the shortlist, and nothing
+    /// else would complain — the submenu would still list it.
     #[test]
-    fn unknown_state_reapplies_the_default_rather_than_guessing() {
-        assert_eq!(Current::Unknown.reapply_arg(), DEFAULT_PRESET);
-        assert_eq!(Current::Multi.reapply_arg(), DEFAULT_PRESET);
-        assert_eq!(Current::Mixed.reapply_arg(), DEFAULT_PRESET);
+    fn every_favourite_names_a_real_preset() {
+        for name in FAVOURITES {
+            assert!(
+                PRESETS.iter().any(|&(p, _)| p == *name),
+                "FAVOURITES has no matching preset: {name}"
+            );
+        }
+    }
+
+    /// Both menus address a colour by its index into PRESETS, so picking
+    /// `orange` from the shortlist and from All Colors must be the same click.
+    #[test]
+    fn both_menus_agree_on_a_colours_id() {
+        for name in FAVOURITES {
+            let i = PRESETS.iter().position(|&(p, _)| p == *name).unwrap();
+            assert_eq!(PRESETS[((ID_PRESET_BASE + i as u32) - ID_PRESET_BASE) as usize].0, *name);
+        }
     }
 
     #[test]
-    fn a_hex_reapplies_without_its_hash() {
-        // The bare form is what the CLI's own help shows, so keep the round
-        // trip boring even though `#FF0000` would also be accepted.
-        assert_eq!(Current::Hex((0xFF, 0x00, 0x00)).reapply_arg(), "FF0000");
+    fn a_hex_is_labelled_with_its_hash() {
         assert_eq!(Current::Hex((0xFF, 0x00, 0x00)).label(), "#FF0000");
     }
 
@@ -811,14 +847,6 @@ mod tests {
         assert_eq!(black.label(), "black");
         assert!(matches!(off.swatch(), Swatch::Empty));
         assert!(matches!(black.swatch(), Swatch::Solid(_)));
-    }
-
-    /// Reapplying `off` must send `off`, not the black preset — otherwise the
-    /// controller ends up in static-black mode instead of back where it was.
-    #[test]
-    fn off_reapplies_as_off() {
-        assert_eq!(Current::Off.reapply_arg(), "off");
-        assert_eq!(Current::Named("black").reapply_arg(), "black");
     }
 
     /// A menu is not the CLI: every existing `jdrgb COLOR` invocation has to

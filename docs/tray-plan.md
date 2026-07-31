@@ -194,14 +194,17 @@ for y in 0..size {
 **Rims, but only where they earn their place.** The first draft rimmed every
 swatch, and it looked fussy. Menu backgrounds are neutral greys, and a saturated
 color reads cleanly against a neutral of *any* lightness — an RGB strip set to
-grey isn't really a thing, so most of the palette is never at risk. Only the
-near-neutral extremes need an outline: `coolwhite` and `white` dissolve into a
-light menu, `black` into a dark one.
+grey isn't really a thing, so most of the palette is never at risk.
+
+That leaves two: `coolwhite` and `white` dissolve into a light menu and need an
+outline. `black` looked like the mirror case and isn't — menu and taskbar greys
+never get near black, so a #000 disc is still a clear step at either theme.
 
 The policy is three constants in `draw.rs` (`RIM_MAX_CHROMA`, `RIM_LUMA_HI`,
-`RIM_LUMA_LO`) and a test pins down exactly which presets they select, so tuning
-a color into that corner shows up in the test rather than in the menu. Rim
-everything by setting the chroma bound above 1.0; rim nothing by setting it to 0.
+`RIM_LUMA_LO`, the last set to 0.0 to switch the dark end off) and a test pins
+down exactly which presets they select, so tuning a color into that corner shows
+up in the test rather than in the menu. Rim everything by setting the chroma
+bound above 1.0; rim nothing by setting it to 0.
 
 `off` is a hollow ring — the one case where the shape, not the color, carries
 the meaning.
@@ -357,18 +360,26 @@ Recommend (1) for v1, with (3) as the principled fix if it grates.
 
 ## Menu shape
 
-Everything at the top level. The first draft put the colors behind a `Color`
-submenu to keep the menu under ~810 px, and that was the wrong trade: picking a
-color is the *only* thing this exists to do, so it should not cost an extra hop.
-Same for `Target` — three options don't earn a submenu either.
+A shortlist inline, the rest one hop away. Two drafts were wrong before this
+one: all 29 behind a `Color` submenu made the only action cost an extra hop, and
+all 29 inline was too tall to be pleasant. A curated ten covers the common case
+at one click and leaves `All Colors` for everything else.
 
 ```
   ● warmwhite            <- disabled status line, swatch + current color name
   ─────────────
-  coolwhite              <- all 29, each with its swatch;
-  warmwhite                 the current one is bold (SetMenuDefaultItem)
-  ...
-  pink
+  warmwhite              <- FAVOURITES, each with its swatch;
+  coolwhite                 the current one is bold (SetMenuDefaultItem)
+  red
+  vermilion
+  orange
+  green
+  seagreen
+  indigo
+  purple
+  rose
+  ─────────────
+  All Colors       >     <- all 29, same ids, so either route is one click
   ─────────────
   ○ Off                  <- hollow ring, never a black disc
   ─────────────
@@ -377,16 +388,16 @@ Same for `Target` — three options don't earn a submenu either.
   GPU
   Both                   <- radio-marked
   ─────────────
-  Reapply
   Exit
 ```
 
-If it ever outgrows a screen, `MFT_MENUBARBREAK` on one item splits the list
-into columns without moving anything.
+Both lists address a color by its index into `PRESETS`, so a pick from either
+lands in the same place and the command handler doesn't know the difference.
 
-`Reapply` re-sends the last known color — useful after a controller reset. When
-state is unknown, `Multi`, or mixed across devices, it falls back to the default
-preset and the status line says so rather than showing a stale color.
+There is no `Reapply`. It was in the plan, and it turned out to duplicate
+clicking the color again. The one thing it uniquely did was re-send a
+hand-tuned hex, which has no menu item of its own — if that ever matters, it is
+a few lines to bring back.
 
 Target selection is tray-local UI state, not a property of jdrgb. It lives in
 `%LOCALAPPDATA%\jdrgb\tray-target` — **not** beside the executable, which is in
@@ -439,12 +450,17 @@ Everything above is the corrected text. What it used to say, and why it moved:
    every reader of the state file gets the distinction. `load_last` treats it
    like `Multi`, since black is a useless place to resume tuning from.
    *Found by using it, not by review.*
-2. **Colors and target moved to the top level**, from submenus. See above.
-3. **Rims narrowed** from every swatch to three. See above.
-4. **The tray defaults to both devices**, not the strip.
-5. **The crate split cost 1,536 bytes**, predicted to be free.
-6. **`Win32_Graphics_Dwm` isn't needed**; `Win32_Security` is.
-7. **`println!` under `windows_subsystem = "windows"` was a phantom hazard** —
+2. **Menu shape took three passes.** Submenu for everything → everything
+   inline → a curated ten inline with `All Colors` behind them. Target moved
+   inline and stayed there.
+3. **`Reapply` was cut.** It duplicated clicking the color again.
+4. **Rims narrowed** from every swatch to two, in two steps: first to the
+   near-neutral extremes, then dropping `black` once it was clear a dark menu
+   is nowhere near black. See above.
+5. **The tray defaults to both devices**, not the strip.
+6. **The crate split cost 1,536 bytes**, predicted to be free.
+7. **`Win32_Graphics_Dwm` isn't needed**; `Win32_Security` is.
+8. **`println!` under `windows_subsystem = "windows"` was a phantom hazard** —
    measured, not assumed. See Appendix A.
 
 Still true as planned, and worth noting because they were the risky calls: the

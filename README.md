@@ -417,6 +417,10 @@ ring when the LEDs are off.
 .\install.ps1 -Tray -All -Color warmwhite
 ```
 
+The menu carries a shortlist of colors inline and the full palette under
+**All Colors**. Edit `FAVOURITES` in `src/tray/main.rs` to change the
+shortlist; a test checks every name against the preset table.
+
 It is a **second binary, and a second task**. Two binaries because a PE has
 exactly one subsystem: `jdrgb.exe` has to stay a console app, and a tray app
 must not be one. They share the color tables through a small library, so the
