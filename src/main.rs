@@ -522,9 +522,15 @@ fn save_gpu_flash(target: Target) -> Result<(), String> {
 // Device discovery
 // ---------------------------------------------------------------------------
 
-/// Open the Aura control interface. The correct HID interface is the one that
-/// answers the config request (reply byte 1 == 0x30).
-fn open(api: &HidApi) -> Result<HidDevice, String> {
+/// Open the Aura control interface, returning it with its config table. The
+/// correct HID interface is the one that answers the config request (reply
+/// byte 1 == 0x30).
+///
+/// The table comes back because reading it is how the interface gets identified
+/// in the first place. Every caller needs it, and discarding it here only made
+/// them all ask the device for the same 60 bytes a second time — ~12ms on a bus
+/// where each exchange is expensive.
+fn open(api: &HidApi) -> Result<(HidDevice, [u8; 60]), String> {
     let candidates: Vec<&DeviceInfo> = api
         .device_list()
         .filter(|d| d.vendor_id() == VENDOR_ID && d.product_id() == PRODUCT_ID)
@@ -537,12 +543,14 @@ fn open(api: &HidApi) -> Result<HidDevice, String> {
     let mut last = String::from("controller found but no HID interface answered");
     for info in candidates {
         match info.open_device(api) {
-            Ok(dev) if read_config(&dev).is_some() => return Ok(dev),
-            Ok(_) => {
-                last = "opened the controller but it didn't respond \
-                    (is Armoury Crate or another RGB app holding it?)"
-                    .into()
-            }
+            Ok(dev) => match read_config(&dev) {
+                Some(cfg) => return Ok((dev, cfg)),
+                None => {
+                    last = "opened the controller but it didn't respond \
+                        (is Armoury Crate or another RGB app holding it?)"
+                        .into()
+                }
+            },
             Err(e) => last = format!("could not open HID interface: {e}"),
         }
     }
@@ -591,8 +599,7 @@ fn header_count(cfg: &[u8; 60]) -> u8 {
 
 fn set_solid(mode: u8, color: (u8, u8, u8)) -> Result<(), String> {
     let api = HidApi::new().map_err(|e| format!("hidapi init failed: {e}"))?;
-    let dev = open(&api)?;
-    let cfg = read_config(&dev).ok_or("could not read config table")?;
+    let (dev, cfg) = open(&api)?;
     let headers = header_count(&cfg);
     if headers == 0 {
         return Err("config table reported no addressable headers".into());
@@ -694,8 +701,7 @@ fn send_direct(dev: &HidDevice, channel: u8, colors: &[(u8, u8, u8)]) -> Result<
 /// every header so it lands regardless of which one the strip is on.
 fn set_rainbow(count: usize) -> Result<(), String> {
     let api = HidApi::new().map_err(|e| format!("hidapi init failed: {e}"))?;
-    let dev = open(&api)?;
-    let cfg = read_config(&dev).ok_or("could not read config table")?;
+    let (dev, cfg) = open(&api)?;
     let count = count.clamp(2, 255);
 
     let colors: Vec<(u8, u8, u8)> = (0..count)
@@ -766,8 +772,7 @@ fn set_from_config(path: &str, target: Target) -> Result<(), String> {
 
 fn paint_strip(colors: &[(u8, u8, u8)]) -> Result<(), String> {
     let api = HidApi::new().map_err(|e| format!("hidapi init failed: {e}"))?;
-    let dev = open(&api)?;
-    let cfg = read_config(&dev).ok_or("could not read config table")?;
+    let (dev, cfg) = open(&api)?;
     for ch in 0..header_count(&cfg) {
         send_direct(&dev, ch, colors)?;
     }
@@ -888,8 +893,7 @@ struct Live<'a> {
 impl Live<'_> {
     fn open(api: &HidApi, target: Target) -> Result<Live<'_>, String> {
         let mb = if target.mb() {
-            let dev = open(api)?;
-            let cfg = read_config(&dev).ok_or("could not read config table")?;
+            let (dev, cfg) = open(api)?;
             let headers = header_count(&cfg);
             if headers == 0 {
                 return Err("config table reported no addressable headers".into());
