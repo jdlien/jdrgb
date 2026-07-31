@@ -36,10 +36,15 @@ pub const PRESETS: &[(&str, (u8, u8, u8))] = &[
     ("black", (0x00, 0x00, 0x00)),
     ("red", (0xFF, 0x00, 0x00)),
     // Interpolated to fill a gap, not dialled in — see the note on GPU_PRESETS.
-    // Named vermilion, not scarlet: the value is within 2° of dictionary scarlet
-    // (#FF2400), but it reads as an orange-red, and "scarlet" leads people to
-    // expect the deep pinkish red on the far side of the wheel — crimson.
-    ("vermilion", (0xFF, 0x1D, 0x00)),
+    //
+    // Named for what it renders as, not for where it sits on the wheel. By value
+    // it is within 2° of dictionary scarlet (#FF2400) and it was called
+    // `vermilion` for a while on the same reasoning. Neither name survived
+    // contact with the strip: asking a HomeKit bulb for "vermillion" and then
+    // for "burnt orange" and holding each against this, it is plainly the
+    // second. The wheel says one thing and the LEDs say another; the LEDs win,
+    // because the name exists to help you recognise the colour before it lands.
+    ("burntorange", (0xFF, 0x1D, 0x00)),
     ("orange", (0xFF, 0x3A, 0x00)),
     ("amber", (0xFF, 0x87, 0x00)),
     ("yellow", (0xFF, 0xD0, 0x00)),
@@ -108,7 +113,7 @@ pub const GPU_PRESETS: &[(&str, (u8, u8, u8))] = &[
     // each line is the strip value it was matched against.
     ("coolwhite", (0xD2, 0x94, 0x32)),  // FFB0D0
     ("warmwhite", (0xFF, 0x56, 0x0A)),  // FA9536
-    ("vermilion", (0xFF, 0x10, 0x00)),  // FF1D00  interp
+    ("burntorange", (0xFF, 0x10, 0x00)), // FF1D00  interp
     ("orange", (0xFF, 0x20, 0x00)),     // FF3A00
     ("amber", (0xFF, 0x54, 0x00)),      // FF8700
     ("yellow", (0xFF, 0x8C, 0x00)),     // FFD000
@@ -156,11 +161,16 @@ pub const GPU_PRESETS: &[(&str, (u8, u8, u8))] = &[
 pub const SWATCH: &[(&str, (u8, u8, u8))] = &[
     ("coolwhite", (0xF5, 0xF8, 0xFF)), // a clean white, faintly cool
     ("warmwhite", (0xFF, 0xD9, 0xB3)), // ~2700K warm white
-    // The strip compresses the red->orange arc, so vermilion's #FF1D00 sits at
+    // The strip compresses the red->orange arc, so burntorange's #FF1D00 sits at
     // hue 7 on the wire while reading as hue 15. turquoise/sky/cerise/rose need
     // no entry: their stretch of the wheel is untuned, so wire and appearance
     // already agree.
-    ("vermilion", (0xFF, 0x40, 0x00)),
+    //
+    // NOTE: this entry predates the rename and may now be understating things.
+    // If the strip really reads as burnt orange, the appearance sits nearer hue
+    // 25 than 15 — but hue 30 is `orange`, so moving it would crowd the two
+    // together. Worth an eyeball against both before changing.
+    ("burntorange", (0xFF, 0x40, 0x00)),
     ("orange", (0xFF, 0x7F, 0x00)),
     ("amber", (0xFF, 0xBF, 0x00)),
     ("yellow", (0xFF, 0xFF, 0x00)),

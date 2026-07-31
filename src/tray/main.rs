@@ -61,7 +61,7 @@ const FAVOURITES: &[&str] = &[
     "warmwhite",
     "coolwhite",
     "red",
-    "vermilion",
+    "burntorange",
     "orange",
     "green",
     "seagreen",
@@ -70,7 +70,8 @@ const FAVOURITES: &[&str] = &[
     "rose",
 ];
 
-const ID_STATUS: u32 = 1;
+const ID_STATUS_MB: u32 = 1;
+const ID_STATUS_GPU: u32 = 3;
 const ID_OFF: u32 = 2;
 const ID_EXIT: u32 = 4;
 const ID_TARGET_MB: u32 = 5;
@@ -171,18 +172,35 @@ enum Current {
 }
 
 impl Current {
-    fn read(target: Target) -> Current {
+    /// Both devices, from a single read of the state file.
+    fn both() -> (Current, Current) {
         let (mb, gpu) = load_state();
+        (Current::from_slot(mb, false), Current::from_slot(gpu, true))
+    }
+
+    fn read(target: Target) -> Current {
+        let (mb, gpu) = Current::both();
         match target {
-            Target::Mb => Current::from_slot(mb, false),
-            Target::Gpu => Current::from_slot(gpu, true),
-            Target::All => {
-                let (a, b) = (Current::from_slot(mb, false), Current::from_slot(gpu, true));
-                match (&a, &b) {
-                    (Current::Named(x), Current::Named(y)) if x == y => a,
-                    _ => Current::Mixed,
-                }
-            }
+            Target::Mb => mb,
+            Target::Gpu => gpu,
+            Target::All => match (&mb, &gpu) {
+                (Current::Named(x), Current::Named(y)) if x == y => mb,
+                _ => Current::Mixed,
+            },
+        }
+    }
+
+    /// The argument that would re-send this exact state, if there is one.
+    ///
+    /// `None` for anything with no single colour behind it — a per-LED pattern
+    /// can't be re-sent from a menu, and an unrecorded slot has nothing to
+    /// re-send. Those cases leave the status row disabled.
+    fn arg(&self) -> Option<String> {
+        match self {
+            Current::Named(name) => Some((*name).to_string()),
+            Current::Hex((r, g, b)) => Some(format!("{r:02X}{g:02X}{b:02X}")),
+            Current::Off => Some("off".to_string()),
+            Current::Multi | Current::Unknown | Current::Mixed => None,
         }
     }
 
@@ -227,6 +245,7 @@ impl Current {
 /// them — the colours never change, only the pixel size does.
 struct Swatches {
     dpi: u32,
+    size: i32,
     presets: Vec<HBITMAP>,
     empty: HBITMAP,
 }
@@ -241,7 +260,25 @@ impl Swatches {
             })
             .collect();
         let empty = unsafe { draw::dib(size, &draw::pixels(size, Swatch::Empty)) };
-        Swatches { dpi, presets, empty }
+        Swatches { dpi, size, presets, empty }
+    }
+
+    /// The bitmap for one state. Presets come from the cache; a hand-tuned hex
+    /// has no cached bitmap, so one is drawn for this menu only and pushed into
+    /// `scratch` for the caller to free once the menu closes.
+    unsafe fn bitmap_for(&self, cur: &Current, scratch: &mut Vec<HBITMAP>) -> Option<HBITMAP> {
+        match cur {
+            Current::Named(name) => PRESETS
+                .iter()
+                .position(|&(p, _)| p == *name)
+                .map(|i| self.presets[i]),
+            Current::Hex(rgb) => {
+                let b = unsafe { draw::dib(self.size, &draw::pixels(self.size, Swatch::Solid(*rgb))) };
+                scratch.push(b);
+                Some(b)
+            }
+            _ => Some(self.empty),
+        }
     }
 
     unsafe fn destroy(&self) {
@@ -466,7 +503,13 @@ unsafe fn refresh_icon(app: *mut App) {
         let nid = &mut (*app).nid;
         nid.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
         nid.hIcon = icon;
-        set_field(&mut nid.szTip, &format!("jdrgb - {}", current.label()));
+        // Both devices, for the same reason the menu shows two rows: the icon
+        // can only be one colour, so the tooltip is where the other half goes.
+        let (mb, gpu) = Current::both();
+        set_field(
+            &mut nid.szTip,
+            &format!("jdrgb — Strip: {}  ·  GPU: {}", mb.label(), gpu.label()),
+        );
         Shell_NotifyIconW(NIM_MODIFY, nid);
         if !old.is_null() {
             DestroyIcon(old);
@@ -565,16 +608,27 @@ unsafe fn show_menu(app: *mut App, x: i32, y: i32) {
 
     let menu = unsafe { CreatePopupMenu() };
 
-    // Status line: disabled text, which is also what lets Windows 11 give the
-    // menu its modern styling rather than falling back to the classic look.
-    let status_bmp = match current_name {
-        Some(n) => unsafe {
-            let idx = PRESETS.iter().position(|&(p, _)| p == n).unwrap_or(0);
-            (*app).swatches.as_ref().map(|s| s.presets[idx])
-        },
-        None => unsafe { (*app).swatches.as_ref().map(|s| s.empty) },
-    };
-    unsafe { add_item(menu, ID_STATUS, &current.label(), status_bmp, false) };
+    // One status row per device, each with its own swatch. A single row could
+    // only ever name one colour, and with two controllers that is the less
+    // interesting half of the answer.
+    //
+    // They are *enabled*, and clicking one re-sends that device's colour.
+    // Partly because that is a sensible thing for a row saying "Strip: rose" to
+    // do — and it is the only route back to a hand-tuned hex, which has no menu
+    // item of its own — but mostly because a disabled item renders dimmed, and
+    // dim grey is exactly what makes a status line hard to read. A row with
+    // nothing to re-send stays disabled, so the contrast tracks whether the
+    // click would do anything.
+    let (mb_cur, gpu_cur) = Current::both();
+    let mut scratch: Vec<HBITMAP> = Vec::new();
+    for (id, name, cur) in [
+        (ID_STATUS_MB, "Strip", &mb_cur),
+        (ID_STATUS_GPU, "GPU", &gpu_cur),
+    ] {
+        let bmp = unsafe { (*app).swatches.as_ref().and_then(|s| s.bitmap_for(cur, &mut scratch)) };
+        let text = format!("{name}: {}", cur.label());
+        unsafe { add_item(menu, id, &text, bmp, cur.arg().is_some()) };
+    }
     unsafe { AppendMenuW(menu, MF_SEPARATOR, 0, core::ptr::null()) };
 
     // A shortlist in the menu itself, the rest one hop away. All 29 at the top
@@ -664,6 +718,9 @@ unsafe fn show_menu(app: *mut App, x: i32, y: i32) {
     };
     unsafe { PostMessageW(hwnd, WM_NULL, 0, 0) };
     unsafe { DestroyMenu(menu) }; // takes the submenus with it
+    for b in scratch {
+        unsafe { DeleteObject(b as _) };
+    }
 
     if cmd > 0 {
         unsafe { on_command(app, cmd as u32) };
@@ -687,20 +744,35 @@ unsafe fn on_command(app: *mut App, id: u32) {
             // different now even though nothing was applied.
             unsafe { refresh_icon(app) };
         }
-        ID_OFF => unsafe { apply(app, "off", "off") },
+        ID_OFF => {
+            let t = unsafe { (*app).target };
+            unsafe { apply(app, "off", "off", t) };
+        }
+        // A status row re-sends that one device, whatever Target is set to.
+        // The row names a device, so acting on a different one would be a lie.
+        ID_STATUS_MB | ID_STATUS_GPU => {
+            let gpu = id == ID_STATUS_GPU;
+            let (mb_cur, gpu_cur) = Current::both();
+            let cur = if gpu { gpu_cur } else { mb_cur };
+            if let Some(arg) = cur.arg() {
+                let device = if gpu { Target::Gpu } else { Target::Mb };
+                unsafe { apply(app, &arg, &cur.label(), device) };
+            }
+        }
         _ if id >= ID_PRESET_BASE => {
             let i = (id - ID_PRESET_BASE) as usize;
             if let Some(&(name, _)) = PRESETS.get(i) {
-                unsafe { apply(app, name, name) };
+                let t = unsafe { (*app).target };
+                unsafe { apply(app, name, name, t) };
             }
         }
         _ => {}
     }
 }
 
-unsafe fn apply(app: *mut App, arg: &str, label: &str) {
+unsafe fn apply(app: *mut App, arg: &str, label: &str, target: Target) {
     let mut args = vec![arg.to_string()];
-    if let Some(flag) = unsafe { (*app).target }.flag() {
+    if let Some(flag) = target.flag() {
         args.push(flag.to_string());
     }
     if let Some(tx) = unsafe { &(*app).tx } {

@@ -82,7 +82,7 @@ Notably `white` (`#FFFFFF`) reads greenish here, so the default is `coolwhite`
 warm tone.
 
 ```
-coolwhite  warmwhite  white  black  red  vermilion  orange  amber  yellow
+coolwhite  warmwhite  white  black  red  burntorange  orange  amber  yellow
 chartreuse  lime  green  seagreen  teal  turquoise  cyan  sky  azure  cobalt
 sapphire  blue  indigo  purple  violet  magenta  cerise  hotpink  rose  pink
 ```
@@ -116,7 +116,7 @@ Nothing else is consistent — green against red moves both ways, and only sligh
 |---|---|---|
 | `coolwhite` | `#FFB0D0` | `#D29432` |
 | `warmwhite` | `#FA9536` | `#FF560A` |
-| `vermilion` | `#FF1D00` | `#FF1000` | *interp* |
+| `burntorange` | `#FF1D00` | `#FF1000` | *interp* |
 | `orange` | `#FF3A00` | `#FF2000` |
 | `amber` | `#FF8700` | `#FF5400` |
 | `yellow` | `#FFD000` | `#FF8C00` |

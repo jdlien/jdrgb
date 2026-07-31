@@ -371,7 +371,7 @@ at one click and leaves `All Colors` for everything else.
   warmwhite              <- FAVOURITES, each with its swatch;
   coolwhite                 the current one is bold (SetMenuDefaultItem)
   red
-  vermilion
+  burntorange
   orange
   green
   seagreen
