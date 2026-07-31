@@ -297,7 +297,8 @@ fn main() -> ExitCode {
         Command::Rainbow(n) => with_retry(wait, || set_rainbow(n)).map(|()| {
             println!("jdrgb: rainbow across {n} LEDs (white end-caps)");
         }),
-        Command::Load(path) => with_retry(wait, || set_from_config(&path, target))
+        Command::Load(path) => read_led_config(&path)
+            .and_then(|conf| with_retry(wait, || apply_config(&conf, &path, target)))
             .map(|()| println!("jdrgb: loaded {path}")),
         Command::Template(path) => write_template(&path, force).map(|()| {
             println!("jdrgb: wrote {path} ({STRIP_LEDS} LEDs) — edit it, then `jdrgb load {path}`");
@@ -739,10 +740,15 @@ fn set_rainbow(count: usize) -> Result<(), String> {
     Ok(())
 }
 
-/// Load per-LED colors from a config file and paint them via direct mode.
+/// Paint an already-parsed config via direct mode.
 /// The strip is padded to its full length with "off" so every LED is defined.
-fn set_from_config(path: &str, target: Target) -> Result<(), String> {
-    let conf = read_led_config(path)?;
+///
+/// Parsing happens in the caller, outside the `--wait` retry loop: a missing or
+/// malformed file will never become valid by waiting, and re-reading it 120
+/// times just delays the error by a minute. Only the device work belongs in a
+/// retry, since that genuinely can start succeeding once the controller
+/// enumerates.
+fn apply_config(conf: &LedConfig, path: &str, target: Target) -> Result<(), String> {
     let mut failures = Vec::new();
 
     if target.mb() {
