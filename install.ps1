@@ -20,6 +20,15 @@
   Also install jdrgb-tray.exe and start it at logon: a notification-area menu
   for picking a preset colour. This is a second, separate task — the boot task
   runs as SYSTEM in session 0 and cannot show a tray icon.
+.PARAMETER TrayOnly
+  Install the tray and skip the boot task entirely. Implies -Tray.
+
+  jdrgb commits to the controller's flash on every solid set, so the color
+  already survives a cold boot without anything running. That makes the boot
+  task insurance rather than a requirement — and it isn't free, since it fires
+  at startup, at logon and on resume, writing flash each time to reassert a
+  color that was already there. If you don't need the insurance, don't pay for
+  it. See "GPU persistence" in the README.
 .PARAMETER TrayUser
   Internal. The SID of the user the tray task belongs to, captured before
   elevation. Not meant to be passed by hand.
@@ -33,6 +42,7 @@ param(
     [switch]$Gpu,
     [switch]$All,
     [switch]$Tray,
+    [switch]$TrayOnly,
     [string]$TrayUser = ""
 )
 
@@ -40,9 +50,17 @@ $ErrorActionPreference = "Stop"
 $TaskName = "jdrgb"
 $TrayTaskName = "jdrgb-tray"
 
+if ($TrayOnly) { $Tray = $true }
+
 # --- Reject combinations that would install a permanently failing task -------
 if ($Gpu -and $All) {
     throw "-Gpu and -All are mutually exclusive."
+}
+# -Color and -Config only ever configured the boot task. Silently ignoring them
+# would look like the color had been set up when nothing was listening.
+if ($TrayOnly -and ($Color -or $Config)) {
+    throw ("-TrayOnly registers no boot task, so -Color/-Config would have nothing to configure. " +
+           "Set the color once by hand — it persists — e.g. `"jdrgb $Color --all`".")
 }
 # -Config combined with -Gpu/-All is fine: a config can carry a `gpu:` line, so
 # one file describes the whole machine. If it has no `gpu:` line, jdrgb says so
@@ -68,6 +86,7 @@ if (-not $admin) {
         $sid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
         $argList += @("-Tray", "-TrayUser", $sid)
     }
+    if ($TrayOnly) { $argList += "-TrayOnly" }
     if ($PSBoundParameters.ContainsKey("InstallDir")) { $argList += @("-InstallDir", "`"$InstallDir`"") }
     Start-Process -FilePath (Get-Process -Id $PID).Path -Verb RunAs -ArgumentList $argList
     return
@@ -134,66 +153,81 @@ try {
         Write-Host "Installed binary: $trayTarget"
     }
 
-    # Task components. A config file wins over a single color.
-    $targetFlag = if ($Gpu) { " --gpu" } elseif ($All) { " --all" } else { "" }
-    $taskArgs = "--wait$targetFlag"
-    if ($Config) {
-        if (-not (Test-Path $Config)) { throw "config file not found: $Config" }
-        $confTarget = Join-Path $InstallDir "leds.conf"
-        Copy-Item -Path $Config -Destination $confTarget -Force
-        Write-Host "Installed config: $confTarget"
-        $taskArgs = "load `"$confTarget`" --wait$targetFlag"
-    } elseif ($Color) {
-        $taskArgs = "$Color --wait$targetFlag"
-    }
-    $action    = New-ScheduledTaskAction -Execute $target -Argument $taskArgs
-    $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-    $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-                    -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
+    # --- The boot task, which -TrayOnly skips entirely -----------------------
+    # Optional, and genuinely so: jdrgb commits to the controller's flash on
+    # every solid set, so the color already survives a cold boot with nothing
+    # running. This is insurance for the cases that clear the controllers — a
+    # BIOS update, a CMOS reset, reinstalling vendor software — and it is paid
+    # for in flash writes, once per trigger, reasserting a color that was
+    # already there.
+    if (-not $TrayOnly) {
+        # Task components. A config file wins over a single color.
+        $targetFlag = if ($Gpu) { " --gpu" } elseif ($All) { " --all" } else { "" }
+        $taskArgs = "--wait$targetFlag"
+        if ($Config) {
+            if (-not (Test-Path $Config)) { throw "config file not found: $Config" }
+            $confTarget = Join-Path $InstallDir "leds.conf"
+            Copy-Item -Path $Config -Destination $confTarget -Force
+            Write-Host "Installed config: $confTarget"
+            $taskArgs = "load `"$confTarget`" --wait$targetFlag"
+        } elseif ($Color) {
+            $taskArgs = "$Color --wait$targetFlag"
+        }
+        $action    = New-ScheduledTaskAction -Execute $target -Argument $taskArgs
+        $principal = New-ScheduledTaskPrincipal -UserId "NT AUTHORITY\SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+        $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                        -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
 
-    # Startup fires before login; logon is a belt-and-suspenders re-apply that
-    # survives a late controller reset. Both run as SYSTEM.
-    $base = @(
-        (New-ScheduledTaskTrigger -AtStartup),
-        (New-ScheduledTaskTrigger -AtLogOn)
-    )
+        # Startup fires before login; logon is a belt-and-suspenders re-apply that
+        # survives a late controller reset. Both run as SYSTEM.
+        $base = @(
+            (New-ScheduledTaskTrigger -AtStartup),
+            (New-ScheduledTaskTrigger -AtLogOn)
+        )
 
-    # Try base + resume-from-sleep; if the wake trigger is rejected, fall back.
-    $registered = $false
-    if (-not $NoWake) {
-        try {
-            $evtClass = Get-CimClass -Namespace ROOT\Microsoft\Windows\TaskScheduler -ClassName MSFT_TaskEventTrigger
-            $wake = New-CimInstance -CimClass $evtClass -ClientOnly
-            $wake.Enabled = $true
-            $wake.Subscription = '<QueryList><Query Id="0" Path="System"><Select Path="System">*[System[Provider[@Name=''Microsoft-Windows-Power-Troubleshooter''] and (EventID=1)]]</Select></Query></QueryList>'
-            Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger ($base + $wake) `
+        # Try base + resume-from-sleep; if the wake trigger is rejected, fall back.
+        $registered = $false
+        if (-not $NoWake) {
+            try {
+                $evtClass = Get-CimClass -Namespace ROOT\Microsoft\Windows\TaskScheduler -ClassName MSFT_TaskEventTrigger
+                $wake = New-CimInstance -CimClass $evtClass -ClientOnly
+                $wake.Enabled = $true
+                $wake.Subscription = '<QueryList><Query Id="0" Path="System"><Select Path="System">*[System[Provider[@Name=''Microsoft-Windows-Power-Troubleshooter''] and (EventID=1)]]</Select></Query></QueryList>'
+                Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger ($base + $wake) `
+                    -Principal $principal -Settings $settings -Force `
+                    -Description "Set ASUS Aura LEDs to a static color at boot (jdrgb)." | Out-Null
+                Write-Host "Registered task '$TaskName' with startup + logon + resume-from-sleep triggers."
+                $registered = $true
+            } catch {
+                Write-Warning "Could not register the resume-from-sleep trigger: $($_.Exception.Message)"
+                Write-Warning "Falling back to startup + logon."
+            }
+        }
+
+        if (-not $registered) {
+            Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $base `
                 -Principal $principal -Settings $settings -Force `
                 -Description "Set ASUS Aura LEDs to a static color at boot (jdrgb)." | Out-Null
-            Write-Host "Registered task '$TaskName' with startup + logon + resume-from-sleep triggers."
-            $registered = $true
-        } catch {
-            Write-Warning "Could not register the resume-from-sleep trigger: $($_.Exception.Message)"
-            Write-Warning "Falling back to startup + logon."
+            Write-Host "Registered task '$TaskName' with startup + logon triggers."
         }
-    }
 
-    if (-not $registered) {
-        Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $base `
-            -Principal $principal -Settings $settings -Force `
-            -Description "Set ASUS Aura LEDs to a static color at boot (jdrgb)." | Out-Null
-        Write-Host "Registered task '$TaskName' with startup + logon triggers."
+        # Run it once now. The task uses --wait, so it can legitimately take up to a
+        # minute if the controller isn't enumerated yet; poll instead of guessing at
+        # a fixed 500ms, which reported a result from before the task had finished.
+        Start-ScheduledTask -TaskName $TaskName
+        $deadline = (Get-Date).AddSeconds(90)
+        do {
+            Start-Sleep -Milliseconds 500
+            $info = Get-ScheduledTaskInfo -TaskName $TaskName
+            $running = (Get-ScheduledTask -TaskName $TaskName).State -eq "Running"
+        } while ($running -and (Get-Date) -lt $deadline)
     }
-
-    # Run it once now. The task uses --wait, so it can legitimately take up to a
-    # minute if the controller isn't enumerated yet; poll instead of guessing at
-    # a fixed 500ms, which reported a result from before the task had finished.
-    Start-ScheduledTask -TaskName $TaskName
-    $deadline = (Get-Date).AddSeconds(90)
-    do {
-        Start-Sleep -Milliseconds 500
-        $info = Get-ScheduledTaskInfo -TaskName $TaskName
-        $running = (Get-ScheduledTask -TaskName $TaskName).State -eq "Running"
-    } while ($running -and (Get-Date) -lt $deadline)
+    elseif (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+        # Upgrading an install that had one. Leaving it would keep writing flash
+        # on every boot behind your back, which is the thing -TrayOnly avoids.
+        Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+        Write-Host "Removed the existing boot task '$TaskName' (-TrayOnly)."
+    }
 
     # --- The tray, which needs a task of its own ----------------------------
     # The boot task above runs as SYSTEM so it can fire before anyone logs in.
@@ -229,6 +263,14 @@ try {
         } else {
             Write-Warning "The tray task was registered but the process isn't running yet; it will start at your next logon."
         }
+    }
+
+    if ($TrayOnly) {
+        Write-Host ""
+        Write-Host "SUCCESS. The tray will start at logon."
+        Write-Host "No boot task: the color is already held in the controllers' flash, so it"
+        Write-Host "survives a cold boot on its own. Set it once with jdrgb and leave it."
+        return
     }
 
     $what = if ($Config) { "config '$confTarget'" } elseif ($Color) { "color '$Color'" } else { "default preset" }

@@ -183,6 +183,48 @@ pub const SWATCH: &[(&str, (u8, u8, u8))] = &[
     ("pink", (0xFF, 0x9E, 0xB5)), // soft, not the saturated value the strip needs
 ];
 
+/// A preset name as it should read in a UI: `burntorange` -> `Burnt Orange`.
+///
+/// The stored names are lowercase single tokens because that is what you type.
+/// Nothing is typed at a menu, so a menu can afford to be legible.
+///
+/// The word split is derived rather than tabulated. Every compound in this
+/// palette is a modifier followed by a base colour that is *itself* a preset —
+/// `seagreen` ends in `green`, `burntorange` in `orange`, `coolwhite` in
+/// `white`. So the table teaches the splitter, and a compound added later reads
+/// correctly without anyone remembering to update a map. The longest matching
+/// base wins, and the base is split again, so a hypothetical `darkseagreen`
+/// would come out as `Dark Sea Green` rather than `Dark Seagreen`.
+///
+/// The remainder must be a plausible word on its own, or a future two-letter
+/// preset would start slicing `red` into `R Ed`.
+pub fn display_name(name: &str) -> String {
+    const MIN_MODIFIER: usize = 3;
+
+    let base = PRESETS
+        .iter()
+        .map(|&(base, _)| base)
+        .filter(|base| *base != name && name.len() >= base.len() + MIN_MODIFIER)
+        .filter(|base| name.ends_with(base))
+        .max_by_key(|base| base.len());
+
+    match base {
+        Some(base) => {
+            let modifier = &name[..name.len() - base.len()];
+            format!("{} {}", capitalise(modifier), display_name(base))
+        }
+        None => capitalise(name),
+    }
+}
+
+fn capitalise(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 /// The on-screen appearance of a preset, falling back to the strip's value for
 /// anything that already looks like itself.
 pub fn swatch_rgb(name: &str) -> (u8, u8, u8) {
@@ -453,6 +495,52 @@ mod tests {
         assert_ne!(swatch_rgb("coolwhite"), p.rgb(false));
         assert_eq!(p.rgb(false), (0xFF, 0xB0, 0xD0));
         assert_eq!(p.rgb(true), (0xD2, 0x94, 0x32));
+    }
+
+    #[test]
+    fn compound_names_split_on_a_base_that_is_itself_a_preset() {
+        assert_eq!(display_name("burntorange"), "Burnt Orange");
+        assert_eq!(display_name("coolwhite"), "Cool White");
+        assert_eq!(display_name("warmwhite"), "Warm White");
+        assert_eq!(display_name("seagreen"), "Sea Green");
+        assert_eq!(display_name("hotpink"), "Hot Pink");
+    }
+
+    #[test]
+    fn single_words_are_only_capitalised() {
+        // `chartreuse` ends in "reuse" and `turquoise` in "oise"; neither is a
+        // preset, so neither gets carved up.
+        assert_eq!(display_name("red"), "Red");
+        assert_eq!(display_name("chartreuse"), "Chartreuse");
+        assert_eq!(display_name("turquoise"), "Turquoise");
+        assert_eq!(display_name("cerise"), "Cerise");
+    }
+
+    /// The splitter is derived from the table, so the table can break it —
+    /// adding a short preset could make an existing name split somewhere silly.
+    /// Pinning every rendered name means that shows up here, not in the menu.
+    #[test]
+    fn every_preset_renders_the_way_it_should() {
+        let rendered: Vec<String> = PRESETS.iter().map(|&(n, _)| display_name(n)).collect();
+        assert_eq!(
+            rendered,
+            [
+                "Cool White", "Warm White", "White", "Black", "Red", "Burnt Orange", "Orange",
+                "Amber", "Yellow", "Chartreuse", "Lime", "Green", "Sea Green", "Teal",
+                "Turquoise", "Cyan", "Sky", "Azure", "Cobalt", "Sapphire", "Blue", "Indigo",
+                "Purple", "Violet", "Magenta", "Cerise", "Hot Pink", "Rose", "Pink",
+            ]
+        );
+    }
+
+    /// A display name is never something the CLI would accept, so nothing may
+    /// quietly pass one back as an argument.
+    #[test]
+    fn a_display_name_round_trips_only_through_lowercase() {
+        for &(name, _) in PRESETS {
+            let shown = display_name(name);
+            assert_eq!(shown.to_lowercase().replace(' ', ""), name);
+        }
     }
 
     #[test]

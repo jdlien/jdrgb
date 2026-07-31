@@ -414,8 +414,21 @@ opening a terminal. The icon *is* the current color — a filled dot, or a hollo
 ring when the LEDs are off.
 
 ```powershell
-.\install.ps1 -Tray -All -Color warmwhite
+.\install.ps1 -TrayOnly          # the tray at logon, no boot task
+.\install.ps1 -Tray -All -Color warmwhite   # both, if you want the insurance
 ```
+
+**`-TrayOnly` is usually the one you want.** The color is already held in the
+controllers' flash (see [GPU persistence](#gpu-persistence)), so it survives a
+cold boot with nothing running — which makes the boot task insurance rather
+than a requirement, and it isn't free: it fires at startup, at logon *and* on
+resume, writing flash each time to reassert a color that was already there.
+Keep it if you want cover for a BIOS update or a CMOS reset. Otherwise the tray
+is the only thing that actually needs to persist, because unlike a color, a
+menu can't be latched into hardware.
+
+`-TrayOnly` refuses `-Color`/`-Config`, which only ever configured the boot
+task, and removes an existing boot task if you're switching over.
 
 The menu carries a shortlist of colors inline and the full palette under
 **All Colors**. Edit `FAVOURITES` in `src/tray/main.rs` to change the

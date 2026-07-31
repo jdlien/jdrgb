@@ -14,7 +14,7 @@ mod worker;
 use std::sync::mpsc::Sender;
 
 use draw::Swatch;
-use jdrgb::palette::{Last, PRESETS, load_state, preset_for_rgb, swatch_rgb};
+use jdrgb::palette::{Last, PRESETS, display_name, load_state, preset_for_rgb, swatch_rgb};
 
 use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
@@ -223,14 +223,15 @@ impl Current {
         }
     }
 
+    /// For display only — never an argument. `arg()` is what gets sent.
     fn label(&self) -> String {
         match self {
-            Current::Named(name) => (*name).to_string(),
+            Current::Named(name) => display_name(name),
             Current::Hex((r, g, b)) => format!("#{r:02X}{g:02X}{b:02X}"),
-            Current::Off => "off".to_string(),
-            Current::Multi => "per-LED pattern".to_string(),
-            Current::Unknown => "not set from here".to_string(),
-            Current::Mixed => "strip and GPU differ".to_string(),
+            Current::Off => "Off".to_string(),
+            Current::Multi => "Per-LED pattern".to_string(),
+            Current::Unknown => "Not set from here".to_string(),
+            Current::Mixed => "Strip and GPU differ".to_string(),
         }
     }
 
@@ -639,7 +640,7 @@ unsafe fn show_menu(app: *mut App, x: i32, y: i32) {
     for name in FAVOURITES {
         if let Some(i) = PRESETS.iter().position(|&(p, _)| p == *name) {
             let bmp = unsafe { (*app).swatches.as_ref().map(|s| s.presets[i]) };
-            unsafe { add_item(menu, ID_PRESET_BASE + i as u32, name, bmp, true) };
+            unsafe { add_item(menu, ID_PRESET_BASE + i as u32, &display_name(name), bmp, true) };
             favourites.push(i);
         }
     }
@@ -647,7 +648,7 @@ unsafe fn show_menu(app: *mut App, x: i32, y: i32) {
     let all = unsafe { CreatePopupMenu() };
     for (i, &(name, _)) in PRESETS.iter().enumerate() {
         let bmp = unsafe { (*app).swatches.as_ref().map(|s| s.presets[i]) };
-        unsafe { add_item(all, ID_PRESET_BASE + i as u32, name, bmp, true) };
+        unsafe { add_item(all, ID_PRESET_BASE + i as u32, &display_name(name), bmp, true) };
     }
     let all_label = wide("All Colors");
     unsafe {
@@ -764,7 +765,9 @@ unsafe fn on_command(app: *mut App, id: u32) {
             let i = (id - ID_PRESET_BASE) as usize;
             if let Some(&(name, _)) = PRESETS.get(i) {
                 let t = unsafe { (*app).target };
-                unsafe { apply(app, name, name, t) };
+                // The stored name is the argument; the pretty one is for the
+                // balloon. Sending the display name would just be an error.
+                unsafe { apply(app, name, &display_name(name), t) };
             }
         }
         _ => {}
@@ -895,6 +898,21 @@ mod tests {
     #[test]
     fn a_hex_is_labelled_with_its_hash() {
         assert_eq!(Current::Hex((0xFF, 0x00, 0x00)).label(), "#FF0000");
+        // ...but sent without one, matching what `jdrgb --help` shows.
+        assert_eq!(Current::Hex((0xFF, 0x00, 0x00)).arg().as_deref(), Some("FF0000"));
+    }
+
+    /// The menu shows `Burnt Orange`; the CLI only answers to `burntorange`.
+    /// Anything that mixes the two up sends an argument jdrgb will reject.
+    #[test]
+    fn a_pretty_label_is_never_the_argument() {
+        for &(name, _) in PRESETS {
+            let cur = Current::Named(name);
+            assert_eq!(cur.arg().as_deref(), Some(name));
+            if display_name(name) != name {
+                assert_ne!(cur.label(), name, "{name} should render prettier than it stores");
+            }
+        }
     }
 
     #[test]
@@ -916,8 +934,11 @@ mod tests {
 
         assert!(matches!(off, Current::Off));
         assert!(matches!(black, Current::Named("black")));
-        assert_eq!(off.label(), "off");
-        assert_eq!(black.label(), "black");
+        assert_eq!(off.label(), "Off");
+        assert_eq!(black.label(), "Black");
+        // The label is cosmetic; what gets sent must stay the CLI's own word.
+        assert_eq!(off.arg().as_deref(), Some("off"));
+        assert_eq!(black.arg().as_deref(), Some("black"));
         assert!(matches!(off.swatch(), Swatch::Empty));
         assert!(matches!(black.swatch(), Swatch::Solid(_)));
     }
