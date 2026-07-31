@@ -1137,6 +1137,12 @@ fn preview(target: Target) -> Result<(), String> {
     let live = Live::open(&api, target)?;
 
     let raw = RawMode::enable();
+    // Keys come from the console input buffer, so without a console `poll_key`
+    // only ever returns None — the slideshow would run forever with no way to
+    // quit. `tune` doesn't need this: its stdin read sees EOF and stops.
+    if !raw.active {
+        return Err("preview needs a console — it reads single keypresses".into());
+    }
     let pal = Palette::new(raw.color);
     let (k, r) = (pal.key, pal.reset);
     println!(
