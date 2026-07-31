@@ -453,7 +453,13 @@ Everything above is the corrected text. What it used to say, and why it moved:
 2. **Menu shape took three passes.** Submenu for everything → everything
    inline → a curated ten inline with `All Colors` behind them. Target moved
    inline and stayed there.
-3. **`Reapply` was cut.** It duplicated clicking the color again.
+3. **`Reapply` was cut, then came back somewhere better.** As a menu row it
+   duplicated clicking the color again. As a click on the status row it is
+   scoped to one device, needs no row of its own, and is the reason those rows
+   can be enabled — which is what makes them legible. Note what it means: the
+   row reports what *jdrgb* last set, not what the hardware is showing. Nothing
+   reads the color back, so if something else repaints the strip the label goes
+   quietly stale; clicking it makes the claim true again.
 4. **Rims narrowed** from every swatch to two, in two steps: first to the
    near-neutral extremes, then dropping `black` once it was clear a dark menu
    is nowhere near black. See above.
