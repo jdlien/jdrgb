@@ -79,8 +79,9 @@ Notably `white` (`#FFFFFF`) reads greenish here, so the default is `coolwhite`
 warm tone.
 
 ```
-coolwhite  warmwhite  white  black  red  orange  amber  yellow  chartreuse  lime
-green  seagreen  teal  cyan  azure  cobalt  blue  indigo  purple  violet  magenta  hotpink  pink
+coolwhite  warmwhite  white  black  red  vermilion  orange  amber  yellow
+chartreuse  lime  green  seagreen  teal  turquoise  cyan  sky  azure  cobalt
+blue  indigo  purple  violet  magenta  cerise  hotpink  rose  pink
 ```
 
 #### `black` vs `off`
@@ -112,6 +113,7 @@ Nothing else is consistent — green against red moves both ways, and only sligh
 |---|---|---|
 | `coolwhite` | `#FFB0D0` | `#D29432` |
 | `warmwhite` | `#FA9536` | `#FF560A` |
+| `vermilion` | `#FF1D00` | `#FF1000` | *interp* |
 | `orange` | `#FF3A00` | `#FF2000` |
 | `amber` | `#FF8700` | `#FF5400` |
 | `yellow` | `#FFD000` | `#FF8C00` |
@@ -119,14 +121,18 @@ Nothing else is consistent — green against red moves both ways, and only sligh
 | `lime` | `#80FF00` | `#DEFF00` |
 | `seagreen` | `#00FF51` | `#00FF15` |
 | `teal` | `#00FF80` | `#00FF2F` |
+| `turquoise` | `#00FFBF` | `#00FF49` | *interp* |
 | `cyan` | `#00FFFF` | `#00FF62` |
+| `sky` | `#00BFFF` | `#00FF8C` | *interp* |
 | `azure` | `#0080FF` | `#00FFB6` |
 | `cobalt` | `#0040FF` | `#00C0FF` |
 | `indigo` | `#2700FF` | `#BB00FF` |
 | `purple` | `#4000FF` | `#FF007F` |
 | `violet` | `#6E00FF` | `#FF0062` |
 | `magenta` | `#FF00FF` | `#FF0026` |
+| `cerise` | `#FF00BF` | `#FF001B` | *interp* |
 | `hotpink` | `#FF0080` | `#FF0011` |
+| `rose` | `#FF0040` | `#FF0008` | *interp* |
 | `pink` | `#D52A66` | `#E71F18` |
 
 That one effect explains corrections that look opposite. Where blue is the minor
@@ -155,6 +161,30 @@ The override table (`GPU_PRESETS` in `src/main.rs`) is deliberately sparse. Only
 presets actually dialled in by eye on the GPU belong there; everything else falls
 back to the shared value, so the table never claims a calibration nobody has
 looked at. `jdrgb presets` marks the calibrated ones with a `gpu` column.
+
+#### Interpolated presets
+
+Five entries are marked *interp*. They were not dialled in by eye — they were
+derived from the ones that were.
+
+Each calibrated pair is a record of two values you judged to *look alike*, so the
+set as a whole is a sampled `strip hue -> GPU hue` function. It turns out to be
+well-behaved: monotonic across all 18 originally-tuned pairs, and purely a matter
+of hue, since every saturated value in both tables sits at full saturation. That
+makes it something you can interpolate through rather than guess at.
+
+The five fill the widest gaps in the wheel, taking the largest spacing from 30°
+down to 20° across 23 saturated hues. All were placed in stretches where the
+slope agrees between neighbouring samples. The volatile region is
+`blue -> indigo -> purple`, where the slope runs 3.0 → 7.8 → 0.6 over about 25° —
+interpolating there would be guesswork, but it's already the densest part of the
+wheel and needed nothing.
+
+The method only works on the full-saturation ring, which is where all the data
+lives. A darker or muted color — a proper crimson, say — sits off that ring
+entirely and would have to be tuned by eye on both devices.
+
+Confirm one in `preview`, then drop its `interp` marker; re-tune it if it's off.
 
 #### The third table: what a preset looks like
 

@@ -76,6 +76,11 @@ const PRESETS: &[(&str, (u8, u8, u8))] = &[
     // device dark and the other lit.
     ("black", (0x00, 0x00, 0x00)),
     ("red", (0xFF, 0x00, 0x00)),
+    // Interpolated to fill a gap, not dialled in — see the note on GPU_PRESETS.
+    // Named vermilion, not scarlet: the value is within 2° of dictionary scarlet
+    // (#FF2400), but it reads as an orange-red, and "scarlet" leads people to
+    // expect the deep pinkish red on the far side of the wheel — crimson.
+    ("vermilion", (0xFF, 0x1D, 0x00)),
     ("orange", (0xFF, 0x3A, 0x00)),
     ("amber", (0xFF, 0x87, 0x00)),
     ("yellow", (0xFF, 0xD0, 0x00)),
@@ -84,7 +89,9 @@ const PRESETS: &[(&str, (u8, u8, u8))] = &[
     ("green", (0x00, 0xFF, 0x00)),
     ("seagreen", (0x00, 0xFF, 0x51)),
     ("teal", (0x00, 0xFF, 0x80)),
+    ("turquoise", (0x00, 0xFF, 0xBF)), // interpolated
     ("cyan", (0x00, 0xFF, 0xFF)),
+    ("sky", (0x00, 0xBF, 0xFF)),    // interpolated
     ("azure", (0x00, 0x80, 0xFF)),  // bright sky blue
     ("cobalt", (0x00, 0x40, 0xFF)), // mid blue, bridges azure->blue in hue + brightness
     ("blue", (0x00, 0x00, 0xFF)),
@@ -92,7 +99,9 @@ const PRESETS: &[(&str, (u8, u8, u8))] = &[
     ("purple", (0x40, 0x00, 0xFF)),
     ("violet", (0x6E, 0x00, 0xFF)),
     ("magenta", (0xFF, 0x00, 0xFF)),
+    ("cerise", (0xFF, 0x00, 0xBF)),  // interpolated
     ("hotpink", (0xFF, 0x00, 0x80)), // intense synthwave/Barbie pink
+    ("rose", (0xFF, 0x00, 0x40)),    // interpolated
     ("pink", (0xD5, 0x2A, 0x66)),    // softer, "pretty in pink"
 ];
 
@@ -120,11 +129,22 @@ const PRESETS: &[(&str, (u8, u8, u8))] = &[
 /// here. Anything absent falls back to the shared value in PRESETS above, so this
 /// table never claims a calibration that hasn't been eyeballed. Add entries with
 /// `jdrgb --gpu tune NAME` and paste the hex it prints.
+///
+/// The `interp` entries are the one exception, and they say so. Each pair here is
+/// really a record of two values that look alike, which makes the whole set a
+/// sampled strip-hue -> GPU-hue function — monotonic across all 18 originals, and
+/// pure hue, since every saturated value in both tables sits at full saturation.
+/// Four presets were added by interpolating it to close the widest gaps. They
+/// were chosen to land in stretches where the slope is stable between
+/// neighbouring samples; the wild region (`blue`->`purple`, where the slope runs
+/// 3.0 -> 7.8 -> 0.6) is already the densest part of the wheel and needed
+/// nothing. Verify one in `preview` and drop its marker, or re-tune it.
 const GPU_PRESETS: &[(&str, (u8, u8, u8))] = &[
     // Kept in PRESETS order so the two tables read side by side. The comment on
     // each line is the strip value it was matched against.
     ("coolwhite", (0xD2, 0x94, 0x32)),  // FFB0D0
     ("warmwhite", (0xFF, 0x56, 0x0A)),  // FA9536
+    ("vermilion", (0xFF, 0x10, 0x00)),  // FF1D00  interp
     ("orange", (0xFF, 0x20, 0x00)),     // FF3A00
     ("amber", (0xFF, 0x54, 0x00)),      // FF8700
     ("yellow", (0xFF, 0x8C, 0x00)),     // FFD000
@@ -132,14 +152,18 @@ const GPU_PRESETS: &[(&str, (u8, u8, u8))] = &[
     ("lime", (0xDE, 0xFF, 0x00)),       // 80FF00
     ("seagreen", (0x00, 0xFF, 0x15)),   // 00FF51
     ("teal", (0x00, 0xFF, 0x2F)),       // 00FF80
+    ("turquoise", (0x00, 0xFF, 0x49)),  // 00FFBF  interp
     ("cyan", (0x00, 0xFF, 0x62)),       // 00FFFF
+    ("sky", (0x00, 0xFF, 0x8C)),        // 00BFFF  interp
     ("azure", (0x00, 0xFF, 0xB6)),      // 0080FF
     ("cobalt", (0x00, 0xC0, 0xFF)),     // 0040FF
     ("indigo", (0xBB, 0x00, 0xFF)),     // 2700FF
     ("purple", (0xFF, 0x00, 0x7F)),     // 4000FF
     ("violet", (0xFF, 0x00, 0x62)),     // 6E00FF
     ("magenta", (0xFF, 0x00, 0x26)),    // FF00FF
+    ("cerise", (0xFF, 0x00, 0x1B)),     // FF00BF  interp
     ("hotpink", (0xFF, 0x00, 0x11)),    // FF0080
+    ("rose", (0xFF, 0x00, 0x08)),       // FF0040  interp
     ("pink", (0xE7, 0x1F, 0x18)),       // D52A66
 ];
 
@@ -166,6 +190,11 @@ const GPU_PRESETS: &[(&str, (u8, u8, u8))] = &[
 const SWATCH: &[(&str, (u8, u8, u8))] = &[
     ("coolwhite", (0xF5, 0xF8, 0xFF)), // a clean white, faintly cool
     ("warmwhite", (0xFF, 0xD9, 0xB3)), // ~2700K warm white
+    // The strip compresses the red->orange arc, so vermilion's #FF1D00 sits at
+    // hue 7 on the wire while reading as hue 15. turquoise/sky/cerise/rose need
+    // no entry: their stretch of the wheel is untuned, so wire and appearance
+    // already agree.
+    ("vermilion", (0xFF, 0x40, 0x00)),
     ("orange", (0xFF, 0x7F, 0x00)),
     ("amber", (0xFF, 0xBF, 0x00)),
     ("yellow", (0xFF, 0xFF, 0x00)),
