@@ -361,63 +361,168 @@ impl Last {
     }
 }
 
+/// Everything the state file holds, for both devices.
+///
 /// The two devices keep separate slots. Sharing one would be actively wrong:
 /// the same look is a *different* RGB on each (see GPU_PRESETS), so carrying the
 /// strip's last value onto the card hands `tune` a starting point that doesn't
 /// render as anything like what was on screen.
 ///
-/// Format is one `dev=value` per line. A legacy file — a bare hex, from before
+/// The `*_pattern` fields exist so a per-LED state can be *reproduced*, which
+/// `Multi` alone cannot do — it says only "no single color", which is the right
+/// answer for the tray's swatch and useless for `jdrgb state`. They are a side
+/// channel rather than a new `Last` variant on purpose: `Last` is what the tray
+/// matches on, and it wants exactly the three cases it already has.
+///
+/// **Invariant: a pattern is only ever written by `record_pattern`, and any
+/// other write to that slot clears it.** That is what makes a stale pattern
+/// impossible rather than merely unlikely — see `record`.
+#[derive(Clone, Default, PartialEq, Eq, Debug)]
+pub struct State {
+    pub mb: Option<Last>,
+    pub gpu: Option<Last>,
+    pub mb_pattern: Option<Vec<(u8, u8, u8)>>,
+    pub gpu_pattern: Option<Vec<(u8, u8, u8)>>,
+}
+
+impl State {
+    /// One device's slot, by the `Paint::rgb(gpu)` convention used everywhere.
+    pub fn slot(&self, gpu: bool) -> Option<Last> {
+        if gpu {
+            self.gpu
+        } else {
+            self.mb
+        }
+    }
+
+    pub fn pattern(&self, gpu: bool) -> Option<&[(u8, u8, u8)]> {
+        let p = if gpu { &self.gpu_pattern } else { &self.mb_pattern };
+        p.as_deref()
+    }
+}
+
+/// Format is one `key=value` per line. A legacy file — a bare hex, from before
 /// the split — is read as the motherboard's, since that's the only device that
 /// ever wrote one.
-pub fn parse_state(text: &str) -> (Option<Last>, Option<Last>) {
+///
+/// Unknown keys are skipped, which is what let the `*.pattern` keys be added
+/// without touching anything that already reads this file.
+pub fn parse_state(text: &str) -> State {
     let text = text.trim();
     if !text.contains('=') {
-        return (Last::decode(text), None);
+        return State { mb: Last::decode(text), ..State::default() };
     }
-    let (mut mb, mut gpu) = (None, None);
+    let mut s = State::default();
     for line in text.lines() {
         let Some((key, value)) = line.split_once('=') else { continue };
+        let value = value.trim();
         match key.trim() {
-            "mb" => mb = Last::decode(value.trim()),
-            "gpu" => gpu = Last::decode(value.trim()),
+            "mb" => s.mb = Last::decode(value),
+            "gpu" => s.gpu = Last::decode(value),
+            "mb.pattern" => s.mb_pattern = decode_pattern(value),
+            "gpu.pattern" => s.gpu_pattern = decode_pattern(value),
             _ => {}
         }
     }
-    (mb, gpu)
+    s
 }
 
-pub fn load_state() -> (Option<Last>, Option<Last>) {
-    match state_path().and_then(|p| std::fs::read_to_string(p).ok()) {
-        Some(text) => parse_state(&text),
-        None => (None, None),
+/// A pattern is all-or-nothing: one unparseable entry drops the whole thing,
+/// rather than silently restoring a frame with a wrong LED in it. Same spirit
+/// as garbage in a colour slot being ignored instead of guessed at.
+fn decode_pattern(s: &str) -> Option<Vec<(u8, u8, u8)>> {
+    if s.is_empty() {
+        return None;
     }
+    s.split(',').map(|c| parse_hex(c.trim())).collect()
 }
 
-pub fn encode_state(mb: Option<Last>, gpu: Option<Last>) -> String {
+fn encode_pattern(colors: &[(u8, u8, u8)]) -> String {
+    colors
+        .iter()
+        .map(|&(r, g, b)| format!("{r:02X}{g:02X}{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+pub fn encode_state(s: &State) -> String {
     let mut out = String::new();
-    if let Some(v) = mb {
+    if let Some(v) = s.mb {
         out.push_str(&format!("mb={}\n", v.encode()));
     }
-    if let Some(v) = gpu {
+    if let Some(p) = &s.mb_pattern {
+        out.push_str(&format!("mb.pattern={}\n", encode_pattern(p)));
+    }
+    if let Some(v) = s.gpu {
         out.push_str(&format!("gpu={}\n", v.encode()));
+    }
+    if let Some(p) = &s.gpu_pattern {
+        out.push_str(&format!("gpu.pattern={}\n", encode_pattern(p)));
     }
     out
 }
 
-/// Record what one device was just set to, leaving the other's slot untouched.
-/// `gpu` selects the slot, matching the `Paint::rgb(gpu)` convention used
-/// everywhere else. Best-effort; failures are ignored.
+pub fn load_state_full() -> State {
+    match state_path().and_then(|p| std::fs::read_to_string(p).ok()) {
+        Some(text) => parse_state(&text),
+        None => State::default(),
+    }
+}
+
+/// The two colour slots alone — what the tray needs, and all it has ever asked
+/// for. Kept so adding patterns changed nothing on that side.
+pub fn load_state() -> (Option<Last>, Option<Last>) {
+    let s = load_state_full();
+    (s.mb, s.gpu)
+}
+
+/// Read-modify-write the state file. Best-effort; failures are ignored.
 ///
 /// Only the process that actually wrote to a device calls this — which is always
 /// `jdrgb.exe`. The tray reads this file but never writes it.
-pub fn record(gpu: bool, last: Last) {
+fn update(edit: impl FnOnce(&mut State)) {
     let Some(path) = state_path() else { return };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let (old_mb, old_gpu) = load_state();
-    let (mb, gpu_slot) = if gpu { (old_mb, Some(last)) } else { (Some(last), old_gpu) };
-    let _ = std::fs::write(path, encode_state(mb, gpu_slot));
+    let mut s = load_state_full();
+    edit(&mut s);
+    let _ = std::fs::write(path, encode_state(&s));
+}
+
+/// Record what one device was just set to, leaving the other's slot untouched.
+/// `gpu` selects the slot, matching the `Paint::rgb(gpu)` convention used
+/// everywhere else.
+///
+/// Clearing the pattern here — including when `last` is `Multi` — is what keeps
+/// a stale frame from outliving the state that produced it. A caller with a
+/// pattern in hand calls `record_pattern`; one without is by definition not
+/// describing a frame we could replay, so any frame on file is from an older
+/// state and must go.
+pub fn record(gpu: bool, last: Last) {
+    update(|s| {
+        if gpu {
+            s.gpu = Some(last);
+            s.gpu_pattern = None;
+        } else {
+            s.mb = Some(last);
+            s.mb_pattern = None;
+        }
+    });
+}
+
+/// Record a per-LED frame: `Multi` for anything reading the colour slot, plus
+/// the colours themselves so `jdrgb state` can reproduce it.
+pub fn record_pattern(gpu: bool, colors: &[(u8, u8, u8)]) {
+    update(|s| {
+        if gpu {
+            s.gpu = Some(Last::Multi);
+            s.gpu_pattern = Some(colors.to_vec());
+        } else {
+            s.mb = Some(Last::Multi);
+            s.mb_pattern = Some(colors.to_vec());
+        }
+    });
 }
 
 /// The last solid color set on one device, if there is one to resume from.
@@ -426,8 +531,7 @@ pub fn record(gpu: bool, last: Last) {
 /// tuning — nothing is lit, and HSL has no hue there to step through — so the
 /// caller's default preset is a better answer than the literal last value.
 pub fn load_last(gpu: bool) -> Option<(u8, u8, u8)> {
-    let (mb, gpu_slot) = load_state();
-    match if gpu { gpu_slot } else { mb } {
+    match load_state_full().slot(gpu) {
         Some(Last::Color(rgb)) => Some(rgb),
         _ => None,
     }
@@ -599,30 +703,40 @@ mod tests {
         assert_eq!(preset_for_rgb((0x12, 0x34, 0x56), false), None);
     }
 
+    /// The two colour slots, with no patterns — the shape most of these
+    /// assertions are about.
+    fn slots(mb: Option<Last>, gpu: Option<Last>) -> State {
+        State { mb, gpu, ..State::default() }
+    }
+
     #[test]
     fn state_slots_are_independent() {
         // The whole point of the split: the same look is a different RGB on each
         // device, so one slot must never answer for the other.
-        let text = encode_state(Some(Last::Color((0xFF, 0xB0, 0xD0))), Some(Last::Color((0xD2, 0x94, 0x32))));
-        let (mb, gpu) = parse_state(&text);
-        assert_eq!(mb, Some(Last::Color((0xFF, 0xB0, 0xD0))));
-        assert_eq!(gpu, Some(Last::Color((0xD2, 0x94, 0x32))));
+        let text = encode_state(&slots(
+            Some(Last::Color((0xFF, 0xB0, 0xD0))),
+            Some(Last::Color((0xD2, 0x94, 0x32))),
+        ));
+        let s = parse_state(&text);
+        assert_eq!(s.mb, Some(Last::Color((0xFF, 0xB0, 0xD0))));
+        assert_eq!(s.gpu, Some(Last::Color((0xD2, 0x94, 0x32))));
     }
 
     #[test]
     fn recording_one_slot_leaves_the_other() {
         // record() is read-modify-write; this is the encode half of that.
-        let (mb, _) = parse_state(&encode_state(Some(Last::Color((1, 2, 3))), None));
-        let text = encode_state(mb, Some(Last::Color((4, 5, 6))));
-        assert_eq!(parse_state(&text), (Some(Last::Color((1, 2, 3))), Some(Last::Color((4, 5, 6)))));
+        let mut s = parse_state(&encode_state(&slots(Some(Last::Color((1, 2, 3))), None)));
+        s.gpu = Some(Last::Color((4, 5, 6)));
+        let text = encode_state(&s);
+        assert_eq!(parse_state(&text), slots(Some(Last::Color((1, 2, 3))), Some(Last::Color((4, 5, 6)))));
     }
 
     #[test]
     fn legacy_state_reads_as_motherboard() {
         // Files written before the split hold a bare hex, and only the strip
         // ever wrote one — so it must not be handed to the GPU.
-        assert_eq!(parse_state("FFB0D0\n"), (Some(Last::Color((0xFF, 0xB0, 0xD0))), None));
-        assert_eq!(parse_state("multi"), (Some(Last::Multi), None));
+        assert_eq!(parse_state("FFB0D0\n"), slots(Some(Last::Color((0xFF, 0xB0, 0xD0))), None));
+        assert_eq!(parse_state("multi"), slots(Some(Last::Multi), None));
     }
 
     #[test]
@@ -630,10 +744,9 @@ mod tests {
         // Never-set falls back to the device's default; multi-colored has no
         // single color to resume from. Both yield None from load_last, but the
         // file has to keep them apart or a `load` would look like a fresh state.
-        let (_, gpu) = parse_state(&encode_state(Some(Last::Multi), None));
-        assert_eq!(gpu, None);
-        let (mb, _) = parse_state(&encode_state(Some(Last::Multi), None));
-        assert_eq!(mb, Some(Last::Multi));
+        let s = parse_state(&encode_state(&slots(Some(Last::Multi), None)));
+        assert_eq!(s.gpu, None);
+        assert_eq!(s.mb, Some(Last::Multi));
     }
 
     /// `off` and `black` put the same bytes on the wire but leave the
@@ -642,11 +755,55 @@ mod tests {
     /// is actually off.
     #[test]
     fn off_survives_the_round_trip_as_itself() {
-        let text = encode_state(Some(Last::Off), Some(Last::Color((0, 0, 0))));
-        let (mb, gpu) = parse_state(&text);
-        assert_eq!(mb, Some(Last::Off));
-        assert_eq!(gpu, Some(Last::Color((0, 0, 0))));
-        assert_ne!(mb, gpu);
+        let text = encode_state(&slots(Some(Last::Off), Some(Last::Color((0, 0, 0)))));
+        let s = parse_state(&text);
+        assert_eq!(s.mb, Some(Last::Off));
+        assert_eq!(s.gpu, Some(Last::Color((0, 0, 0))));
+        assert_ne!(s.mb, s.gpu);
+    }
+
+    #[test]
+    fn a_pattern_survives_the_round_trip() {
+        // The reason the pattern keys exist: `multi` alone says only "no single
+        // colour", which cannot be replayed.
+        let frame = vec![(0xFA, 0x95, 0x36), (0xFF, 0x00, 0x11), (0x00, 0x00, 0x00)];
+        let s = State {
+            mb: Some(Last::Multi),
+            mb_pattern: Some(frame.clone()),
+            ..State::default()
+        };
+        let back = parse_state(&encode_state(&s));
+        assert_eq!(back, s);
+        assert_eq!(back.pattern(false), Some(&frame[..]));
+        assert_eq!(back.pattern(true), None, "the strip's frame answered for the card");
+    }
+
+    /// The invariant that makes a stale frame impossible: only `record_pattern`
+    /// writes one, and any other write to that slot clears it. This is the pure
+    /// half — `record`'s edit, without the file I/O.
+    #[test]
+    fn a_solid_clears_the_frame_that_preceded_it() {
+        let mut s = State {
+            mb: Some(Last::Multi),
+            mb_pattern: Some(vec![(1, 2, 3)]),
+            gpu: Some(Last::Multi),
+            gpu_pattern: Some(vec![(4, 5, 6)]),
+        };
+        // What record(false, Color) does.
+        s.mb = Some(Last::Color((0xFF, 0x00, 0x00)));
+        s.mb_pattern = None;
+        let back = parse_state(&encode_state(&s));
+        assert_eq!(back.pattern(false), None, "a frame outlived the state that produced it");
+        assert_eq!(back.pattern(true), Some(&[(4, 5, 6)][..]), "cleared the other device's frame");
+    }
+
+    #[test]
+    fn a_corrupt_frame_is_dropped_whole() {
+        // Restoring a frame with one wrong LED in it would be worse than
+        // restoring nothing, because nothing is visibly nothing.
+        let s = parse_state("mb=multi\nmb.pattern=FA9536,nonsense,FF0011\n");
+        assert_eq!(s.mb, Some(Last::Multi));
+        assert_eq!(s.mb_pattern, None);
     }
 
     /// Neither `off` nor `multi` offers a color to resume tuning from, and
@@ -660,7 +817,7 @@ mod tests {
 
     #[test]
     fn garbage_state_is_ignored_not_fatal() {
-        assert_eq!(parse_state("mb=nonsense\ngpu=\n"), (None, None));
-        assert_eq!(parse_state(""), (None, None));
+        assert_eq!(parse_state("mb=nonsense\ngpu=\n"), State::default());
+        assert_eq!(parse_state(""), State::default());
     }
 }

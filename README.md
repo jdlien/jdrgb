@@ -43,6 +43,8 @@ jdrgb off             turn the LEDs off
 jdrgb presets         list the named color presets
 jdrgb load [file]     per-LED colors from a config file (default leds.conf)
 jdrgb template [file] write a starter config, one line per LED
+jdrgb state [file]    write what's set now as a config (no file = stdout)
+jdrgb restore [color] put back what --stash saved (color = if none saved)
 jdrgb rainbow [n]     per-LED rainbow across n LEDs (default 38, white end-caps)
 jdrgb tune [color]    dial in a color live (preset/hex, or that device's last)
 jdrgb preview         slideshow all presets (+/- speed, n/N next/prev, s stop, q quit)
@@ -54,6 +56,7 @@ jdrgb --help
   --wait              retry ~60s until the controller is ready (used at boot)
   --gpu               act on the GPU LEDs instead of the motherboard
   --all               act on both
+  --stash             before setting a color, save what's showing for `restore`
 ```
 
 ### Targets
@@ -286,6 +289,90 @@ Generate a starter file pre-filled with the preset (`jdrgb template leds.conf`),
 edit it, and preview with `jdrgb load leds.conf` — re-run after each edit until
 it's dialed in.
 
+Two directives set a whole device at once instead:
+
+```
+mb:  warmwhite     # the whole strip, one color (not per-LED lines — use one or the other)
+gpu: warmwhite     # the card; several colors drive its LEDs individually
+gpu: off           # either directive takes `off`, the controller's own off mode
+```
+
+A device the file doesn't mention is left alone, so a config can describe one
+device, the other, or both. `off` is not `black` — see above.
+
+### Saving and restoring what's showing
+
+`jdrgb state [file]` writes the current setting out as a config file, in exactly
+the grammar `load` reads. With no argument it prints, so `>` works too.
+
+```powershell
+jdrgb state before.conf        # snapshot whatever is showing
+jdrgb red --all                # ...borrow the lights...
+jdrgb load before.conf --all   # put them back
+```
+
+This is what makes jdrgb usable from something else's event hook — a UPS going
+to battery, a game launcher, a recording script — without that thing having to
+know what your normal lighting is.
+
+#### `--stash` and `restore`
+
+The same thing with the bookkeeping done for you:
+
+```powershell
+jdrgb amber --all --stash     # set amber, remembering what was showing
+jdrgb red   --all --stash     # ...again; the first snapshot is kept
+jdrgb restore --all           # put the original back
+```
+
+Two rules carry it, and both were got wrong by hand first:
+
+- **A second `--stash` never overwrites the first.** A UPS outage fires
+  `on_battery` and then `on_pending`; if the second snapshot won, mains would
+  restore the room to amber instead of normal.
+- **An apply *without* `--stash` drops the snapshot.** Pick a color from the
+  tray mid-outage and that's your new normal — restoring over it afterwards
+  would stomp on a deliberate choice.
+
+`restore` with nothing stashed is a silent success, so a hook that fires twice,
+or on a machine that never stashed, leaves the lights alone rather than failing.
+`jdrgb restore coolwhite` gives it something to fall back on instead.
+
+A stash from a *previous boot* is ignored and removed. This is not an edge case:
+an outage long enough to matter ends with the machine shut down, so `on_mains`
+never runs and the snapshot is still on disk at next boot. The check is the
+stash's age against `GetTickCount64` — if it's older than the machine has been
+up, it predates the boot. (Measured on this machine: that tick count and the
+boot time Windows reports agree to within 1 second across 31 hours of uptime.)
+
+Why this isn't left to a shell one-liner: the obvious cmd spelling of the first
+rule is wrong.
+
+```cmd
+if not exist "%LOCALAPPDATA%\jdrgb\stash.conf" jdrgb state "..." & jdrgb red --all
+```
+
+`&` does not end the `if` body, so **both** commands are skipped when the file
+exists — the color never gets set. It reads correctly and isn't.
+
+Everything round-trips: a solid, a per-LED pattern, `off`, and a machine where
+the two devices are in different states. That's the reason `mb:` exists. Written
+as 38 identical bare lines, a solid strip would go out over *direct* mode — a
+different controller state, recorded as `multi` — so the tray would read back
+"Multi" where it used to read "Warm White".
+
+Two things it can't do:
+
+- **It reports what jdrgb recorded, not what the hardware holds.** The strip's
+  controller offers no color readback, so the record is the only source. (The
+  card does have one — `jdrgb --gpu probe` reads its live color over I2C — but
+  mixing the two would make one file disagree with itself about where the truth
+  lives.) A color set by Armoury Crate or another tool is not seen.
+- **A boot-task apply is invisible to your session.** That task runs as SYSTEM
+  and records to SYSTEM's profile, so on a machine set only at boot, `state`
+  has nothing to report until you set a color yourself. It says so and exits
+  non-zero rather than writing a file that would restore you to darkness.
+
 ### Tuning a color
 
 `jdrgb tune [color]` steps a color live in HSL — `h`/`s`/`l` nudge each channel
@@ -303,6 +390,18 @@ The last-set color is remembered per device in a small state file under
 mb=FFB0D0
 gpu=D29432
 ```
+
+A device left multi-colored records `multi` plus the frame itself, so `state`
+can reproduce it — `multi` alone says only "no single color", which is the right
+answer for the tray's swatch and useless for a snapshot:
+
+```
+mb=multi
+mb.pattern=FA9536,FA9536,...,FF0011
+```
+
+A frame is only ever written alongside `multi`, and any other write to that slot
+clears it, so a frame can't outlive the state that produced it.
 
 The split matters because the same look is a *different* RGB on each (see the
 calibration table above). A shared slot would hand `jdrgb --gpu tune` the strip's

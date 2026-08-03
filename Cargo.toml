@@ -22,7 +22,8 @@ path = "src/tray/main.rs"
 hidapi = "2"
 windows-sys = { version = "0.61", features = [
     "Win32_System_Console",
-    "Win32_System_LibraryLoader", # LoadLibraryA/GetProcAddress for nvapi64.dll
+    "Win32_System_LibraryLoader",     # LoadLibraryA/GetProcAddress for nvapi64.dll
+    "Win32_System_SystemInformation", # GetTickCount64, for the stash's boot check
     "Win32_Foundation",
     # jdrgb-tray only. These cost jdrgb.exe nothing: windows-sys is pure FFI
     # declarations, and an unreferenced one emits no code and no import.

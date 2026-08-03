@@ -67,6 +67,8 @@ enum Command {
     Rainbow(usize),          // per-LED demo across N LEDs
     Load(String),            // per-LED colors from a config file
     Template(String),        // write a starter config file
+    State(Option<String>),   // dump what's set as a config (None = stdout)
+    Restore(Option<Paint>),  // put back what --stash saved (arg = if none saved)
     Tune(Option<Paint>),     // interactively dial in a color (None = pick up the last)
     Preview,                 // cycle through all presets
     Presets,                 // list keyword presets
@@ -120,6 +122,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let wait = args.iter().any(|a| a == "--wait");
     let force = args.iter().any(|a| a == "--force");
+    let stash = args.iter().any(|a| a == "--stash");
 
     let target = match (args.iter().any(|a| a == "--gpu"), args.iter().any(|a| a == "--all")) {
         (true, true) => {
@@ -136,7 +139,7 @@ fn main() -> ExitCode {
     // --help and --version, which parse() handles as positional words.
     let positional: Vec<&str> = args
         .iter()
-        .filter(|a| !matches!(a.as_str(), "--wait" | "--gpu" | "--all" | "--force"))
+        .filter(|a| !matches!(a.as_str(), "--wait" | "--gpu" | "--all" | "--force" | "--stash"))
         .map(String::as_str)
         .collect();
 
@@ -152,6 +155,16 @@ fn main() -> ExitCode {
     if let (Some(name), false) = (mb_only(&command), target == Target::Mb) {
         eprintln!("jdrgb: `{name}` is motherboard-only — drop --gpu/--all");
         return ExitCode::FAILURE;
+    }
+
+    // Before the apply runs, so the snapshot is of what's about to be replaced.
+    // A failed apply leaves a stash holding the right thing, which is harmless.
+    if is_apply(&command) {
+        if stash {
+            stash_now();
+        } else {
+            clear_stash();
+        }
     }
 
     let result = match command {
@@ -177,6 +190,8 @@ fn main() -> ExitCode {
         Command::Template(path) => write_template(&path, force).map(|()| {
             println!("jdrgb: wrote {path} ({STRIP_LEDS} LEDs) — edit it, then `jdrgb load {path}`");
         }),
+        Command::State(out) => dump_state(target, out.as_deref(), force),
+        Command::Restore(fallback) => restore(target, fallback, wait),
         // Tuning needs one concrete starting RGB even with --all, so a preset
         // resolves against whichever device is the focus: the GPU only when
         // it's the sole target. With no arg, that device's own last color is the
@@ -220,6 +235,20 @@ fn parse(args: &[&str]) -> Result<Command, String> {
         }
         "load" => Ok(Command::Load(args.get(1).copied().unwrap_or("leds.conf").to_string())),
         "template" => Ok(Command::Template(args.get(1).copied().unwrap_or("leds.conf").to_string())),
+        // No default path, unlike `template`: with no argument this prints, so
+        // that `jdrgb state > file` works as well as `jdrgb state file`.
+        "state" => Ok(Command::State(args.get(1).map(|s| s.to_string()))),
+        "restore" => {
+            // The optional color is what to use when nothing was stashed —
+            // notably on a machine only ever set by the SYSTEM boot task.
+            let fallback = match args.get(1) {
+                Some(s) => {
+                    Some(parse_paint(s).ok_or_else(|| format!("'{s}' is not a color or preset"))?)
+                }
+                None => None,
+            };
+            Ok(Command::Restore(fallback))
+        }
         "tune" => {
             // No arg stays unresolved here: which device's last color to pick up
             // depends on the target, which parse() doesn't see. main() finishes it.
@@ -624,7 +653,7 @@ fn set_rainbow(count: usize) -> Result<(), String> {
     for ch in 0..header_count(&cfg) {
         send_direct(&dev, ch, &colors)?;
     }
-    record(false, Last::Multi); // strip is now multi-colored
+    record_pattern(false, &colors); // multi-colored, and reproducible
     Ok(())
 }
 
@@ -638,43 +667,70 @@ fn set_rainbow(count: usize) -> Result<(), String> {
 /// enumerates.
 fn apply_config(conf: &LedConfig, path: &str, target: Target) -> Result<(), String> {
     let mut failures = Vec::new();
+    // A file may legitimately describe only one device — `jdrgb state` writes
+    // exactly that when only one slot is recorded. So a zone the file doesn't
+    // mention is left alone, and only a file that describes *nothing* the
+    // caller asked for is an error. That still catches the case the strict
+    // version existed for: `--gpu` pointed at a file with no `gpu:` line.
+    let mut applied = 0;
+    let mut missing = Vec::new();
 
     if target.mb() {
-        let mut colors = conf.strip.clone();
-        if colors.len() < STRIP_LEDS {
-            colors.resize(STRIP_LEDS, (0, 0, 0));
-        }
-        match paint_strip(&colors) {
-            Ok(()) => record(false, Last::Multi), // strip is now multi-colored
-            Err(e) => failures.push(format!("mb: {e}")),
+        match &conf.mb {
+            None => missing.push("mb"),
+            Some(Zone::Solid { mode, rgb }) => match set_solid(*mode, *rgb) {
+                Ok(()) => {
+                    report(Some("mb"), *mode, *rgb);
+                    applied += 1;
+                }
+                Err(e) => failures.push(format!("mb: {e}")),
+            },
+            Some(Zone::Frame(frame)) => {
+                let mut colors = frame.clone();
+                if colors.len() < STRIP_LEDS {
+                    colors.resize(STRIP_LEDS, (0, 0, 0));
+                }
+                match paint_strip(&colors) {
+                    // The padded frame, not the file's, because the padding is
+                    // part of what the strip is now showing.
+                    Ok(()) => {
+                        record_pattern(false, &colors);
+                        applied += 1;
+                    }
+                    Err(e) => failures.push(format!("mb: {e}")),
+                }
+            }
         }
     }
 
     if target.gpu() {
-        match conf.gpu {
-            // Silent no-op would be worse than saying so: the user asked for the
-            // GPU and the file has nothing for it.
-            None => failures.push(format!("gpu: {path} has no `gpu:` line")),
-            Some(ref colors) => match apply_gpu_colors(MODE_STATIC, colors) {
+        match &conf.gpu {
+            None => missing.push("gpu"),
+            Some(Zone::Solid { mode, rgb }) => match apply_gpu_solid(*mode, *rgb) {
+                Ok(()) => {
+                    report(Some("gpu"), *mode, *rgb);
+                    record(true, last_for(*mode, *rgb));
+                    applied += 1;
+                }
+                Err(e) => failures.push(format!("gpu: {}", e.msg)),
+            },
+            Some(Zone::Frame(colors)) => match apply_gpu_colors(MODE_STATIC, colors) {
                 Ok(()) => {
                     let hex: Vec<String> =
                         colors.iter().map(|&(r, g, b)| format!("#{r:02X}{g:02X}{b:02X}")).collect();
                     println!("jdrgb: gpu: set {}", hex.join(" "));
-                    // A `gpu:` line can name one color per lamp; only a single
-                    // one leaves a color for `tune` to pick up.
-                    record(
-                        true,
-                        match colors[..] {
-                            [one] => Last::Color(one),
-                            _ => Last::Multi,
-                        },
-                    );
+                    record_pattern(true, colors);
+                    applied += 1;
                 }
                 Err(e) => failures.push(format!("gpu: {}", e.msg)),
             },
         }
     }
 
+    if applied == 0 && failures.is_empty() {
+        let what = missing.join(" or ");
+        return Err(format!("{path} describes nothing for {what}"));
+    }
     if failures.is_empty() {
         Ok(())
     } else {
@@ -691,22 +747,68 @@ fn paint_strip(colors: &[(u8, u8, u8)]) -> Result<(), String> {
     Ok(())
 }
 
-/// A parsed config: per-LED strip colors, plus optional GPU colors.
-struct LedConfig {
-    strip: Vec<(u8, u8, u8)>,
-    gpu: Option<Vec<(u8, u8, u8)>>,
+/// What a config asks of one device.
+///
+/// The two variants are the two apply paths the controller actually has, so
+/// this maps one-to-one onto them rather than describing a third thing that has
+/// to be translated.
+#[derive(Debug, PartialEq, Eq)]
+enum Zone {
+    /// Effect mode: one color across the whole zone, or the controller's own
+    /// off mode. `off` is not `black` — they put the same bytes on the wire and
+    /// leave the controller in different modes. See `palette::Last`.
+    Solid { mode: u8, rgb: (u8, u8, u8) },
+    /// A latched per-LED frame: the strip's bare lines, or a `gpu:` line naming
+    /// more than one color.
+    Frame(Vec<(u8, u8, u8)>),
 }
 
-/// Parse a config file: one `RRGGBB` hex or preset name per line, line N = LED N.
-/// A `gpu: COLOR` line sets the GPU. `#` starts a comment; blanks are skipped.
+/// A parsed config. Either device may be absent, meaning "this file doesn't
+/// describe it" — which `apply_config` reads as leave-it-alone.
+#[derive(Debug, PartialEq, Eq)]
+struct LedConfig {
+    mb: Option<Zone>,
+    gpu: Option<Zone>,
+}
+
+/// A `dev:` directive line, case-insensitively, returning what follows.
 ///
-/// Bare color lines resolve against the strip and the `gpu:` line against the
-/// GPU, so a preset name on either gets that device's own calibration — which is
-/// the whole point of naming one file a "theme". `black` is the useful one for
-/// the strip: it's how you light part of it and leave the rest dark.
+/// A bare color line is a hex value or a preset name and can never contain a
+/// colon, so a colon anywhere means the line was *meant* as a directive. That's
+/// what lets a misspelled one be reported as such instead of falling through to
+/// "invalid color or preset 'mainboard: red'".
+fn directive(line: &str) -> Option<(&str, &str)> {
+    let (head, rest) = line.split_once(':')?;
+    Some((head.trim(), rest.trim()))
+}
+
+/// Parse a config file.
+///
+/// * bare `RRGGBB`/preset lines — one per strip LED, line N = LED N
+/// * `mb: COLOR` or `mb: off` — the whole strip in effect mode
+/// * `gpu: COLOR [COLOR...]` or `gpu: off` — the card
+///
+/// `#` starts a comment; blanks are skipped. Colors resolve against the device
+/// the line names, so a preset gets that device's own calibration — the whole
+/// point of naming one file a "theme". `black` is the useful one for a bare
+/// line: it's how you light part of the strip and leave the rest dark.
+///
+/// `mb:` and `off` exist so this grammar can express every state jdrgb can
+/// produce, which is what makes `jdrgb state` a round trip through `load`
+/// rather than a second apply path. Before them, a solid strip could only be
+/// written as N identical bare lines — which goes out over *direct* mode, a
+/// different controller state that records as `multi`, so the tray would read
+/// back "Multi" where it used to read "Warm White".
 fn read_led_config(path: &str) -> Result<LedConfig, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
+    parse_led_config(&text, path)
+}
+
+/// The grammar itself, split from the file read so the round trip against
+/// `state_body` can be tested without touching a disk or a device.
+fn parse_led_config(text: &str, path: &str) -> Result<LedConfig, String> {
     let mut strip = Vec::new();
+    let mut mb = None;
     let mut gpu = None;
 
     for (n, raw) in text.lines().enumerate() {
@@ -714,39 +816,65 @@ fn read_led_config(path: &str) -> Result<LedConfig, String> {
         if line.is_empty() {
             continue;
         }
+        let at = n + 1;
 
-        // `gpu: COLOR` — or several, whitespace/comma separated, to drive the
-        // card's LEDs individually. Fewer than it has will cycle to fill.
-        let directive = line
-            .strip_prefix("gpu:")
-            .or_else(|| line.strip_prefix("GPU:"))
-            .or_else(|| line.strip_prefix("Gpu:"));
-        if let Some(rest) = directive {
-            let mut colors = Vec::new();
-            for value in rest.split([' ', '\t', ',']).filter(|s| !s.is_empty()) {
-                colors.push(
-                    parse_paint(value)
-                        .map(|p| p.rgb(true))
-                        .ok_or_else(|| format!("{path}:{}: invalid color or preset '{value}'", n + 1))?,
-                );
+        if let Some((name, rest)) = directive(line) {
+            let slot = match name.to_ascii_lowercase().as_str() {
+                "mb" => &mut mb,
+                "gpu" => &mut gpu,
+                other => return Err(format!("{path}:{at}: unknown directive '{other}:'")),
+            };
+            if slot.is_some() {
+                return Err(format!("{path}:{at}: a second `{name}:` line"));
             }
-            if colors.is_empty() {
-                return Err(format!("{path}:{}: `gpu:` needs at least one color", n + 1));
-            }
-            gpu = Some(colors);
+            *slot = Some(parse_zone(rest, name.eq_ignore_ascii_case("gpu"), path, at)?);
             continue;
         }
 
         let color = parse_paint(line)
             .map(|p| p.rgb(false))
-            .ok_or_else(|| format!("{path}:{}: invalid color or preset '{line}'", n + 1))?;
+            .ok_or_else(|| format!("{path}:{at}: invalid color or preset '{line}'"))?;
         strip.push(color);
     }
 
-    if strip.is_empty() && gpu.is_none() {
+    if !strip.is_empty() {
+        if mb.is_some() {
+            return Err(format!("{path}: the strip is described twice, by `mb:` and by per-LED lines"));
+        }
+        mb = Some(Zone::Frame(strip));
+    }
+    if mb.is_none() && gpu.is_none() {
         return Err(format!("{path}: no colors found"));
     }
-    Ok(LedConfig { strip, gpu })
+    Ok(LedConfig { mb, gpu })
+}
+
+/// The right-hand side of a `mb:`/`gpu:` line.
+fn parse_zone(rest: &str, gpu: bool, path: &str, at: usize) -> Result<Zone, String> {
+    let dev = if gpu { "gpu" } else { "mb" };
+    if rest.eq_ignore_ascii_case("off") {
+        return Ok(Zone::Solid { mode: MODE_OFF, rgb: (0, 0, 0) });
+    }
+    let mut colors = Vec::new();
+    for value in rest.split([' ', '\t', ',']).filter(|s| !s.is_empty()) {
+        colors.push(
+            parse_paint(value)
+                .map(|p| p.rgb(gpu))
+                .ok_or_else(|| format!("{path}:{at}: invalid color or preset '{value}'"))?,
+        );
+    }
+    match colors[..] {
+        [] => Err(format!("{path}:{at}: `{dev}:` needs a color or `off`")),
+        [one] => Ok(Zone::Solid { mode: MODE_STATIC, rgb: one }),
+        // Several colors drive the card's LEDs individually; fewer than it has
+        // will cycle to fill. The strip has no such line: 38 LEDs named on one
+        // line would be unreadable, and padding a short one to 38 with black
+        // would silently blank most of the strip.
+        _ if gpu => Ok(Zone::Frame(colors)),
+        _ => Err(format!(
+            "{path}:{at}: `mb:` takes one color or `off` — use bare lines for a per-LED pattern"
+        )),
+    }
 }
 
 /// Write a starter config with one line per LED, pre-filled with the preset.
@@ -767,14 +895,31 @@ fn write_template(path: &str, force: bool) -> Result<(), String> {
          # on it get the GPU's own calibration, so `gpu: warmwhite` matches the\n\
          # strip's warmwhite by eye rather than by number.\n\
          # Applied with `jdrgb load <file> --all` (or --gpu for the GPU alone).\n\
+         #\n\
+         # An `mb:` line sets the whole strip to one color instead of the per-LED\n\
+         # lines below — use one or the other, not both. Either line takes `off`\n\
+         # for the controller's own off mode, which is not the same as `black`.\n\
          \n\
          gpu: warmwhite\n\n",
     );
     for i in 0..STRIP_LEDS {
         out.push_str(&format!("{r:02X}{g:02X}{b:02X}   # LED {i}\n"));
     }
+    write_new(path, &out, force)
+}
+
+/// Write a config file, refusing an existing one unless `force`.
+///
+/// A config is hand-tuned per LED and slow to rebuild, and `leds.conf` is both
+/// the default template target and the default `load` target — so the obvious
+/// typo overwrites exactly the file worth keeping. `create_new` makes the check
+/// atomic rather than a racy exists-test.
+///
+/// `state` shares this for the same reason: `jdrgb state leds.conf` is one
+/// keystroke from `jdrgb load leds.conf`.
+fn write_new(path: &str, text: &str, force: bool) -> Result<(), String> {
     if force {
-        return std::fs::write(path, out).map_err(|e| format!("cannot write {path}: {e}"));
+        return std::fs::write(path, text).map_err(|e| format!("cannot write {path}: {e}"));
     }
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -786,7 +931,250 @@ fn write_template(path: &str, force: bool) -> Result<(), String> {
             }
             _ => format!("cannot write {path}: {e}"),
         })?;
-    f.write_all(out.as_bytes()).map_err(|e| format!("cannot write {path}: {e}"))
+    f.write_all(text.as_bytes()).map_err(|e| format!("cannot write {path}: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// State readout
+// ---------------------------------------------------------------------------
+
+/// Write what's currently set, as a config file — the exact grammar `load`
+/// reads back, so `jdrgb state f` then `jdrgb load f --all` is a round trip.
+///
+/// This reports what jdrgb *recorded*, not what the hardware says. The strip's
+/// controller offers no color readback, so the record is the only source there.
+/// The card does — `jdrgb --gpu probe` reads its live color over I2C — but
+/// using it here would make the two halves of one file disagree about where the
+/// truth lives, for a value we already know because we wrote it.
+///
+/// A slot that was never recorded is omitted rather than guessed at, and `load`
+/// leaves an unmentioned device alone. So a partial file restores exactly what
+/// was known and touches nothing else.
+fn dump_state(target: Target, out: Option<&str>, force: bool) -> Result<(), String> {
+    let (body, omitted) = state_body(&load_state_full(), target);
+    for dev in omitted {
+        // A pattern recorded before frames were kept. Say so rather than write
+        // a file that quietly leaves the device out.
+        eprintln!("jdrgb: {dev} holds a per-LED pattern with no frame recorded, omitting it");
+    }
+
+    if body.is_empty() {
+        // Worth naming the usual cause: the boot task runs as SYSTEM and
+        // records to SYSTEM's profile, so a machine that has only ever been set
+        // at boot has nothing in the logged-in user's state file.
+        return Err(format!(
+            "nothing recorded for {} — set a color first (a boot-task apply records to SYSTEM's profile, not yours)",
+            target.describe()
+        ));
+    }
+
+    let text = format!(
+        "# jdrgb state — reapply with: jdrgb load <this file> --all\n\
+         # An ordinary config file; edit it freely.\n\n{body}"
+    );
+
+    match out {
+        None => {
+            print!("{text}");
+            Ok(())
+        }
+        Some(path) => {
+            write_new(path, &text, force)?;
+            println!("jdrgb: wrote {path}");
+            Ok(())
+        }
+    }
+}
+
+/// The config-grammar body for a recorded state, plus the devices left out for
+/// want of a frame. Pure, so the round trip through `parse_led_config` is a
+/// test and not a hope.
+fn state_body(st: &State, target: Target) -> (String, Vec<&'static str>) {
+    let mut body = String::new();
+    let mut omitted = Vec::new();
+
+    if target.mb() {
+        match (st.slot(false), st.pattern(false)) {
+            (Some(Last::Color(rgb)), _) => body.push_str(&zone_line("mb", &[rgb], false)),
+            (Some(Last::Off), _) => body.push_str("mb: off\n"),
+            (Some(Last::Multi), Some(frame)) => {
+                body.push_str("# strip, one line per LED\n");
+                for (i, &(r, g, b)) in frame.iter().enumerate() {
+                    body.push_str(&format!("{r:02X}{g:02X}{b:02X}   # LED {i}\n"));
+                }
+            }
+            (Some(Last::Multi), None) => omitted.push("mb"),
+            (None, _) => {}
+        }
+    }
+
+    if target.gpu() {
+        match (st.slot(true), st.pattern(true)) {
+            (Some(Last::Color(rgb)), _) => body.push_str(&zone_line("gpu", &[rgb], true)),
+            (Some(Last::Off), _) => body.push_str("gpu: off\n"),
+            (Some(Last::Multi), Some(frame)) => body.push_str(&zone_line("gpu", frame, true)),
+            (Some(Last::Multi), None) => omitted.push("gpu"),
+            (None, _) => {}
+        }
+    }
+
+    (body, omitted)
+}
+
+// ---------------------------------------------------------------------------
+// The stash: borrow the lights, then give them back
+// ---------------------------------------------------------------------------
+//
+// `--stash` snapshots what's showing before applying, and `restore` puts it
+// back. It is sugar over `state` + `load` — the stash is an ordinary config
+// file — but the two rules below are the whole reason it isn't left to a shell
+// one-liner. Both were got wrong by hand first.
+//
+//   * **A second `--stash` must not clobber the first.** A UPS outage fires
+//     `on_battery` then `on_pending`; if the second snapshot overwrote the
+//     first, mains would restore the room to amber instead of normal.
+//   * **A bare apply clears the stash.** Pick a color from the tray mid-outage
+//     and that is your new normal; restoring over it afterwards would stomp on
+//     a deliberate choice.
+//
+// The cmd equivalent of the first rule, `if not exist X A & B`, does not do
+// what it reads as: `&` does not end the `if` body, so B is skipped whenever
+// the file exists. Measured, not assumed.
+
+/// Slack for filesystem timestamp granularity, and for the two clocks not
+/// being sampled at the same instant.
+const STASH_SLACK: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn stash_path() -> Option<std::path::PathBuf> {
+    state_path().map(|p| p.with_file_name("stash.conf"))
+}
+
+/// Milliseconds since this machine booted.
+fn uptime() -> std::time::Duration {
+    use windows_sys::Win32::System::SystemInformation::GetTickCount64;
+    std::time::Duration::from_millis(unsafe { GetTickCount64() })
+}
+
+/// Whether a stash of this age was written before the current boot.
+///
+/// A UPS outage long enough to matter ends with the machine *shut down*, so a
+/// stash surviving into the next boot is the normal path, not an edge case:
+/// `on_mains_cmd` never ran, and the tray deliberately doesn't fire it at
+/// startup. Without this check the next outage would decline to overwrite a
+/// stash from last boot and eventually restore a state two outages old.
+///
+/// Age against uptime rather than a stored boot id: if the stash is older than
+/// the machine has been up, it predates the boot. Sound in the direction that
+/// matters — a stash from *this* session is never called stale, because its age
+/// is necessarily less than the uptime.
+///
+/// Measured on this machine: `GetTickCount64` and the boot time Windows itself
+/// reports agreed to within 1 second across 31 hours of uptime, so the derived
+/// boot instant is stable enough to compare against a file timestamp.
+fn predates_boot(age: std::time::Duration, uptime: std::time::Duration) -> bool {
+    age > uptime + STASH_SLACK
+}
+
+/// The stash's contents, if there is one and it belongs to this boot. A stash
+/// from a previous boot is removed on sight rather than left to confuse the
+/// next call.
+fn read_stash(path: &std::path::Path) -> Option<String> {
+    let age = std::fs::metadata(path).ok()?.modified().ok()?.elapsed().ok()?;
+    if predates_boot(age, uptime()) {
+        let _ = std::fs::remove_file(path);
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+/// Snapshot the whole recorded state — both devices, whatever `--gpu`/`--all`
+/// says, because "put the room back" is inherently whole-machine.
+///
+/// Silent no-ops on purpose: a stash is a convenience, and a hook that can't
+/// write one should still get on with setting the color.
+fn stash_now() {
+    let Some(path) = stash_path() else { return };
+    if read_stash(&path).is_some() {
+        return; // an earlier hook already saved the original; keep it
+    }
+    let (body, _) = state_body(&load_state_full(), Target::All);
+    if body.is_empty() {
+        return; // nothing recorded, so nothing to put back
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(
+        &path,
+        format!(
+            "# jdrgb stash — what was showing before something borrowed the lights.\n\
+             # Written by --stash; `jdrgb restore` applies this and deletes it.\n\n{body}"
+        ),
+    );
+}
+
+fn clear_stash() {
+    if let Some(p) = stash_path() {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+/// Put back what `--stash` saved, then drop it.
+///
+/// With nothing stashed this is a silent success, not an error: a restore that
+/// runs twice, or on a machine that never stashed, should leave the lights
+/// alone rather than fail a hook. `fallback` covers the one case where doing
+/// nothing is unhelpful — a boot-task-only machine, whose apply recorded to
+/// SYSTEM's profile, so the user's session has no state to have stashed.
+fn restore(target: Target, fallback: Option<Paint>, wait: bool) -> Result<(), String> {
+    let path = stash_path().ok_or("no LOCALAPPDATA, so no stash")?;
+    let shown = path.display().to_string();
+    match read_stash(&path) {
+        Some(text) => {
+            let conf = parse_led_config(&text, &shown)?;
+            with_retry(wait, || apply_config(&conf, &shown, target))?;
+            // Only once it actually landed: a failed restore that dropped the
+            // stash would leave nothing to try again with.
+            let _ = std::fs::remove_file(&path);
+            Ok(())
+        }
+        None => match fallback {
+            Some(p) => set_solid_targets(target, wait, MODE_STATIC, p),
+            None => {
+                println!("jdrgb: nothing stashed, leaving the lights alone");
+                Ok(())
+            }
+        },
+    }
+}
+
+/// Commands that put a color on a device, and so maintain the stash.
+///
+/// `restore` is deliberately absent: it consumes the stash rather than
+/// replacing it, and clearing it first would leave nothing to restore.
+fn is_apply(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::Solid(..) | Command::Rainbow(_) | Command::Load(_) | Command::Tune(_) | Command::Preview
+    )
+}
+
+/// A `dev:` line, naming the preset in a trailing comment when the value is one.
+///
+/// The value itself is hex, never the preset name: a snapshot should reproduce
+/// the color that was showing, and re-tuning a preset later would quietly
+/// change what a saved name restores to. The comment keeps it legible without
+/// making it load-bearing.
+fn zone_line(dev: &str, colors: &[(u8, u8, u8)], gpu: bool) -> String {
+    let hex: Vec<String> =
+        colors.iter().map(|&(r, g, b)| format!("{r:02X}{g:02X}{b:02X}")).collect();
+    match colors {
+        [one] => match preset_for_rgb(*one, gpu) {
+            Some(name) => format!("{dev}: {}   # {name}\n", hex[0]),
+            None => format!("{dev}: {}\n", hex[0]),
+        },
+        _ => format!("{dev}: {}\n", hex.join(" ")),
+    }
 }
 
 /// Fully-saturated, full-value HSV (hue in degrees) to RGB.
@@ -1430,6 +1818,8 @@ fn print_help() {
          \x20 jdrgb presets         list the named color presets\n\
          \x20 jdrgb load [file]     per-LED colors from a config file (default leds.conf)\n\
          \x20 jdrgb template [file] write a starter config, one line per LED\n\
+         \x20 jdrgb state [file]    write what's set now as a config (no file = stdout)\n\
+         \x20 jdrgb restore [color] put back what --stash saved (color = if none saved)\n\
          \x20 jdrgb rainbow [n]     per-LED rainbow across n LEDs (default {STRIP_LEDS})\n\
          \x20 jdrgb tune [color]    dial in a color live (from a preset/hex, or that device's last)\n\
          \x20 jdrgb preview         slideshow all presets (+/- speed, n/N next/prev, s stop)\n\
@@ -1442,13 +1832,31 @@ fn print_help() {
          \x20 --wait                retry ~60s until the controller is ready (use at boot)\n\
          \x20 --gpu                 act on the GPU LEDs instead of the motherboard\n\
          \x20 --all                 act on both\n\
+         \x20 --stash               before setting a color, save what's showing for `restore`\n\
          \n\
          TARGETS:\n\
          \x20 Without --gpu/--all, everything targets the motherboard strip, as always.\n\
          \x20 rainbow/template are motherboard-only (the GPU has a handful of LEDs).\n\
          \x20 load works on both: a config's `gpu:` line carries the GPU's colors.\n\
          \x20 `save` writes the GPU controller's non-volatile flash so the color holds\n\
-         \x20 with nothing running — do it once by hand, never on a schedule.\n",
+         \x20 with nothing running — do it once by hand, never on a schedule.\n\
+         \n\
+         BORROWING THE LIGHTS:\n\
+         \x20 jdrgb amber --all --stash      set amber, remembering what was showing\n\
+         \x20 jdrgb red   --all --stash      ...again; the first snapshot is kept...\n\
+         \x20 jdrgb restore --all            put the original back\n\
+         \n\
+         \x20 A second --stash never overwrites the first, so a sequence of events can\n\
+         \x20 each set a color and still restore the state from before all of them. Any\n\
+         \x20 apply *without* --stash drops the snapshot: setting a color by hand makes\n\
+         \x20 that the new normal. A snapshot from a previous boot is ignored.\n\
+         \n\
+         \x20 By hand, the same thing without the bookkeeping:\n\
+         \x20 jdrgb state before.conf / jdrgb red --all / jdrgb load before.conf --all\n\
+         \n\
+         \x20 `state` reports what jdrgb recorded, so a color set by some other tool\n\
+         \x20 is not seen. A device never recorded is left out of the file, and `load`\n\
+         \x20 leaves a device the file doesn't mention alone.\n",
         ver = env!("CARGO_PKG_VERSION"),
     );
 }
@@ -1481,6 +1889,182 @@ mod tests {
         assert!(Target::Mb.mb() && !Target::Mb.gpu());
         assert!(!Target::Gpu.mb() && Target::Gpu.gpu());
         assert!(Target::All.mb() && Target::All.gpu());
+    }
+
+    /// Dump a recorded state and read it straight back, the way
+    /// `jdrgb state f` / `jdrgb load f --all` does.
+    fn reload(st: &State) -> LedConfig {
+        let (body, omitted) = state_body(st, Target::All);
+        assert!(omitted.is_empty(), "dropped a device: {omitted:?}");
+        parse_led_config(&body, "state").expect("state wrote a config it cannot read")
+    }
+
+    /// The property the whole feature rests on: every state jdrgb can produce,
+    /// it can dump and reload. A solid is the case that needed `mb:` — written
+    /// as 38 identical bare lines it would come back as a *direct-mode frame*,
+    /// a different controller state that records as `multi`.
+    #[test]
+    fn a_solid_survives_a_dump_and_reload() {
+        let st = State {
+            mb: Some(Last::Color((0xFF, 0xB0, 0xD0))),
+            gpu: Some(Last::Color((0xD2, 0x94, 0x32))),
+            ..State::default()
+        };
+        let conf = reload(&st);
+        assert_eq!(conf.mb, Some(Zone::Solid { mode: MODE_STATIC, rgb: (0xFF, 0xB0, 0xD0) }));
+        assert_eq!(conf.gpu, Some(Zone::Solid { mode: MODE_STATIC, rgb: (0xD2, 0x94, 0x32) }));
+    }
+
+    /// `off` and `black` put the same bytes on the wire and leave the
+    /// controller in different modes, so a snapshot has to carry the mode.
+    #[test]
+    fn off_is_not_black_across_a_dump_and_reload() {
+        let st = State {
+            mb: Some(Last::Off),
+            gpu: Some(Last::Color((0, 0, 0))),
+            ..State::default()
+        };
+        let conf = reload(&st);
+        assert_eq!(conf.mb, Some(Zone::Solid { mode: MODE_OFF, rgb: (0, 0, 0) }));
+        assert_eq!(conf.gpu, Some(Zone::Solid { mode: MODE_STATIC, rgb: (0, 0, 0) }));
+        assert_ne!(conf.mb, conf.gpu);
+    }
+
+    #[test]
+    fn a_per_led_pattern_survives_a_dump_and_reload() {
+        let frame: Vec<(u8, u8, u8)> =
+            (0..STRIP_LEDS).map(|i| (i as u8, 0x95, 0x36)).collect();
+        let st = State {
+            mb: Some(Last::Multi),
+            mb_pattern: Some(frame.clone()),
+            gpu: Some(Last::Multi),
+            gpu_pattern: Some(vec![(1, 2, 3), (4, 5, 6)]),
+        };
+        let conf = reload(&st);
+        assert_eq!(conf.mb, Some(Zone::Frame(frame)));
+        assert_eq!(conf.gpu, Some(Zone::Frame(vec![(1, 2, 3), (4, 5, 6)])));
+    }
+
+    /// A hex value must round-trip as itself. Emitting the *preset name* would
+    /// look tidier and be wrong: re-tuning that preset later would silently
+    /// change what an old snapshot restores to, and a name resolves to a
+    /// different RGB on each device.
+    #[test]
+    fn a_snapshot_holds_values_not_names() {
+        let st = State { mb: Some(Last::Color((0xFA, 0x95, 0x36))), ..State::default() };
+        let (body, _) = state_body(&st, Target::Mb);
+        assert!(body.contains("FA9536"), "{body}");
+        assert!(body.contains("# warmwhite"), "the name is a comment, for legibility: {body}");
+        // ...and reading it back gets the value, not the GPU's warmwhite.
+        assert_eq!(
+            reload(&st).mb,
+            Some(Zone::Solid { mode: MODE_STATIC, rgb: (0xFA, 0x95, 0x36) })
+        );
+    }
+
+    #[test]
+    fn an_unrecorded_state_dumps_nothing() {
+        // Not an empty config — nothing at all, so `state` can fail rather than
+        // write a file that would restore a machine to darkness.
+        let (body, _) = state_body(&State::default(), Target::All);
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn a_config_may_describe_one_device_only() {
+        // What a partial snapshot looks like. `load` leaves the other alone.
+        let conf = parse_led_config("gpu: red\n", "t").unwrap();
+        assert_eq!(conf.mb, None);
+        assert_eq!(conf.gpu, Some(Zone::Solid { mode: MODE_STATIC, rgb: (0xFF, 0, 0) }));
+    }
+
+    #[test]
+    fn the_strip_cannot_be_described_twice() {
+        let e = parse_led_config("mb: red\nFF0000\n", "t").unwrap_err();
+        assert!(e.contains("described twice"), "{e}");
+        let e = parse_led_config("mb: red\nmb: blue\n", "t").unwrap_err();
+        assert!(e.contains("second"), "{e}");
+    }
+
+    /// `mb: red green blue` would pad to 38 with black and silently blank most
+    /// of the strip. The card is different: its lines cycle to fill.
+    #[test]
+    fn only_the_gpu_takes_several_colors_on_one_line() {
+        let e = parse_led_config("mb: red green\n", "t").unwrap_err();
+        assert!(e.contains("per-LED pattern"), "{e}");
+        assert_eq!(
+            parse_led_config("gpu: red green\n", "t").unwrap().gpu,
+            Some(Zone::Frame(vec![(0xFF, 0, 0), (0, 0xFF, 0)]))
+        );
+    }
+
+    #[test]
+    fn a_misspelled_directive_says_so() {
+        // Without the colon check this reported "invalid color or preset
+        // 'mainboard: red'", which points at the wrong half of the line.
+        let e = parse_led_config("mainboard: red\n", "t").unwrap_err();
+        assert!(e.contains("unknown directive"), "{e}");
+    }
+
+    #[test]
+    fn directives_are_case_insensitive() {
+        assert_eq!(
+            parse_led_config("MB: off\nGPU: off\n", "t").unwrap(),
+            LedConfig {
+                mb: Some(Zone::Solid { mode: MODE_OFF, rgb: (0, 0, 0) }),
+                gpu: Some(Zone::Solid { mode: MODE_OFF, rgb: (0, 0, 0) }),
+            }
+        );
+    }
+
+    /// A stash written during this boot is never stale, whatever its age —
+    /// its age is necessarily less than the uptime. The direction that must
+    /// never be got wrong: calling a live stash stale loses the original.
+    #[test]
+    fn a_stash_from_this_boot_is_never_stale() {
+        use std::time::Duration;
+        let up = Duration::from_secs(31 * 3600); // this machine, measured
+        for age_s in [0, 1, 60, 3600, 31 * 3600 - 1] {
+            assert!(
+                !predates_boot(Duration::from_secs(age_s), up),
+                "a stash {age_s}s into a {up:?} uptime was called stale"
+            );
+        }
+    }
+
+    /// The case this exists for: the UPS took the machine down with a stash
+    /// still on disk, because `on_mains_cmd` never got to run.
+    #[test]
+    fn a_stash_older_than_the_uptime_predates_the_boot() {
+        use std::time::Duration;
+        let up = Duration::from_secs(300); // booted 5 minutes ago
+        assert!(predates_boot(Duration::from_secs(3600), up), "restored a stash from last boot");
+        // Just inside the slack is still ours — filesystem timestamps are
+        // coarse and the two clocks aren't sampled together.
+        assert!(!predates_boot(up + Duration::from_secs(1), up));
+        assert!(predates_boot(up + STASH_SLACK + Duration::from_secs(1), up));
+    }
+
+    /// `restore` must never be treated as an apply: applies clear the stash
+    /// first, which would leave `restore` with nothing to put back.
+    #[test]
+    fn restore_does_not_maintain_the_stash() {
+        assert!(!is_apply(&Command::Restore(None)));
+        assert!(!is_apply(&Command::State(None)));
+        assert!(!is_apply(&Command::Probe));
+        assert!(is_apply(&Command::Solid(MODE_STATIC, Paint::Preset("red"))));
+        assert!(is_apply(&Command::Load("x".into())));
+        assert!(is_apply(&Command::Rainbow(38)));
+    }
+
+    #[test]
+    fn restore_takes_an_optional_fallback_color() {
+        assert!(matches!(parse(&["restore"]), Ok(Command::Restore(None))));
+        assert!(matches!(
+            parse(&["restore", "coolwhite"]),
+            Ok(Command::Restore(Some(Paint::Preset("coolwhite"))))
+        ));
+        assert!(parse(&["restore", "nonsense"]).is_err());
     }
 
     #[test]
