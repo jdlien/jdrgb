@@ -16,10 +16,14 @@
 
 use std::ffi::c_void;
 use std::mem::offset_of;
+use std::cell::Cell;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0};
 use windows_sys::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryExA, LOAD_LIBRARY_SEARCH_SYSTEM32,
 };
+use windows_sys::Win32::System::Threading::{CreateMutexW, ReleaseMutex, WaitForSingleObject};
 
 // ---- Device -----------------------------------------------------------------
 
@@ -162,6 +166,144 @@ impl Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
+// ---- Keeping off the bus ----------------------------------------------------
+
+/// Minimum gap between GPU LED writes, machine-wide.
+///
+/// `docs/ups-wedge-incident.md` records the observation this is built on: two
+/// writes *seconds apart* visibly glitched the monitor for a few seconds, while
+/// a single write, and writes minutes apart, did not. The card's RGB controller
+/// hangs off the GPU's own I2C block, which is display plumbing, so that is not
+/// a surprising place to find interference.
+///
+/// The number is a guess constrained by one observation — the honest thing to
+/// say is that "seconds apart" was bad and this is comfortably longer than a
+/// single write takes. `JDRGB_GPU_GAP_MS` overrides it; `0` disables the wait.
+const DEFAULT_WRITE_GAP: Duration = Duration::from_millis(1500);
+
+/// Minimum gap between repaints *within one session* — `tune` and `preview`,
+/// which hold a single `Gpu` and paint repeatedly.
+///
+/// The full gap is wrong here. It exists to separate one program's burst from
+/// the next program's, and applying it per keypress would make `tune --gpu`
+/// take a second and a half to answer an arrow key. But a held key repeats
+/// around 30 times a second, and letting that through unthrottled is the
+/// "live tuning at speed" the incident write-up warned about, so there is still
+/// a floor — just a human-scaled one.
+const LIVE_WRITE_GAP: Duration = Duration::from_millis(100);
+
+/// How long to wait for another process to finish with the bus before going
+/// ahead anyway. A lock that can't be taken must not leave the lights wrong.
+const LOCK_TIMEOUT_MS: u32 = 10_000;
+
+fn write_gap() -> Duration {
+    match std::env::var("JDRGB_GPU_GAP_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+        Some(ms) => Duration::from_millis(ms),
+        None => DEFAULT_WRITE_GAP,
+    }
+}
+
+/// Where the time of the last GPU write is recorded.
+///
+/// Machine-wide rather than per-user on purpose: the boot task runs as SYSTEM
+/// and a tray click runs as the logged-in user, and the whole point is that
+/// those two see each other.
+fn gap_marker() -> Option<std::path::PathBuf> {
+    let dir = std::path::PathBuf::from(std::env::var_os("ProgramData")?).join("jdrgb");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir.join("gpu-last-write"))
+}
+
+/// Milliseconds since the epoch, as text, written into the marker file.
+///
+/// The time goes in the file's *contents* rather than being read off its mtime,
+/// which is what this did first and why it silently did nothing: writing zero
+/// bytes doesn't update the last-write timestamp on Windows, so the marker
+/// always looked ancient and the gap never applied.
+fn now_ms() -> Option<u128> {
+    SystemTime::now().duration_since(UNIX_EPOCH).ok().map(|d| d.as_millis())
+}
+
+fn mark_write() {
+    if let (Some(path), Some(ms)) = (gap_marker(), now_ms()) {
+        let _ = std::fs::write(&path, ms.to_string());
+    }
+}
+
+/// Serialises GPU I2C across every process on the machine.
+///
+/// Two reasons, one confirmed and one observed:
+///
+///   * The ENE register protocol is stateful. `ene_select` puts a register
+///     address on the bus in one transaction and the read or write that follows
+///     is a *separate* one, so two jdrgb processes can interleave and have one
+///     read back the register the other just selected. The LED count that gates
+///     every write comes through exactly that path.
+///   * Writes close together disturb the display (see `DEFAULT_WRITE_GAP`).
+///
+/// Nothing else serialises this. The tray queues its own clicks, but a scheduled
+/// task, a tray click and a hand-run command are three processes that have never
+/// heard of each other.
+///
+/// One name, no fallback. An earlier version tried `Global\` and fell back to
+/// `Local\`, which is worse than having no lock: two processes that end up on
+/// different objects both believe they hold the bus. If the named mutex cannot
+/// be created at all we say so and go ahead unserialised, which is at least
+/// honest about what is happening.
+///
+/// The remaining gap is cross-account, and it is a DACL problem rather than a
+/// privilege one — creating a *mutex* in the global namespace needs no special
+/// privilege (`SeCreateGlobalPrivilege` covers file-mapping and symbolic-link
+/// objects only). But an object created by the SYSTEM boot task gets that
+/// token's default DACL, and a later `CreateMutexW` from an ordinary user asks
+/// for `MUTEX_ALL_ACCESS`, which that DACL may refuse. Serialisation between the
+/// boot task and a logged-in user is therefore not guaranteed; between processes
+/// of the same user — the tray, a hook, a hand-run command, an agent in a loop —
+/// it is.
+const BUS_MUTEX: &str = "Global\\jdrgb-gpu-i2c";
+
+struct BusLock(HANDLE);
+
+impl BusLock {
+    /// `Ok(Some)` — held. `Ok(None)` — no lock could be created, proceeding
+    /// unserialised. `Err` — someone else has it.
+    ///
+    /// Being busy is a *transient* error rather than a silent free pass. The
+    /// earlier version gave up after the timeout and carried on without the
+    /// lock, which meant a long-lived holder — `tune` and `preview` keep one for
+    /// the whole interactive session — turned every competing command into
+    /// exactly the interleaved-select race the lock exists to prevent. Failing
+    /// makes `--wait` retry and tells everyone else what happened.
+    fn acquire() -> Result<Option<BusLock>> {
+        let wide: Vec<u16> = BUS_MUTEX.encode_utf16().chain(std::iter::once(0)).collect();
+        let h = unsafe { CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
+        if h.is_null() {
+            return Ok(None);
+        }
+        // WAIT_ABANDONED means the last holder died without releasing — the
+        // mutex is ours now, and there is nothing to repair on our side.
+        match unsafe { WaitForSingleObject(h, LOCK_TIMEOUT_MS) } {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Some(BusLock(h))),
+            _ => {
+                unsafe { CloseHandle(h) };
+                Err(Error::transient(
+                    "another jdrgb is using the GPU's I2C bus (a `tune` or `preview` session holds \
+                     it until it exits)",
+                ))
+            }
+        }
+    }
+}
+
+impl Drop for BusLock {
+    fn drop(&mut self) {
+        unsafe {
+            ReleaseMutex(self.0);
+            CloseHandle(self.0);
+        }
+    }
+}
+
 // ---- NVAPI entry points -----------------------------------------------------
 
 struct Nvapi {
@@ -259,11 +401,27 @@ pub struct Gpu {
     /// LED count straight from the config table, as reported — not yet bounded.
     pub raw_led_count: u8,
     config_table: [u8; 64],
+    /// Held for as long as this handle lives, so every transaction it makes is
+    /// serialised against other processes. `None` when the lock couldn't be
+    /// taken — see `BusLock`, which is deliberately best-effort.
+    _lock: Option<BusLock>,
+    /// When this handle last wrote LEDs, for the in-session throttle. `None`
+    /// until the first write, which is what makes that write consult the
+    /// machine-wide marker instead.
+    last_write: Cell<Option<Instant>>,
 }
 
 /// Find the supported card and confirm an ENE controller is really at 0x67.
 /// Read-only: this never writes an LED register.
 pub fn detect() -> Result<Gpu> {
+    if crate::hardware_disabled() {
+        return Err(Error::permanent(crate::NO_HW_MESSAGE));
+    }
+
+    // Taken before NVAPI is even loaded, and held until this `Gpu` is dropped,
+    // so a whole detect/prepare/apply sequence is one atomic turn on the bus.
+    let lock = BusLock::acquire()?;
+
     let api = load_nvapi()?;
 
     let mut handles: [NvHandle; 64] = [std::ptr::null_mut(); 64];
@@ -298,6 +456,8 @@ pub fn detect() -> Result<Gpu> {
             ene_name: String::new(),
             raw_led_count: 0,
             config_table: [0u8; 64],
+            _lock: lock,
+            last_write: Cell::new(None),
         });
     }
 
@@ -330,8 +490,12 @@ impl Gpu {
         sig.iter().enumerate().all(|(i, &b)| b as usize == i)
     }
 
-    /// Read the firmware string and config table. Only meaningful once the
-    /// signature has confirmed an ENE controller is answering.
+    /// Read the firmware string and the whole config table. Only meaningful once
+    /// the signature has confirmed an ENE controller is answering.
+    ///
+    /// The full table is for `probe`, which prints it. Everything else wants one
+    /// byte of it and should call `prepare`, which reads one byte of it — see the
+    /// note there on why that is worth splitting.
     pub fn read_identity(&mut self) -> Result<()> {
         self.ene_name = self.read_name()?;
         for i in 0..64 {
@@ -352,6 +516,15 @@ impl Gpu {
     /// Full readiness check for any write path: confirm an ENE controller really
     /// is answering at 0x67, learn what it is, and make sure it looks sane.
     /// Returns the validated LED count.
+    ///
+    /// Reads the one config byte it needs rather than the whole table. Each ENE
+    /// register read is two NVAPI I2C transactions — a select and an access — so
+    /// the 64-byte table cost 128 of them to use one, and this path runs on every
+    /// single write. Dropping it takes a `jdrgb --gpu COLOR` from roughly 209
+    /// transactions to 83. That matters here specifically: the ENE controller
+    /// sits on the graphics card's own I2C block, and writes close together are
+    /// what glitched the monitor in `docs/ups-wedge-incident.md`. `probe` still
+    /// reads the full table through `read_identity`, because it prints it.
     pub fn prepare(&mut self) -> Result<usize> {
         let sig = self.signature()?;
         if !Self::signature_ok(&sig) {
@@ -361,7 +534,9 @@ impl Gpu {
                 hex.join(" ")
             )));
         }
-        self.read_identity()?;
+        self.ene_name = self.read_name()?;
+        self.raw_led_count = self.ene_read(REG_CONFIG_TABLE + CONFIG_LED_COUNT as u16)?;
+        self.config_table[CONFIG_LED_COUNT] = self.raw_led_count;
         self.validate()
     }
 
@@ -453,6 +628,14 @@ impl Gpu {
         let per_led: Vec<(u8, u8, u8)> = (0..led_count).map(|i| colors[i % colors.len()]).collect();
         let buf = pack_colors(&per_led);
 
+        // Inside the bus lock, so the check and the write can't be raced.
+        self.space_out_writes();
+        // Stamped before the burst as well as after it. Every `?` below leaves
+        // without reaching the closing stamp, and the error path is precisely
+        // when the bus is already unhappy — a `--wait` retry 500ms later was the
+        // one case that escaped the gap entirely.
+        self.note_write();
+
         let mut sent = 0;
         while sent < buf.len() {
             let n = (buf.len() - sent).min(MAX_BLOCK);
@@ -466,7 +649,53 @@ impl Gpu {
         self.ene_write(REG_APPLY, APPLY)?;
         self.ene_write(REG_DIRECT, 0)?;
         self.ene_write(REG_APPLY, APPLY)?;
+
+        self.note_write();
         Ok(())
+    }
+
+    /// Record that the bus was just used, here and machine-wide.
+    fn note_write(&self) {
+        self.last_write.set(Some(Instant::now()));
+        mark_write();
+    }
+
+    /// Wait until enough time has passed since the last GPU write anywhere on
+    /// the machine. See `DEFAULT_WRITE_GAP` for why this exists.
+    ///
+    /// Every failure here is ignored on purpose — no ProgramData, no marker
+    /// file, an unreadable timestamp, a clock that went backwards. This is a
+    /// courtesy to the display, and none of those are worth refusing to set the
+    /// lights over.
+    fn space_out_writes(&self) {
+        let gap = write_gap();
+        if gap.is_zero() {
+            return;
+        }
+
+        // Second and later paints of one live session: this handle already owns
+        // the bus lock, so nobody else is waiting, and the only question is
+        // whether we are painting faster than a display can take.
+        //
+        // `min` so that `JDRGB_GPU_GAP_MS` can only ever make this *less*
+        // permissive than it already is — someone lowering the gap to 50ms
+        // should not find live repaints still pinned at 100.
+        if let Some(last) = self.last_write.get() {
+            if let Some(remaining) = LIVE_WRITE_GAP.min(gap).checked_sub(last.elapsed()) {
+                std::thread::sleep(remaining);
+            }
+            return;
+        }
+
+        let Some(path) = gap_marker() else { return };
+        let Ok(text) = std::fs::read_to_string(&path) else { return };
+        let (Ok(last), Some(now)) = (text.trim().parse::<u128>(), now_ms()) else { return };
+        // A clock that moved backwards leaves `now` behind `last`. Waiting out a
+        // gap computed from that could mean sleeping for days, so don't.
+        let Some(since) = now.checked_sub(last) else { return };
+        if let Some(remaining) = gap.checked_sub(Duration::from_millis(since as u64)) {
+            std::thread::sleep(remaining);
+        }
     }
 
     /// Commit whatever is currently live to the controller's flash.
@@ -486,7 +715,15 @@ impl Gpu {
     /// flash has finite write cycles, so this belongs in a deliberate one-shot
     /// command, not in anything that runs at boot.
     pub fn save_to_flash(&self) -> Result<()> {
-        self.ene_write(REG_APPLY, SAVE)
+        // Paced like any other write. It is one transaction rather than a burst,
+        // but it is still traffic on the card's I2C block, and it typically
+        // follows an apply by a second or two — exactly the spacing that caused
+        // trouble.
+        self.space_out_writes();
+        self.note_write();
+        let out = self.ene_write(REG_APPLY, SAVE);
+        self.note_write();
+        out
     }
 
     // ---- ENE register layer -------------------------------------------------

@@ -17,13 +17,14 @@ use std::cell::Cell;
 use std::io::{Read, Write};
 use std::process::ExitCode;
 
-use hidapi::{DeviceInfo, HidApi, HidDevice};
+use hid::Device;
 
 // Colors and the last-set state live in the library half of this package, so
 // jdrgb-tray.exe can share them without duplicating tables that get tuned by eye.
 use jdrgb::palette::*;
 
 mod gpu;
+mod hid;
 
 // ---- Device -----------------------------------------------------------------
 const VENDOR_ID: u16 = 0x0B05; // ASUSTek
@@ -185,7 +186,10 @@ fn main() -> ExitCode {
             println!("jdrgb: rainbow across {n} LEDs (white end-caps)");
         }),
         Command::Load(path) => read_led_config(&path)
-            .and_then(|conf| with_retry(wait, || apply_config(&conf, &path, target)))
+            .and_then(|conf| {
+                let mut done = Landed::default();
+                with_retry(wait, || apply_config(&conf, &path, target, &mut done))
+            })
             .map(|()| println!("jdrgb: loaded {path}")),
         Command::Template(path) => write_template(&path, force).map(|()| {
             println!("jdrgb: wrote {path} ({STRIP_LEDS} LEDs) — edit it, then `jdrgb load {path}`");
@@ -266,6 +270,29 @@ fn parse(args: &[&str]) -> Result<Command, String> {
     }
 }
 
+/// What every hardware path says when `JDRGB_NO_HW` is set.
+const NO_HW_MESSAGE: &str = "JDRGB_NO_HW is set — refusing to touch the hardware";
+
+/// Whether `JDRGB_NO_HW` is set to anything other than `0` or the empty string.
+///
+/// This exists because agents drive this tool in loops, and this tool talks to
+/// hardware that does not enjoy that. One automated session put a few thousand
+/// I2C transactions through the GPU in a couple of minutes and visibly glitched
+/// the monitor; `docs/ups-wedge-incident.md` covers the USB side of the same
+/// lesson. With the variable set, everything that would open a device refuses
+/// before it opens one, so a test run can exercise argument parsing, config
+/// files, presets, `state` and the exit codes without a single USB or I2C
+/// transaction.
+///
+/// Deliberately not a CLI flag: a flag has to be remembered at every call site,
+/// and the point is to make a whole session safe at once.
+fn hardware_disabled() -> bool {
+    match std::env::var("JDRGB_NO_HW") {
+        Ok(v) => !v.is_empty() && v != "0",
+        Err(_) => false,
+    }
+}
+
 /// An error that knows whether retrying it could ever help.
 trait Retryable {
     fn is_permanent(&self) -> bool;
@@ -297,7 +324,9 @@ impl Retryable for gpu::Error {
 /// wrong card, bad ENE signature, missing NVAPI interface — abort immediately
 /// rather than burning a minute on something that can't come right.
 fn with_retry<T, E: Retryable>(wait: bool, mut f: impl FnMut() -> Result<T, E>) -> Result<T, String> {
-    let tries = if wait { 120 } else { 1 };
+    // Nothing can become ready when the hardware is switched off, so `--wait`
+    // would spend a minute discovering that.
+    let tries = if wait && !hardware_disabled() { 120 } else { 1 };
     let mut last = String::new();
     for attempt in 0..tries {
         match f() {
@@ -330,7 +359,7 @@ fn set_solid_targets(target: Target, wait: bool, mode: u8, paint: Paint) -> Resu
     // Label each line only when there's more than one device to tell apart, so
     // plain `jdrgb warmwhite` prints exactly what it always has.
     let labelled = target == Target::All;
-    let tries = if wait { 120 } else { 1 };
+    let tries = if wait && !hardware_disabled() { 120 } else { 1 };
 
     // Each target is applied the moment *it* is ready and then marked done, so a
     // device that never appears can't hold up one that's sitting there working.
@@ -451,36 +480,6 @@ fn save_gpu_flash(target: Target) -> Result<(), String> {
 // Device discovery
 // ---------------------------------------------------------------------------
 
-/// A hidapi handle that has **only ever looked at the Aura controller**.
-///
-/// `HidApi::new()` enumerates every HID device on the machine, and on Windows
-/// enumeration is not passive: it opens each device and asks it for its string
-/// descriptors. Filtering by VID/PID afterwards, the way this program used to,
-/// happens long after every keyboard, mouse and UPS on the bus has already
-/// been opened and interrogated.
-///
-/// That was not free. On the machine this was written for it wedged a UPS: an
-/// APC Back-UPS on the same bus stopped servicing USB requests entirely --
-/// serial-string reads included, from every process, until the cable was
-/// replugged -- and the failures landed exactly when `jdrgb restore` ran, at
-/// the moment mains returned and the UPS firmware was busy with the transfer.
-/// Painting the case lights has no business touching a UPS at all, so now it
-/// does not: `new_without_enumerate` plus `add_devices` looks at one VID/PID
-/// and nothing else. It is also simply faster.
-/// Discovery is disabled process-wide, once, which hidapi documents as the
-/// application's call to make and refuses to a library. It must happen before
-/// any context exists, and it panics if a context was already built *with*
-/// discovery -- so every hidapi handle in this program comes from here, and
-/// `HidApi::new()` appears nowhere else.
-fn aura_api() -> Result<HidApi, String> {
-    static DISABLE: std::sync::Once = std::sync::Once::new();
-    DISABLE.call_once(HidApi::disable_device_discovery);
-    let mut api = HidApi::new().map_err(|e| format!("hidapi init failed: {e}"))?;
-    api.add_devices(VENDOR_ID, PRODUCT_ID)
-        .map_err(|e| format!("could not look for the Aura controller: {e}"))?;
-    Ok(api)
-}
-
 /// Open the Aura control interface, returning it with its config table. The
 /// correct HID interface is the one that answers the config request (reply
 /// byte 1 == 0x30).
@@ -489,19 +488,24 @@ fn aura_api() -> Result<HidApi, String> {
 /// in the first place. Every caller needs it, and discarding it here only made
 /// them all ask the device for the same 60 bytes a second time — ~12ms on a bus
 /// where each exchange is expensive.
-fn open(api: &HidApi) -> Result<(HidDevice, [u8; 60]), String> {
-    let candidates: Vec<&DeviceInfo> = api
-        .device_list()
-        .filter(|d| d.vendor_id() == VENDOR_ID && d.product_id() == PRODUCT_ID)
-        .collect();
+///
+/// Nothing but the Aura controller is opened along the way. That is the whole
+/// point of `mod hid`, and `docs/ups-wedge-incident.md` is why — the candidates
+/// here are picked out of the PnP database by path, so a device with the wrong
+/// VID/PID is never opened at all, let alone asked for its string descriptors.
+fn open_controller() -> Result<(Device, [u8; 60]), String> {
+    if hardware_disabled() {
+        return Err(NO_HW_MESSAGE.into());
+    }
 
+    let candidates = hid::interfaces(VENDOR_ID, PRODUCT_ID)?;
     if candidates.is_empty() {
         return Err(format!("no ASUS Aura controller found (USB {VENDOR_ID:04X}:{PRODUCT_ID:04X})"));
     }
 
     let mut last = String::from("controller found but no HID interface answered");
-    for info in candidates {
-        match info.open_device(api) {
+    for info in &candidates {
+        match info.open() {
             Ok(dev) => match read_config(&dev) {
                 Some(cfg) if header_count(&cfg) > MAX_HEADERS => {
                     return Err(format!(
@@ -517,7 +521,7 @@ fn open(api: &HidApi) -> Result<(HidDevice, [u8; 60]), String> {
                         .into()
                 }
             },
-            Err(e) => last = format!("could not open HID interface: {e}"),
+            Err(e) => last = e,
         }
     }
     Err(last)
@@ -528,22 +532,21 @@ fn open(api: &HidApi) -> Result<(HidDevice, [u8; 60]), String> {
 // ---------------------------------------------------------------------------
 
 /// Write one logical Aura packet (payload[0] must be 0xEC) as a 65-byte report.
-fn write(dev: &HidDevice, payload: &[u8]) -> Result<(), String> {
+fn write(dev: &Device, payload: &[u8]) -> Result<(), String> {
     let mut buf = [0u8; REPORT_LEN];
     buf[..payload.len()].copy_from_slice(payload);
-    dev.write(&buf).map_err(|e| format!("HID write failed: {e}"))?;
-    Ok(())
+    dev.write(&buf)
 }
 
 /// Send a request byte and read the 65-byte reply.
-fn request(dev: &HidDevice, req: u8) -> Option<[u8; REPORT_LEN]> {
+fn request(dev: &Device, req: u8) -> Option<[u8; REPORT_LEN]> {
     write(dev, &[CMD, req]).ok()?;
     let mut buf = [0u8; REPORT_LEN];
     (dev.read_timeout(&mut buf, 500).ok()? >= 2).then_some(buf)
 }
 
 /// Read the 60-byte config table (reply id 0x30).
-fn read_config(dev: &HidDevice) -> Option<[u8; 60]> {
+fn read_config(dev: &Device) -> Option<[u8; 60]> {
     let reply = request(dev, REQ_CONFIG)?;
     if reply[1] != 0x30 {
         return None;
@@ -564,8 +567,7 @@ fn header_count(cfg: &[u8; 60]) -> u8 {
 }
 
 fn set_solid(mode: u8, color: (u8, u8, u8)) -> Result<(), String> {
-    let api = aura_api()?;
-    let (dev, cfg) = open(&api)?;
+    let (dev, cfg) = open_controller()?;
     let headers = header_count(&cfg);
     if headers == 0 {
         return Err("config table reported no addressable headers".into());
@@ -579,7 +581,7 @@ fn set_solid(mode: u8, color: (u8, u8, u8)) -> Result<(), String> {
 /// single LED-slot; the hardware fills the whole strip. With `commit`, the
 /// controller saves it (survives with nothing running); without, it's a live
 /// preview only — handy for rapid updates without hammering the flash.
-fn apply_solid(dev: &HidDevice, headers: u8, mode: u8, rgb: (u8, u8, u8), commit: bool) -> Result<(), String> {
+fn apply_solid(dev: &Device, headers: u8, mode: u8, rgb: (u8, u8, u8), commit: bool) -> Result<(), String> {
     apply_solid_stepped(dev, headers, mode, rgb, commit, true)
 }
 
@@ -600,7 +602,7 @@ fn apply_solid(dev: &HidDevice, headers: u8, mode: u8, rgb: (u8, u8, u8), commit
 /// flash is written by the same full sequence as a one-shot `jdrgb COLOR`. The
 /// saving is rare, so the extra four packets cost nothing that matters.
 fn apply_solid_stepped(
-    dev: &HidDevice,
+    dev: &Device,
     headers: u8,
     mode: u8,
     (r, g, b): (u8, u8, u8),
@@ -629,7 +631,7 @@ fn apply_solid_stepped(
 
 /// Stream a full per-LED frame to one header. The channel must be switched into
 /// direct mode first, or the controller ignores the frame.
-fn send_direct(dev: &HidDevice, channel: u8, colors: &[(u8, u8, u8)]) -> Result<(), String> {
+fn send_direct(dev: &Device, channel: u8, colors: &[(u8, u8, u8)]) -> Result<(), String> {
     let led_count = colors.len().min(255);
     if led_count == 0 {
         return Ok(());
@@ -666,8 +668,7 @@ fn send_direct(dev: &HidDevice, channel: u8, colors: &[(u8, u8, u8)]) -> Result<
 /// White end-caps with a rainbow interior — the per-LED showcase. Written to
 /// every header so it lands regardless of which one the strip is on.
 fn set_rainbow(count: usize) -> Result<(), String> {
-    let api = aura_api()?;
-    let (dev, cfg) = open(&api)?;
+    let (dev, cfg) = open_controller()?;
     let count = count.clamp(2, 255);
 
     let colors: Vec<(u8, u8, u8)> = (0..count)
@@ -687,6 +688,20 @@ fn set_rainbow(count: usize) -> Result<(), String> {
     Ok(())
 }
 
+/// Which targets an `apply_config` retry sequence has already landed.
+///
+/// `set_solid_targets` has always tracked this; `apply_config` did not, and
+/// under `with_retry` that mattered. A `restore --all` where the strip is ready
+/// but the GPU is not would fail the whole call, and the retry re-ran the
+/// motherboard write — which commits to the controller's flash — every 500ms for
+/// up to 120 attempts. Flash has finite write cycles, so a slow-to-appear GPU
+/// must not cost the strip a hundred saves.
+#[derive(Default)]
+struct Landed {
+    mb: bool,
+    gpu: bool,
+}
+
 /// Paint an already-parsed config via direct mode.
 /// The strip is padded to its full length with "off" so every LED is defined.
 ///
@@ -695,22 +710,25 @@ fn set_rainbow(count: usize) -> Result<(), String> {
 /// times just delays the error by a minute. Only the device work belongs in a
 /// retry, since that genuinely can start succeeding once the controller
 /// enumerates.
-fn apply_config(conf: &LedConfig, path: &str, target: Target) -> Result<(), String> {
+fn apply_config(conf: &LedConfig, path: &str, target: Target, done: &mut Landed) -> Result<(), String> {
     let mut failures = Vec::new();
     // A file may legitimately describe only one device — `jdrgb state` writes
     // exactly that when only one slot is recorded. So a zone the file doesn't
     // mention is left alone, and only a file that describes *nothing* the
     // caller asked for is an error. That still catches the case the strict
     // version existed for: `--gpu` pointed at a file with no `gpu:` line.
-    let mut applied = 0;
+    // Counts what earlier attempts landed as well as this one, so the
+    // "describes nothing" check below stays right across a retry.
+    let mut applied = usize::from(done.mb) + usize::from(done.gpu);
     let mut missing = Vec::new();
 
-    if target.mb() {
+    if target.mb() && !done.mb {
         match &conf.mb {
             None => missing.push("mb"),
             Some(Zone::Solid { mode, rgb }) => match set_solid(*mode, *rgb) {
                 Ok(()) => {
                     report(Some("mb"), *mode, *rgb);
+                    done.mb = true;
                     applied += 1;
                 }
                 Err(e) => failures.push(format!("mb: {e}")),
@@ -725,6 +743,7 @@ fn apply_config(conf: &LedConfig, path: &str, target: Target) -> Result<(), Stri
                     // part of what the strip is now showing.
                     Ok(()) => {
                         record_pattern(false, &colors);
+                        done.mb = true;
                         applied += 1;
                     }
                     Err(e) => failures.push(format!("mb: {e}")),
@@ -733,13 +752,14 @@ fn apply_config(conf: &LedConfig, path: &str, target: Target) -> Result<(), Stri
         }
     }
 
-    if target.gpu() {
+    if target.gpu() && !done.gpu {
         match &conf.gpu {
             None => missing.push("gpu"),
             Some(Zone::Solid { mode, rgb }) => match apply_gpu_solid(*mode, *rgb) {
                 Ok(()) => {
                     report(Some("gpu"), *mode, *rgb);
                     record(true, last_for(*mode, *rgb));
+                    done.gpu = true;
                     applied += 1;
                 }
                 Err(e) => failures.push(format!("gpu: {}", e.msg)),
@@ -750,6 +770,7 @@ fn apply_config(conf: &LedConfig, path: &str, target: Target) -> Result<(), Stri
                         colors.iter().map(|&(r, g, b)| format!("#{r:02X}{g:02X}{b:02X}")).collect();
                     println!("jdrgb: gpu: set {}", hex.join(" "));
                     record_pattern(true, colors);
+                    done.gpu = true;
                     applied += 1;
                 }
                 Err(e) => failures.push(format!("gpu: {}", e.msg)),
@@ -769,8 +790,7 @@ fn apply_config(conf: &LedConfig, path: &str, target: Target) -> Result<(), Stri
 }
 
 fn paint_strip(colors: &[(u8, u8, u8)]) -> Result<(), String> {
-    let api = aura_api()?;
-    let (dev, cfg) = open(&api)?;
+    let (dev, cfg) = open_controller()?;
     for ch in 0..header_count(&cfg) {
         send_direct(&dev, ch, colors)?;
     }
@@ -1162,7 +1182,8 @@ fn restore(target: Target, fallback: Option<Paint>, wait: bool) -> Result<(), St
     match read_stash(&path) {
         Some(text) => {
             let conf = parse_led_config(&text, &shown)?;
-            with_retry(wait, || apply_config(&conf, &shown, target))?;
+            let mut done = Landed::default();
+            with_retry(wait, || apply_config(&conf, &shown, target, &mut done))?;
             // Only once it actually landed: a failed restore that dropped the
             // stash would leave nothing to try again with.
             let _ = std::fs::remove_file(&path);
@@ -1229,19 +1250,18 @@ const HUE_STEP: f32 = 1.0; // degrees per keypress (hold a key to ramp)
 const SL_STEP: f32 = 0.01; // saturation/lightness per keypress (1%)
 
 /// Everything a live command (tune, preview) paints to, opened once up front.
-struct Live<'a> {
-    mb: Option<(HidDevice, u8)>, // device + addressable header count
+struct Live {
+    mb: Option<(Device, u8)>, // device + addressable header count
     gpu: Option<gpu::Gpu>,
     /// Whether the strip's effect mode has been selected already this session,
     /// so repeat paints can send colors alone. See `apply_solid_stepped`.
     mb_selected: Cell<bool>,
-    _api: &'a HidApi,
 }
 
-impl Live<'_> {
-    fn open(api: &HidApi, target: Target) -> Result<Live<'_>, String> {
+impl Live {
+    fn open(target: Target) -> Result<Live, String> {
         let mb = if target.mb() {
-            let (dev, cfg) = open(api)?;
+            let (dev, cfg) = open_controller()?;
             let headers = header_count(&cfg);
             if headers == 0 {
                 return Err("config table reported no addressable headers".into());
@@ -1257,7 +1277,7 @@ impl Live<'_> {
         } else {
             None
         };
-        Ok(Live { mb, gpu, mb_selected: Cell::new(false), _api: api })
+        Ok(Live { mb, gpu, mb_selected: Cell::new(false) })
     }
 
     /// Paint everywhere, resolving the color separately per device so a preset
@@ -1281,8 +1301,7 @@ impl Live<'_> {
 
 /// Dial in a color live on the strip with single keypresses, in HSL.
 fn tune(target: Target, start: (u8, u8, u8)) -> Result<(), String> {
-    let api = aura_api()?;
-    let live = Live::open(&api, target)?;
+    let live = Live::open(target)?;
 
     let (mut h, mut s, mut l) = rgb_to_hsl(start);
 
@@ -1485,8 +1504,7 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
 // ---------------------------------------------------------------------------
 
 fn preview(target: Target) -> Result<(), String> {
-    let api = aura_api()?;
-    let live = Live::open(&api, target)?;
+    let live = Live::open(target)?;
 
     let raw = RawMode::enable();
     // Keys come from the console input buffer, so without a console `poll_key`
@@ -1741,29 +1759,32 @@ fn is_elevated() -> bool {
 }
 
 fn probe_mb() -> Result<(), String> {
-    let api = aura_api()?;
-    let candidates: Vec<&DeviceInfo> = api
-        .device_list()
-        .filter(|d| d.vendor_id() == VENDOR_ID && d.product_id() == PRODUCT_ID)
-        .collect();
+    if hardware_disabled() {
+        return Err(NO_HW_MESSAGE.into());
+    }
+    let candidates = hid::interfaces(VENDOR_ID, PRODUCT_ID)?;
     if candidates.is_empty() {
         return Err(format!("no device {VENDOR_ID:04X}:{PRODUCT_ID:04X} found"));
     }
 
-    for info in candidates {
-        println!(
-            "interface {} (usage_page={:#06x} usage={:#06x})",
-            info.interface_number(),
-            info.usage_page(),
-            info.usage()
-        );
-        let dev = match info.open_device(&api) {
+    for info in &candidates {
+        let dev = match info.open() {
             Ok(d) => d,
             Err(e) => {
-                println!("  could not open: {e}\n");
+                println!("interface {:?}\n  could not open: {e}\n", info.interface_number());
                 continue;
             }
         };
+        match dev.usage() {
+            Some((page, usage)) => println!(
+                "interface {} (usage_page={page:#06x} usage={usage:#06x})",
+                info.interface_number().map_or(-1, i32::from)
+            ),
+            None => println!("interface {}", info.interface_number().map_or(-1, i32::from)),
+        }
+        // The path is the thing that decided this device was opened at all, so
+        // it is worth showing when the question is "what did jdrgb touch?".
+        println!("  path: {}", info.path());
         match request(&dev, REQ_FIRMWARE) {
             Some(r) => {
                 let fw: String = r[2..17].iter().filter(|&&c| c.is_ascii_graphic()).map(|&c| c as char).collect();

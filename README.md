@@ -588,6 +588,39 @@ byte on the wire — the signature can't protect a device it has to touch to che
 The NVAPI struct layout is pinned with compile-time offset assertions, since a
 wrong offset would silently send the wrong bytes to real hardware.
 
+### Being a good neighbour on the bus
+
+jdrgb once wedged a UPS on the same USB bus, because the HID library it used
+enumerated every device on the machine and asked each one for its string
+descriptors before filtering by VID/PID. `docs/ups-wedge-incident.md` is the full
+account; it is worth reading before changing anything in `src/hid.rs`.
+
+The rules that came out of it:
+
+- **Only our device is ever opened.** `src/hid.rs` gets the HID interface list
+  from the configuration manager, matches the VID and PID as text in the device
+  path, and calls `CreateFileW` on nothing else. No other device is opened, read
+  from, or sent anything.
+- **GPU writes are spaced out and serialised.** The card's RGB controller sits on
+  the GPU's own I2C block, which is display plumbing; two writes seconds apart
+  have been observed to glitch the monitor. Separate invocations are held at
+  least 1500ms apart, recorded machine-wide, and a named mutex keeps two
+  processes off the bus at once — a command that finds the bus busy says so and
+  fails rather than interleaving. Repaints *within* one `tune` or `preview`
+  session use a 100ms floor instead, because a second and a half per keypress
+  would make live tuning useless; that session holds the mutex until it exits.
+
+Two environment variables:
+
+| Variable | Effect |
+| --- | --- |
+| `JDRGB_NO_HW=1` | Every hardware path refuses before opening anything. Parsing, config files, presets and `state` still work, so an automated run can exercise the CLI without a single USB or I2C transaction. **Set this when scripting or testing jdrgb.** |
+| `JDRGB_GPU_GAP_MS=n` | Minimum milliseconds between GPU LED writes (default 1500). `0` disables the wait. |
+
+If you are wiring jdrgb into something that runs at a delicate moment — a UPS
+power hook, a shutdown script — prefer `--mb`, which never touches the graphics
+card at all.
+
 ### Lineage & credits
 
 The motherboard wire protocol was ported from **OpenRGB**'s

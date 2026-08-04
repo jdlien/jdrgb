@@ -2,8 +2,11 @@
 
 2026-08-03. Written for whoever works on jdrgb next, because the bug is invisible
 from inside this repo: nothing here misbehaved, no test could have caught it, and
-the damage landed on a different device belonging to a different program. The fix
-is one commit (`2a3c918`), and the reason it matters is worth more than the diff.
+the damage landed on a different device belonging to a different program.
+
+It took two attempts. The first (`2a3c918`) was wrong in a way that read as
+obviously correct, and both sections are kept below — the failed fix is the more
+useful half, because the mistake is the kind anyone would make.
 
 ## What happened
 
@@ -81,50 +84,95 @@ is illegal, and a device that deadlocks under them is at fault. But jdrgb was
 supplying the provocation, at the worst possible instant, for no reason at all —
 it needs one device and was touching two dozen.
 
-## The fix
+## The first fix, which did not work
 
-`disable_device_discovery()` + `add_devices(VID, PID)`, behind one helper that
-every hidapi handle in the program now comes from:
+Commit `2a3c918` routed every hidapi handle through one helper that called
+`disable_device_discovery()` and then `add_devices(VID, PID)`. It was wrong in
+three separate ways, and this section is kept rather than deleted because the
+reasoning looked sound and would be easy to repeat.
+
+**`disable_device_discovery()` does nothing on Windows.** The flag it sets is
+read in exactly one place that has any effect — hidapi 2.6.6 `src/lib.rs:166` —
+and that line sits inside `#[cfg(all(libusb, not(target_os = "freebsd")))]`. It
+disables device scanning inside `libusb_init()`, for Android. Windows builds
+compile the bundled C backend and emit only `cargo:rustc-cfg=hidapi`; you can
+confirm it in the build artifact:
+
+```
+$ grep rustc-cfg target/release/build/hidapi-*/output
+cargo:rustc-cfg=hidapi          # and no libusb
+```
+
+**`HidApi::new()` enumerates regardless.** It ends with an unconditional
+`api.add_devices(0, 0)?` (`src/lib.rs:190`) — outside every guard, never gated on
+the discovery flag. `new_without_enumerate()` is literally
+`disable_device_discovery(); Self::new()`, so it is the same function and equally
+ineffective here.
+
+**A VID/PID filter would not have been enough anyway.** `hid_enumerate` opens
+*every* HID interface with `CreateFileW` and calls `HidD_GetAttributes` on it
+**before** comparing the IDs (`etc/hidapi/windows/hid.c:863`). The filter only
+decides whether to go on and read the string descriptors. Filtering is therefore
+worth having — the string reads are the part that reaches the device — but "looks
+at one VID/PID and nothing else" was never true of it.
+
+Net effect: the helper did the full unfiltered sweep exactly as before, then a
+second filtered sweep on top, and `add_devices` appends rather than replaces, so
+every Aura interface appeared twice in the device list. It was slower and
+touched more, not less. The one-live-plug-pull verification below passed because
+a single enumeration on a healthy UPS is usually survivable, not because the
+provocation had been removed.
+
+## The fix that works
+
+`src/hid.rs`: about 200 lines of Win32 that open one device by path. hidapi is
+gone from `Cargo.toml` entirely.
 
 ```rust
-fn aura_api() -> Result<HidApi, String> {
-    static DISABLE: std::sync::Once = std::sync::Once::new();
-    DISABLE.call_once(HidApi::disable_device_discovery);
-    let mut api = HidApi::new().map_err(|e| format!("hidapi init failed: {e}"))?;
-    api.add_devices(VENDOR_ID, PRODUCT_ID)
-        .map_err(|e| format!("could not look for the Aura controller: {e}"))?;
-    Ok(api)
+// Nothing is opened here. CM_Get_Device_Interface_ListW returns the
+// configuration manager's own records, and the VID/PID are matched as text in
+// the path: \\?\HID#VID_0B05&PID_19AF&MI_02#...
+let candidates = hid::interfaces(VENDOR_ID, PRODUCT_ID)?;
+for info in &candidates {
+    let dev = info.open()?;   // CreateFileW on exactly one path
+    ...
 }
 ```
 
-Six call sites (`set_solid`, the two other paint paths, `Live::open`, the state
-dump, `probe_mb`) now route through it. `HidApi::new()` appears nowhere else.
+A device that is not the Aura controller is now never opened, never sent a
+control transfer, and never asked for anything. Not "filtered afterwards" —
+never touched.
 
 Notes for anyone touching this:
 
-- **`new_without_enumerate()` is deprecated** and hidapi says why: it is a global
-  operation, so libraries must not do it and applications should be explicit.
-  jdrgb is an application, so it calls `disable_device_discovery()` itself. That
-  is the sanctioned path, not a workaround.
-- **The `Once` is not paranoia.** `disable_device_discovery()` panics if a context
-  was already built *with* discovery. One helper, one disable, no ordering
-  question. If you ever add a second hidapi entry point, route it through
-  `aura_api()` or you reintroduce the panic *and* the bug.
-- **Adding a second controller means a second `add_devices` call**, not a return
-  to broad enumeration. Filtering after the fact is what caused this.
+- **Do not reintroduce hidapi.** There is no argument to it that avoids the
+  sweep; that is the whole finding above. If you need a second controller, add
+  its VID/PID to the path match in `hid::interfaces`.
+- **`hid::interfaces` must stay free of device opens.** It is the one function
+  whose job is to answer "which devices are ours?" without touching anything. The
+  unit tests in `src/hid.rs` pin the matcher, including a case that asserts the
+  UPS's own path never matches.
+- **Windows returns these paths in either case.** The controller here arrives as
+  `&MI_02`, uppercase; matching lowercase-only reported every interface as -1.
 
 ## Verification
 
-- `jdrgb amber --all --stash` and `jdrgb restore --all` both still drive the
-  motherboard strip and the GPU correctly.
-- Full test suite green, clippy clean.
-- One live plug-pull afterwards: 3.5 minutes on battery, replug, lights restored
-  from the stash, **and the UPS kept answering** — reads, serial and all.
+- `jdrgb probe --all` reports the controller and the card correctly, and now
+  lists the control interface **once** rather than twice.
+- Ten back-to-back `--all` applies, then `jdups --once`: the UPS still reads its
+  serial `0B2148N01995` and answers every request.
+- Full test suite green (81 tests), clippy clean.
+- One live plug-pull under the *first* fix: 3.5 minutes on battery, replug,
+  lights restored from the stash, and the UPS kept answering.
 
-Evidence status, stated honestly: **2-for-2 wedges before the fix, 1-for-1 clean
-after.** That is likely-fixed, not proven. The outstanding test is a deeper
-discharge, because both wedges had the UPS's `BelowRemainingCapacityLimit` flag
-asserted and the clean pulls did not.
+Evidence status, stated honestly: **2-for-2 wedges before any fix.** The clean
+plug-pull was run against the first fix, which we now know changed nothing about
+what gets touched — so it is evidence that a single enumeration on a healthy UPS
+is survivable, not that the problem was solved. What is different now is not a
+better-behaved enumeration but the absence of one: the UPS is not opened at all,
+so there is no provocation left to be unlucky with. The outstanding test is still
+a deeper discharge, because both wedges had the UPS's
+`BelowRemainingCapacityLimit` flag asserted and the clean pulls did not.
 
 ## Side finding: GPU LED writes can glitch the display
 
@@ -137,10 +185,34 @@ NVAPI**, which is display plumbing — the NVAPI descriptor literally carries
 few seconds. A single write, and writes minutes apart, did not: the real
 power-event sequence produced none.
 
-So no code change was made. But if a future feature paints the GPU rapidly —
-animation, a pulse effect, live tuning at speed — expect display disturbance, and
-consider rate-limiting the GPU path specifically. `--mb` is the escape hatch for
-any caller that wants lights without touching the card.
+That has since been acted on, because an automated agent driving the CLI in a
+loop reproduced it:
+
+- **A machine-wide minimum gap between GPU writes**, default 1500ms, recorded in
+  `%ProgramData%\jdrgb\gpu-last-write`. `JDRGB_GPU_GAP_MS` tunes it; `0` disables
+  it. The number is a guess constrained by one observation — "seconds apart" was
+  bad — not a measured safe threshold. Repaints inside a single `tune`/`preview`
+  session use a 100ms floor instead; the full gap per keypress would make live
+  tuning unusable, and that session holds the bus mutex throughout anyway. The
+  marker is stamped before a burst as well as after, so a write that fails
+  part-way still paces whatever retries it.
+- **Far less I2C per write.** `prepare()` used to read all 64 config bytes to use
+  one of them, and each ENE register read is two NVAPI transactions. A
+  `jdrgb --gpu COLOR` went from ~209 transactions to ~83.
+- **A machine-wide mutex** (`Global\jdrgb-gpu-i2c`) held for the life of a `Gpu`
+  handle. This closes a real race as well as capping concurrency: ENE registers
+  are selected in one transaction and read or written in the next, so two
+  processes interleaving could have one read back the register the other just
+  selected. A command that cannot get the lock fails with a transient error
+  rather than proceeding without it — carrying on unserialised would have
+  reintroduced exactly that race, and `tune`/`preview` hold the lock for whole
+  minutes. Serialisation between the SYSTEM boot task and a logged-in user is
+  not guaranteed, because the mutex inherits the creator's default DACL; between
+  processes of one user it is.
+
+`--mb` remains the escape hatch for any caller that wants lights without touching
+the card, and `JDRGB_NO_HW=1` makes every hardware path refuse — which is what an
+automated test run should set.
 
 ## The transferable lesson
 

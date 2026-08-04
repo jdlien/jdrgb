@@ -19,11 +19,19 @@ name = "jdrgb-tray"
 path = "src/tray/main.rs"
 
 [dependencies]
-hidapi = "2"
+# No hidapi. Its enumeration opens every HID device on the machine and asks the
+# matching ones for their string descriptors, which wedged a UPS — and the crate
+# offers no way to avoid it, since `HidApi::new()` calls `add_devices(0, 0)`
+# unconditionally and `disable_device_discovery()` is libusb-only. `src/hid.rs`
+# opens one device by path instead. See docs/ups-wedge-incident.md.
 windows-sys = { version = "0.61", features = [
     "Win32_System_Console",
+    "Win32_System_IO",                # overlapped HID reads and writes
     "Win32_System_LibraryLoader",     # LoadLibraryA/GetProcAddress for nvapi64.dll
     "Win32_System_SystemInformation", # GetTickCount64, for the stash's boot check
+    "Win32_Storage_FileSystem",       # CreateFileW/ReadFile/WriteFile for the HID device
+    "Win32_Devices_DeviceAndDriverInstallation", # CM_Get_Device_Interface_List, opens nothing
+    "Win32_Devices_HumanInterfaceDevice",        # HidD_/HidP_ for the one device we open
     "Win32_Foundation",
     # jdrgb-tray only. These cost jdrgb.exe nothing: windows-sys is pure FFI
     # declarations, and an unreferenced one emits no code and no import.
