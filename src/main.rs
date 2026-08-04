@@ -451,6 +451,36 @@ fn save_gpu_flash(target: Target) -> Result<(), String> {
 // Device discovery
 // ---------------------------------------------------------------------------
 
+/// A hidapi handle that has **only ever looked at the Aura controller**.
+///
+/// `HidApi::new()` enumerates every HID device on the machine, and on Windows
+/// enumeration is not passive: it opens each device and asks it for its string
+/// descriptors. Filtering by VID/PID afterwards, the way this program used to,
+/// happens long after every keyboard, mouse and UPS on the bus has already
+/// been opened and interrogated.
+///
+/// That was not free. On the machine this was written for it wedged a UPS: an
+/// APC Back-UPS on the same bus stopped servicing USB requests entirely --
+/// serial-string reads included, from every process, until the cable was
+/// replugged -- and the failures landed exactly when `jdrgb restore` ran, at
+/// the moment mains returned and the UPS firmware was busy with the transfer.
+/// Painting the case lights has no business touching a UPS at all, so now it
+/// does not: `new_without_enumerate` plus `add_devices` looks at one VID/PID
+/// and nothing else. It is also simply faster.
+/// Discovery is disabled process-wide, once, which hidapi documents as the
+/// application's call to make and refuses to a library. It must happen before
+/// any context exists, and it panics if a context was already built *with*
+/// discovery -- so every hidapi handle in this program comes from here, and
+/// `HidApi::new()` appears nowhere else.
+fn aura_api() -> Result<HidApi, String> {
+    static DISABLE: std::sync::Once = std::sync::Once::new();
+    DISABLE.call_once(HidApi::disable_device_discovery);
+    let mut api = HidApi::new().map_err(|e| format!("hidapi init failed: {e}"))?;
+    api.add_devices(VENDOR_ID, PRODUCT_ID)
+        .map_err(|e| format!("could not look for the Aura controller: {e}"))?;
+    Ok(api)
+}
+
 /// Open the Aura control interface, returning it with its config table. The
 /// correct HID interface is the one that answers the config request (reply
 /// byte 1 == 0x30).
@@ -534,7 +564,7 @@ fn header_count(cfg: &[u8; 60]) -> u8 {
 }
 
 fn set_solid(mode: u8, color: (u8, u8, u8)) -> Result<(), String> {
-    let api = HidApi::new().map_err(|e| format!("hidapi init failed: {e}"))?;
+    let api = aura_api()?;
     let (dev, cfg) = open(&api)?;
     let headers = header_count(&cfg);
     if headers == 0 {
@@ -636,7 +666,7 @@ fn send_direct(dev: &HidDevice, channel: u8, colors: &[(u8, u8, u8)]) -> Result<
 /// White end-caps with a rainbow interior — the per-LED showcase. Written to
 /// every header so it lands regardless of which one the strip is on.
 fn set_rainbow(count: usize) -> Result<(), String> {
-    let api = HidApi::new().map_err(|e| format!("hidapi init failed: {e}"))?;
+    let api = aura_api()?;
     let (dev, cfg) = open(&api)?;
     let count = count.clamp(2, 255);
 
@@ -739,7 +769,7 @@ fn apply_config(conf: &LedConfig, path: &str, target: Target) -> Result<(), Stri
 }
 
 fn paint_strip(colors: &[(u8, u8, u8)]) -> Result<(), String> {
-    let api = HidApi::new().map_err(|e| format!("hidapi init failed: {e}"))?;
+    let api = aura_api()?;
     let (dev, cfg) = open(&api)?;
     for ch in 0..header_count(&cfg) {
         send_direct(&dev, ch, colors)?;
@@ -1251,7 +1281,7 @@ impl Live<'_> {
 
 /// Dial in a color live on the strip with single keypresses, in HSL.
 fn tune(target: Target, start: (u8, u8, u8)) -> Result<(), String> {
-    let api = HidApi::new().map_err(|e| format!("hidapi init failed: {e}"))?;
+    let api = aura_api()?;
     let live = Live::open(&api, target)?;
 
     let (mut h, mut s, mut l) = rgb_to_hsl(start);
@@ -1455,7 +1485,7 @@ fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
 // ---------------------------------------------------------------------------
 
 fn preview(target: Target) -> Result<(), String> {
-    let api = HidApi::new().map_err(|e| format!("hidapi init failed: {e}"))?;
+    let api = aura_api()?;
     let live = Live::open(&api, target)?;
 
     let raw = RawMode::enable();
@@ -1711,7 +1741,7 @@ fn is_elevated() -> bool {
 }
 
 fn probe_mb() -> Result<(), String> {
-    let api = HidApi::new().map_err(|e| format!("hidapi init failed: {e}"))?;
+    let api = aura_api()?;
     let candidates: Vec<&DeviceInfo> = api
         .device_list()
         .filter(|d| d.vendor_id() == VENDOR_ID && d.product_id() == PRODUCT_ID)
