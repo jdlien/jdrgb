@@ -1,12 +1,14 @@
 # Plan: the LEDs as a Home Assistant light
 
-Status: **planned, not started.** Written 2026-10-30 and revised three times the
-same day after external review (Appendix B). The `off`/`on` pair this builds on has
-landed; everything below is still to do.
+Status: **ready to implement.** Written 2026-10-29 and revised the same night
+through eight rounds of external review — the last returning READY — and
+feedback and live checks from the house's own HA setup (Appendix B). The work —
+starting with the `off`/`on` pair it builds on — happens on the `home-assistant`
+branch.
 
-The consumer is a Home Assistant install on the LAN, and through it a Hue
-dimmer switch, Apple Home (via HA's HomeKit Bridge) and, optionally, Matter.
-The goal is that the PC's LEDs show up in all of them as an ordinary light.
+The consumer is this house's Home Assistant, and through it a Hue dimmer switch
+and Apple Home (via HA's HomeKit Bridge). The goal is that the PC's LEDs show
+up in both as an ordinary light, and can take part in the house's scenes.
 
 ## Goal
 
@@ -23,7 +25,8 @@ the hardware can do continuous color it has never been calibrated for.
 
 | Question | Decision |
 |---|---|
-| Transport | **MQTT with HA discovery.** The PC connects *out* to the broker; nothing listens on the PC |
+| Transport | **MQTT with HA discovery.** The PC connects *out* to the house's existing broker; nothing listens on the PC |
+| Broker auth | **None on the PC.** Anonymous on the broker's LAN listener, whose shared anonymous ACL the bridge's topics join — the pattern the house's other devices use. `user`/`password` stay optional for other installs |
 | What runs on the PC | `jdrgb-ha.exe`, a third binary in this crate, one per machine, started at logon for one configured user |
 | Does it touch hardware? | **No.** It spawns `jdrgb.exe`, as the tray does |
 | MQTT client | `rumqttc`'s synchronous client, default features off (no TLS); `serde_json` for payloads |
@@ -35,7 +38,8 @@ the hardware can do continuous color it has never been calibrated for.
 | Duplicate commands | Reach the CLI, like tray clicks — with one narrow exception for the bridge repeating itself |
 | One entity or two? | One. Presets resolve per device, so one name looks the same on both |
 | Boot task | Mutually exclusive with `-Ha`, enforced whichever is installed first |
-| HomeKit / Matter | No code. HA's HomeKit Bridge; a community Matter bridge |
+| HomeKit | No code. Added by name to HA's HomeKit Bridge include list |
+| Matter | Out of scope for this house: no Matter server, and HomeKit already covers Apple Home |
 
 ## Why the calibration is not an obstacle
 
@@ -66,21 +70,78 @@ and is a non-goal.
   password auth is off and the key is restricted to jdrgb.
 - **HTTP** (a listener on the PC) is least-privilege by construction, but opens
   an inbound port, needs a firewall rule, and gives HA state only by polling.
-- **MQTT** inverts the connection: the PC dials out to the broker HA already
-  runs (the Mosquitto add-on), so **no port is opened on the PC**. Discovery
-  builds the entity from one retained message, state is pushed both ways, and
-  the broker's last will marks the light *unavailable* when the PC sleeps or
-  the bridge dies.
+- **MQTT** inverts the connection: the PC dials out to the existing Mosquitto
+  broker, so **no port is opened on the PC**. Discovery builds the entity from
+  one retained message, state is pushed both ways, and the broker's last will
+  marks the light *unavailable* when the PC sleeps or the bridge dies.
 
-The cost is the Mosquitto add-on and a broker password on the PC, sent in the
-clear on the LAN. Use a dedicated broker user for the bridge; restricting it by
-ACL to the bridge's topics is recommended, and makes a leaked password worth
-exactly "can change the PC's LED color". TLS stays possible later.
+The house already runs the broker and other devices already use it, so the cost
+is one ACL entry (*This install*, below). The bridge connects anonymously, so no
+secret lives on the PC. The threat model is the one already accepted for an
+unauthenticated LAN protocol: anyone on the LAN can change the PC's LEDs. The
+ACL bounds what anonymous clients can do as a group — the house's anonymous
+devices share one allowlist — rather than isolating this client. An install that
+prefers a broker user sets `user`/`password` in `ha.conf`; TLS stays possible
+later.
+
+MQTT discovery is used rather than hand-written YAML in HA's `mqtt.yaml`, which
+is how some of the house's devices are defined. Discovery lets the bridge define
+its own entity and, with `--unpublish`, delete it cleanly.
 
 `docs/streamdeck-plan.md` lists "a socket, named pipe, or HTTP surface" as a
 non-goal. That still holds for `jdrgb.exe`. Remote control needs *something* on
 the PC to receive commands; of `sshd`, a listener, or an outbound client, the
 outbound client can do the least.
+
+## This install
+
+The plan was first written against a generic HA install. This house differs in
+ways that matter for Phase 3:
+
+- **No add-ons.** HA (2026.10.4) runs as a Docker container in a Lima VM on a
+  Mac mini, not on HAOS, so there is no Supervisor. Mosquitto runs as its own
+  container beside it and already serves other devices. Phase 3 needs no broker
+  setup beyond the ACL entry below.
+- **Devices connect anonymously** to the broker's LAN listener on port 1884. The
+  house rule is that no secret lives on a device, and the bridge follows it.
+  Anonymous clients there share **one** allowlist: Mosquitto applies the ACL
+  file's leading `topic` lines to every anonymous client together, and nothing in
+  them names a client. So the bridge's entry adds its topics to what any anonymous
+  LAN client may do, and the bridge may also use the topics other anonymous
+  devices were given. The ACL bounds anonymous LAN clients as a group; it doesn't
+  isolate one from another. That is the boundary the house already accepts for
+  its devices. The bridge's entry, with `<name>` the PC's lowercased computer name
+  (the `<id>` of Phase 3 is `jdrgb_<name>`):
+
+  ```
+  topic readwrite jdrgb/jdrgb_<name>/#
+  topic write     homeassistant/light/jdrgb_<name>/#
+  topic read      homeassistant/status
+  ```
+
+  `readwrite`, not `write`, on the first line: the bridge *subscribes* to its
+  own command topic, `jdrgb/jdrgb_<name>/set`, as well as publishing state and
+  availability there. The will is published to that subtree too. The broker's
+  owner adds the entry; the broker is theirs to touch.
+
+  **An ACL mistake is invisible in the protocol on this broker.** Tested live:
+  Mosquitto 2.0.22 *grants* a subscription its ACL denies — SUBACK `0`, not
+  `0x80` — and enforces the read ACL at delivery instead. And in MQTT 3.1.1 a
+  broker can't refuse a publish, so a denied one is dropped silently. A missing
+  `read` gives a bridge that is online but deaf; a missing `write`, one that
+  connects and is never seen. So the bridge proves its own access with an echo
+  before it goes `online` (Phase 3, *Connecting*), and acceptance is checked from
+  the HA side.
+- **The listener's address** goes in `ha.conf`. Port 1884 is on the HA VM, which
+  has its own pinned LAN address — not the Mac mini's, whose addresses all refuse
+  1884. The broker's owner supplied it, and a TCP connect from the PC succeeded on
+  2026-10-29. It is a private LAN address and stays out of this document.
+- **HomeKit takes an explicit list.** The HomeKit Bridge exposes only the
+  entities named in its include list, so the light won't appear in Apple Home by
+  itself (Phase 3, acceptance).
+- **No Matter server**, and HomeKit already covers Apple Home: Matter is out of
+  scope here.
+- **Scenes snapshot and restore** with `scene.create` (*Scenes*, below).
 
 ## Why a third binary, and why `rumqttc`
 
@@ -162,14 +223,28 @@ from the record and then acts:
   another process wrote in between, including on a device whose lock the
   restore had already released. Process-wide is safe because `restore` is the
   whole of that process's work.
-- **The stash.** `stash_now`'s check-then-write runs under the state lock.
-  `restore` reads the stash and keeps its contents. Before each device leg,
-  holding that device's lock, it checks the stash file still has those
-  contents; if it was removed or replaced, someone has decided since, so it
-  stops there and reports what landed. After the last leg it deletes the stash
-  under the state lock only if the contents still match, so it can't delete a
-  newer stash created mid-restore. Today's sequence — read, apply both,
-  unconditional `remove_file` (`src/main.rs:1196-1205`) — has neither check.
+- **The stash.** `stash_now`'s check-then-write runs under the state lock, and
+  every `--stash` stamps the stash with a fresh id in a comment line —
+  `# stash-id: <ms since epoch>-<pid>` — so the config grammar is unchanged.
+  *Every* `--stash`, including one that keeps an existing snapshot
+  (`src/main.rs:1161`, the first-snapshot-wins rule): it keeps the snapshot's
+  colors and refreshes only the id. Contents can't identify a borrow — the same
+  lighting stashed twice is the same bytes, and a reused snapshot is the same
+  bytes by definition — so without the refresh, a restore that paused mid-way
+  could finish over a *newer* borrow and delete its record. `restore` reads the
+  stash and keeps its id. Before each device leg, holding that device's lock, it
+  checks the stash still carries that id; if it was removed, replaced or
+  re-stamped, someone has decided since, so it stops there, leaves the stash
+  intact, and reports what landed. After the last leg it deletes the stash under
+  the state lock only if the id still matches. Today's sequence — read, apply
+  both, unconditional `remove_file` (`src/main.rs:1196-1205`) — has neither check.
+- **A revision counter.** Every `update` increments a `rev=` key under the state
+  lock, whether or not any value changed. It lets a reader tell that *someone
+  wrote*, even when they wrote identical values — which the bridge needs (Phase
+  3, the follow). A counter rather than the modification time, because file
+  timestamps come from a clock that can tick as coarsely as ~15 ms, so two
+  writes could share one. The parser already skips unknown keys, so older
+  readers ignore it.
 
 *Tests*, no hardware: `update` takes its path internally so a test can point it
 at a temp directory; threads hammering `record` on alternating devices lose
@@ -211,17 +286,27 @@ bridge's mapping — never in `--level`, which stays a plain multiplier.
 
 **Ownership: one bridge per machine.** A `Global\jdrgb-ha` mutex: an instance
 that finds it held, *or is denied access to it*, exits. The MQTT client id is
-`jdrgb-ha-<computername>`, so a second bridge anywhere kicks the first off the
+`jdrgb-ha-<name>`, so a second bridge anywhere kicks the first off the
 broker rather than silently sharing its topics. `install.ps1 -Ha` installs for
 one user, carrying that user's SID through elevation as `-Tray` does
 (`install.ps1:140`, `:292`). Multi-user arbitration is a non-goal.
 
 **Config.** `%LOCALAPPDATA%\jdrgb\ha.conf`, `key=value` like the state file:
-`host`, `port` (default 1883), `user`, `password`, and an optional `name` for
-the device in HA (default `PC LEDs`). Plain text in the user's own profile.
-Missing or unreadable → logged, exit. The installer resolves *that user's*
-profile path from the SID (not the elevated admin's), checks the file exists,
-and prints what to put in it if not.
+
+```
+host=<the broker's LAN listener>
+port=1884
+```
+
+`host` is required. `port` defaults to 1883, the MQTT standard; this house uses
+1884. `name` is optional: the device's name in HA, which also names the entity.
+It defaults to the computer's name plus "LEDs" — a PC named `DESK` becomes
+`Desk LEDs`, entity `light.desk_leds` — because a house can have more than one
+PC, and a fixed default would collide. `user` and `password` are optional and
+absent here: without them the bridge connects anonymously. Missing `host`, or an
+unreadable file, is logged and the bridge exits. The installer resolves *that
+user's* profile path from the SID (not the elevated admin's), checks the file
+exists, and prints what to put in it if not.
 
 **Logging.** `%LOCALAPPDATA%\jdrgb\ha.log`, truncated to its last half when it
 passes a small size. There is nowhere else for an error to go.
@@ -233,52 +318,130 @@ its `PostMessageW` wrapper. `lib.rs`'s "only colors and state" comment widens to
 "colors, state, and how to run the CLI"; the device layer stays out. The bridge
 never passes `--wait`: a light command should fail fast, not retry for a minute.
 
+The shared result keeps a successful child's stderr too. Today `run_with`
+returns an empty message for any zero exit (`src/tray/worker.rs:120`), which
+would hide the one warning that matters most here: a hardware apply that
+succeeded while its record was skipped (1b), the reason the bridge would then
+report stale state. The bridge logs such stderr as a warning; the tray can
+ignore it, as now. Tested with a harmless child that writes to stderr and exits
+zero.
+
 **Children die with the bridge.** Windows doesn't end a process's children when
 the parent is killed, and `run_with`'s timeout only protects a child while the
 parent is alive to call `kill()` (`src/tray/worker.rs:99-102`). A bridge killed
 at logoff or by uninstall would leave a `jdrgb.exe` mid-write with nobody
 watching it. So at startup the bridge puts itself in a job object with
 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (one more `windows-sys` feature,
-`Win32_System_JobObjects`); children inherit the job and end with the bridge.
-A child ended mid-write is the case the tray's timeout already accepts. Tested
-with a harmless sleeping child, never with hardware.
+`Win32_System_JobObjects`); children are associated with the job and end with
+the bridge. A child ended mid-write is the case the tray's timeout already
+accepts.
 
-**Threads.** Two. `rumqttc`'s `Client::publish` and `subscribe` are blocking
-sends on a bounded channel that only the connection's own polling drains
-(rumqttc 0.25.1), so a blocking call on the polling thread can deadlock it —
-and splitting connection lifecycle across threads lets a step meant for one
-connection land on the next. So one thread owns the connection outright:
+The job handle is created non-inheritable, so a child holding a copy can't keep
+the job alive, and it is **never closed** — it lives exactly as long as the
+process, because closing the last handle ends every process in the job,
+including the one that closed it. If job setup fails, the resident logs it and
+exits rather than run with unowned children. `--unpublish` spawns no child and
+skips the job entirely, so nothing can end it before it reports its exit code.
+Tested with a harmless sleeping child, never with hardware: killing the bridge
+ends the child; `--unpublish` exits 0.
 
-- *Network* owns the connection and **every** `Client` call. It loops on
-  `Connection::recv_timeout(100 ms)`, handles the event, then moves the
-  worker's requests into a small outbox and flushes it with the non-blocking
-  `try_publish` / `try_subscribe_many`. Anything the full request queue refuses
-  stays in the outbox for the next pass; state in the outbox is latest-wins.
-  Incoming commands are parsed here and handed to the worker.
-- *Worker* owns the pending intent, the follow, pacing and children, and never
-  touches the `Client`. It wakes on a message or a 1 s tick; on a tick it
-  `stat`s the state file and asks the network thread to republish if the
-  modification time changed — no spawn. A 90-second child blocks only this
-  thread.
+**Threads.** Two. Three facts about `rumqttc` 0.25.1 shape them: `publish` and
+`subscribe` are blocking sends on a bounded channel that only the connection's
+polling drains, so a blocking call on the polling thread can deadlock it;
+`recv_timeout` builds a fresh poll future each call and drops it on timeout,
+and since the event loop only keeps a connection once TCP *and* CONNACK have
+completed, a short timeout aborts every slow handshake; and the plain blocking
+`recv` / `iter` is never cancelled, its handshake bounded by `rumqttc`'s own
+connection timeout.
+
+- *Network* runs the blocking `connection.iter()` and owns the connection's
+  lifecycle — subscribing, availability, discovery — using only the
+  non-blocking `try_*` calls, so it can never wait on the queue it drains. It
+  parses incoming commands and hands them to the worker, and sets a shared
+  *ready* flag (below). Every event wakes it, and keepalive pings guarantee one
+  at least every 30 s; that is when it retries a lifecycle step the queue
+  refused and checks its own timers, such as the subscribe retry.
+- *Worker* owns the pending intent, the follow, pacing and children. It wakes on
+  a message or a 1 s tick. **Every tick** reads the state file (a few hundred
+  bytes, no spawn) *and* the stash's identity, and validates a pending follow
+  against both, whatever `rev` says: a hook can re-stamp the stash and then fail
+  its hardware write, since `stash_now` runs before the apply
+  (`src/main.rs:164`), which changes the stash and not `rev`. An unchanged `rev`
+  only spares recomputing the projection. Whenever its projected state changes,
+  the worker updates the shared **latest-state slot** and publishes it (below);
+  if the queue refuses, the slot keeps it for the next tick. A 90-second child
+  blocks only this thread.
+
+The network thread never computes state itself. On readiness and on HA's birth
+message it publishes whatever the latest-state slot holds, so reconnecting can't
+undo the pending-follow rule (*State out*) by publishing a projection of the raw
+file. The worker updates the follow *before* recomputing the projection, and the
+projection *before* the slot.
+
+**One lock orders the two publishers.** The slot is a mutex, and each thread
+holds it across both choosing the payload *and* calling `try_publish` — the
+worker while it writes a new projection and publishes it, the network thread
+while it reads the slot and publishes it. Otherwise the network thread could read
+an old `OFF`, the worker write and publish a newer `ON`, and the network thread
+then enqueue its stale `OFF` last, leaving the wrong state retained until the
+next change. `try_publish` never blocks, so the critical section is short. A
+deterministic test drives that interleaving and asserts that an older projection
+can never be enqueued after a newer one.
+
+State is the only thing the worker publishes. It is retained and idempotent, so
+one that slips onto a new connection early does no harm, and the lifecycle
+messages whose order matters never leave the network thread.
 
 Keepalive is 30 s, driven by the polling, so a slow child can't drop the
-connection. After a connection error the network thread waits 1 s before
-polling again — `rumqttc` reconnects on the next poll with no delay of its own —
-and logs a repeated identical error once rather than every second.
+connection. After a connection error the network thread clears *ready* and
+waits 1 s before polling again — `rumqttc` reconnects on the next poll with no
+delay of its own — and logs a repeated identical error once rather than every
+second.
 
-**Connecting.** Everything here is scoped to one connection. A connection error
-discards that connection's "ready" flag, its queued discovery and availability,
-and its awaited SUBACK; only the latest state survives in the outbox. On
-`ConnAck` the network thread subscribes to the command topic and
-`homeassistant/status` in one SUBSCRIBE, noting its packet id from the
-`Outgoing::Subscribe` event. **Availability goes `online` only when that
-SUBACK grants the command subscription** — `rumqttc` doesn't inspect return
-codes (`handle_incoming_suback` is `Ok(None)`), so the bridge does: a `0x80` for
-the command topic is logged as a broker ACL problem, availability stays
-`offline`, and the subscribe is retried every 5 minutes on the same connection.
-Once granted: discovery, `online`, then current state. **No step of connecting
-ever writes hardware.** HA's birth message (`homeassistant/status` = `online`)
-republishes discovery and state the same way.
+**Connecting.** Everything here is scoped to one connection; a connection error
+discards its *ready* flag, its awaited SUBACK and its lifecycle stage. The
+request queue holds 32 entries. `try_*` doesn't retry a request the full queue
+refuses — it returns an error — so the steps below are a **stage machine**: each
+advances only once its request was accepted, and a refused one keeps its stage
+and is retried on the next network event. *Ready* is set only once every startup
+message has been accepted. A test with a one-entry queue and forced refusals
+checks that nothing is skipped. On `ConnAck` the network thread:
+
+1. publishes a retained **`offline`** to the availability topic. Withholding
+   `online` isn't enough on its own: a retained `online` from an earlier
+   connection would otherwise stand, and a live connection never fires its will;
+2. subscribes to the command topic, an echo topic `jdrgb/<id>/echo`, and
+   `homeassistant/status` in one SUBSCRIBE, noting its packet id from the
+   `Outgoing::Subscribe` event;
+3. on the matching SUBACK, checks the return codes — `rumqttc` doesn't
+   (`handle_incoming_suback` is `Ok(None)`). A `0x80` is logged as a broker ACL
+   problem, availability stays `offline`, and the subscribe is retried every
+   5 minutes on the same connection. That covers brokers that report a denial;
+   this house's doesn't (*This install*), which is what the next step is for;
+4. publishes a fresh random nonce, not retained, to `jdrgb/<id>/echo`, and waits
+   for it to come back on its own subscription — MQTT 3.1.1 delivers a client's
+   publishes to its own matching subscriptions. Its return proves `read` and
+   `write` on `/echo` itself, whatever the SUBACK said, and with the expected
+   single wildcard grant on `jdrgb/<id>/#` that stands for the subtree. It can't
+   rule out a narrower deny on `/set` alone — Mosquitto allows topic-specific
+   denials under a broader grant — which is what the HA-side acceptance checks
+   are for. An echo that hasn't returned 10 s after it was sent is handled on the
+   network thread's next event (it wakes on events, so normally within the 30 s
+   keepalive): logged as "the broker's ACL appears to deny `jdrgb/<id>/#`", the
+   bridge stays *not ready*, and the echo is retried every 5 minutes. *Not
+   ready* is the bridge's own state; whether the broker shows `offline` depends
+   on step 1's publish having been allowed. If `write` was revoked, a stale
+   retained `online` from an earlier connection can stand, and the broker's
+   owner clears it. The echo topic sits inside the existing `readwrite` line, so
+   the ACL needs nothing extra. A lifecycle test covers an echo that never
+   returns;
+5. once the echo is back: discovery, `online`, the latest-state slot, and *ready*
+   set. Discovery's own topic isn't covered by the echo; whether HA sees the
+   entity is the acceptance check.
+
+HA's birth message (`homeassistant/status` = `online`) republishes discovery and
+the latest-state slot the same way, but only once *ready*. **No step of connecting ever writes
+hardware.**
 
 Retained messages on the command topic are ignored and logged: a command
 someone left retained would otherwise replay on every reconnect. HA's own MQTT
@@ -286,9 +449,11 @@ light doesn't retain commands by default.
 
 **Exit.** Any exit other than `--unpublish` — killed at logoff, crashed —
 closes the socket, and the broker publishes the will at once. A sleeping PC's
-will fires after 1.5 × keepalive, ~45 s; commands HA sends inside that window
-are buffered and may apply on wake, and after it they are gone. Both are
-acceptable for a light.
+will fires after 1.5 × keepalive, ~45 s. After that HA doesn't send commands at
+all: a call to an unavailable light is skipped, with a logged warning, and the
+calling script carries on (tested live on 2026.10.4). Only inside that ~45 s,
+while HA still believes the light is available, can a command reach the broker,
+sit on the dead connection, and apply on wake. Both are acceptable for a light.
 
 **Topics.** `<id>` is `jdrgb_` plus the lowercased computer name.
 
@@ -296,6 +461,7 @@ acceptable for a light.
 |---|---|
 | `homeassistant/light/<id>/leds/config` | discovery, retained |
 | `jdrgb/<id>/set` | commands from HA, subscribed at QoS 0 |
+| `jdrgb/<id>/echo` | the bridge's own access check (*Connecting*), never retained |
 | `jdrgb/<id>/state` | state to HA, retained |
 | `jdrgb/<id>/availability` | `online` / `offline` (the will), retained |
 | `homeassistant/status` | HA's birth message |
@@ -315,7 +481,7 @@ acceptable for a light.
   "effect_list": ["Cool White", "Warm White", "White", "Black", "Red", "…"],
   "transition": false,
   "flash": false,
-  "device": { "identifiers": ["jdrgb_desk"], "name": "PC LEDs", "manufacturer": "jdrgb" }
+  "device": { "identifiers": ["jdrgb_desk"], "name": "Desk LEDs", "manufacturer": "jdrgb" }
 }
 ```
 
@@ -356,9 +522,19 @@ and `brightness`.
   which would lose `on`'s per-device lit records and its care for the stash.
 
 **Resolving a command.** After a 250 ms settle with no new message, the worker
-takes the pending intent and resolves it against one **base**: the device the
-state table below takes the look from — the strip, unless the strip is off or
-absent and the card is lit. The result is a single command:
+first validates any pending follow (below), then resolves the pending intent
+against one **base**, chosen by the same rule as what is reported (*State out*):
+
+- while a follow is pending, **the strip** — including its lit record when it is
+  off. The card is converging on the strip, so its record is stale by design;
+- otherwise, the device the state table takes the look from — the strip, unless
+  the strip is off or absent and the card is lit.
+
+Otherwise a command sent while the card lags would resolve against the card's
+old look: Red at 40%, then `OFF`, then `ON` with a brightness, would bring back
+the card's lagging Blue rather than the Red the strip was turned off from, which
+is what plain `on` restores (`src/main.rs:1253`). The result is a single
+command:
 
 | Intent | Command |
 |---|---|
@@ -374,9 +550,13 @@ it (Stream Deck plan, trap 2: a partial failure is a real state).
 
 **The card follows the strip.** When the strip leg finishes, the worker holds
 one *follow*: the same command for the card — `jdrgb off --gpu`,
-`jdrgb on --gpu`, `jdrgb P --gpu` — and three observations taken right then:
-the strip's record, the card's record, and the stash's identity (absent, or its
-contents). The card gets the *command*, not a copied value, so the CLI resolves
+`jdrgb on --gpu`, `jdrgb P --gpu` — and two observations taken right then,
+after the strip leg's child has exited: the state file's `rev`, and the stash's
+identity (absent, or its `stash-id`; both 1b). A revision rather than the
+recorded values, because values can't show a write that repeated them: with both
+devices Blue, HA picks Red and the card's Red follow waits; the user then picks
+Blue for the card from the tray. The records look exactly as the follow expects,
+and only the revision shows that someone chose since. The card gets the *command*, not a copied value, so the CLI resolves
 it against the card itself: a preset gets the card's calibration, and
 `on --gpu` acts only if the card is recorded off, using the card's own lit
 record.
@@ -385,14 +565,28 @@ A newer strip leg **replaces** the follow. There is never more than one, it
 always mirrors the latest command, and nothing carries over from the one it
 replaced.
 
+One exception: a plain `ON` that **left the strip unchanged** — the strip was
+already lit, so `jdrgb on` did nothing and recorded nothing — doesn't replace a
+pending follow whose observations still match. Replacing it with `on --gpu` would strand the
+card on its old color, since `on` acts only on a device recorded off. If the
+observations no longer match, someone else has acted, and the plain `ON`
+replaces the follow as usual. A plain `ON` that turned the strip back on always
+replaces it.
+
 The follow runs once the light has been quiet for 5 s and the bridge's previous
-GPU leg was at least 60 s ago (pacing, below). Immediately before spawning, the
-worker takes the three observations again. **Any difference means someone else
-acted since** — a tray click, a terminal, a UPS hook — so the follow is dropped,
-logged, and the truth published. Because the observations are taken *after* the
-strip leg, a stash the strip leg itself cleared doesn't count as a difference.
-The window between that check and the child holding the bus is the spawn plus
-up to 10 s the CLI may wait for the bus lock; that window is accepted.
+GPU leg was at least 60 s ago (pacing, below). The worker re-checks both
+observations **on every tick**, not just before spawning, and once more
+immediately before spawning. **Any difference means someone else acted since** —
+a tray click, a terminal, a UPS hook — so the follow is dropped at once, logged,
+and the ordinary projection published at once (*State out*), rather than a
+minute later when pacing would have let it run. Because the observations are
+taken *after* the strip leg's child, the strip leg's own write and any stash it
+cleared don't count as differences.
+
+Two windows are accepted: a write by someone else that lands *during* the
+bridge's own child is attributed to the bridge, and the time between the final
+check and the child holding the bus is the spawn plus up to 10 s the CLI may
+wait for the bus lock.
 
 Nothing ever corrects the hardware toward an old intent. A message that arrives
 while a child runs starts the next pending intent; it doesn't cancel the child.
@@ -402,11 +596,16 @@ Worked cases, each a pure resolution test:
 | Sequence | Result |
 |---|---|
 | Red, then (level 2) brightness 40% before the follow runs | strip Red, then Red at 40%; the follow becomes `red --gpu --level 40`. The second command resolved against the strip, already Red |
-| Red; a UPS hook paints amber with `--stash`; nothing more | follow dropped: the strip's record is no longer what the strip leg left |
-| Red; UPS amber `--stash`; then plain `ON` | strip `on`, a no-op; the follow becomes `on --gpu`, also a no-op; the stash survives for the UPS restore |
+| Red; a UPS hook paints amber with `--stash`; nothing more | follow dropped on the next tick: `rev` and the stash both changed |
+| Both blue; Red; then the tray sets the card Blue | follow dropped on the next tick: the values match what it observed, but `rev` moved |
+| `OFF`; then the tray sets the card Green before the follow runs | follow dropped on the next tick, and HA sees `ON` with the card's Green at once instead of the strip-only `OFF` |
+| Red; UPS amber `--stash`; then plain `ON` | strip `on`, a no-op; the old follow's observations no longer match, so it becomes `on --gpu`, also a no-op; the stash survives for the UPS restore |
+| Both blue; Red; then plain `ON` before the follow runs | strip `on` changes nothing and the follow's observations still match, so `red --gpu` stays and runs; the card ends Red |
 | Warm White picked during a UPS borrow | the strip leg clears the stash — the new normal, as from the tray; the follow observes no stash both times and runs |
 | `OFF` then plain `ON`, card lit | strip off, then back on; follow `on --gpu` is a no-op, so the card is never touched |
 | `OFF` then plain `ON`, card already recorded off | strip back on; follow `on --gpu` restores the card's own lit record |
+| (level 2) Both Blue; Red at 40%; `OFF`; `ON` + brightness 60%, all before the follow runs | base is the strip's lit record, Red: strip Red at 60%, follow `red --gpu --level 60` — never the card's lagging Blue |
+| (level 2) Both Blue at 100%; Red at 40%; then effect Green before the follow runs | Green at the strip's 40%, not the card's 100% |
 
 **Pacing.** This is where the plan meets `docs/ups-wedge-incident.md`: two GPU
 writes *seconds* apart visibly glitched the monitor, writes *minutes* apart did
@@ -433,11 +632,20 @@ signature reads included, which happen before `space_out_writes` paces anything.
   the hardware does (trap 4), and the same color picked during a UPS borrow must
   make it the new normal, as from the tray.
 - **A runaway guard on the strip.** A token bucket of 30 strip legs, refilling
-  one a minute. An empty bucket drops a command — no strip leg, no follow — logs
-  it and publishes the truth, except an `off` for a strip not already recorded
-  off, which always goes through, so the light can always be turned off. The
-  bucket lives in memory and starts full on every launch. It guards against a
-  looping automation; it is not a wear budget, since the controller's flash
+  one a minute, counted on *attempt*, whatever the outcome. An empty bucket drops
+  the strip leg, logs it and publishes the truth. Two things still happen:
+  - an `off` strip leg gets through at most once every 5 minutes, so the light
+    can always be turned off. That allowance counts attempts too, never records:
+    a record can fail to land (1b keeps recording best-effort) while the write
+    succeeds, and an exemption keyed on "strip not recorded off" would then let
+    every repeated `OFF` commit flash;
+  - the **follow is still created**, with its observations taken at the moment
+    the strip leg was dropped. The card has its own pacing, at most once a minute, so
+    an `OFF` reaches a lit card even when the strip's bucket is empty or the strip
+    was already off.
+
+  The bucket lives in memory and starts full on every launch. It guards against
+  a looping automation; it is not a wear budget, since the controller's flash
   endurance is unknown.
 
 In practice: the dimmer's off button turns the strip off at once and the card
@@ -462,9 +670,17 @@ A *look* is:
   so omitting it leaves the last preset showing.
 
 When both are lit with different looks the strip's is reported, documented as
-approximate — and while a follow is pending the difference is the bridge's own
-pacing, so the strip's look is simply right. The projection is for display
-only; it never decides whether a leg is done.
+approximate.
+
+**While a follow is pending, the strip alone is reported** — its on/off state as
+well as its look. The difference is the bridge's own pacing and the card is
+converging on the strip, so the strip is what the user asked for. Without this,
+the dimmer's toggle would break: after an `OFF` the card stays lit for at least
+5 s, the table would say `ON`, and a second press — `light.toggle` decides from
+the reported state — would send another `OFF` instead of turning the light back
+on.
+
+The projection is for display only; it never decides whether a leg is done.
 
 Level 1 state messages:
 
@@ -485,6 +701,22 @@ Exclusion with the boot task holds in both directions:
   it isn't, before starting the bridge.
 - `-Boot` with a `jdrgb-ha` task installed is an error naming the way out.
 
+**Acceptance, in this house**, once the broker's ACL entry exists:
+
+1. `Test-NetConnection <host> -Port 1884` succeeds from the PC (done 2026-10-29).
+2. `ha.log` shows the echo coming back and availability going `online`.
+3. The entity appears in HA with no YAML, named after the device:
+   `light.<computer>_leds` by default. That is the check on discovery's `write`.
+4. Its state follows the tray: pick a color from the tray, and HA shows it within
+   about a second — the check on state's `write`.
+5. Picking a named preset in HA changes the strip, and HA then shows that preset
+   as confirmed state — the check on the command path, HA to bridge, which the
+   echo exercises but doesn't prove for HA's own publishes.
+6. Unplugging the network, or sleeping the PC, turns it `unavailable` within
+   about 45 s; it comes back on its own.
+7. **HomeKit:** the HA owner adds the light to the HomeKit Bridge's include list,
+   and it appears in Apple Home.
+
 **Remove.** `uninstall.ps1`, in order:
 
 1. Disables and stops the `jdrgb-ha` task and ends any `jdrgb-ha` process — its
@@ -493,7 +725,7 @@ Exclusion with the boot task holds in both directions:
    running.
 2. Runs `jdrgb-ha.exe --unpublish --config <that user's ha.conf>`. It takes the
    singleton itself, so a resident can't start mid-cleanup; connects with the
-   client id `<id>-cleanup`; publishes **nothing** of its normal startup;
+   client id `jdrgb-ha-<name>-cleanup`; publishes **nothing** of its normal startup;
    publishes empty retained payloads to the config, state and availability
    topics at QoS 1 and waits for their three PUBACKs; queues DISCONNECT, polls
    until the `Outgoing::Disconnect` event confirms it was sent, then drops the
@@ -503,9 +735,9 @@ Exclusion with the boot task holds in both directions:
 3. Removes the task and binary, reporting a failed unpublish with the manual
    fallback (delete the device under HA's MQTT integration).
 
-`ha.conf` is left in place and its path printed: it holds a password the user may
-want to keep or delete deliberately. Acceptance check, in HA: after uninstall
-the entity is gone and stays gone across an HA restart.
+`ha.conf` is left in place and its path printed, since it may hold a password on
+an install that uses one. Acceptance check, in HA: after uninstall the entity is
+gone and stays gone across an HA restart.
 
 ### Phase 4 — level 2: color wheel, white temperature, brightness
 
@@ -598,6 +830,53 @@ triggers for each button; one automation maps them onto the light:
 HA's Hue documentation states the Hue API limits each device to one event per
 second. That suits this light, and the GPU pacing makes faster pointless.
 
+Acceptance check for the toggle: press off, then on again within five seconds.
+The strip goes off and comes back, and the card is never touched — the second
+press saw `OFF`, because the pending follow made the strip's state the
+reported one.
+
+### Scenes (documentation and acceptance, not code)
+
+The house's Studio scenes — `script.studio_off`, and Relax / Bright / Synthwave
+Dreams driven by `input_select.studio_mode` — snapshot and restore with
+`scene.create`. A known quirk: a restore skips any entity whose last-reported
+state already matches. The light needs nothing special, but these behaviours are
+worth pinning down:
+
+- **A scene sees the true requested state at once.** The strip changes within
+  about a second, and while a follow is pending the bridge reports the strip
+  (Phase 3, *State out*), so a snapshot or restore never waits on the card. The
+  card visibly arrives 5–60 s after the strip in a scene change. That is the
+  pacing working, not a bug, and the user-facing docs say so.
+- **A restore lands on the same preset.** Tested live on the level-1 payload: a
+  snapshot taken at Warm White restores as `{"state":"ON","effect":"Warm White"}`
+  — effect only, whether over Red or over `OFF` — and sends nothing over a
+  matching Warm White (the known skip). So a snapshot comes back as exactly that
+  preset. At level 2, check whether `color` or `brightness` ride along; within one
+  command `effect` wins (Phase 3), so the result is the same either way. A
+  hand-tuned hex reports `effect: null` and comes back snapped.
+- **Wiring.** The Studio's Off snapshots a fixed list of entities and its On
+  restores that list with `scene.turn_on`: the light joins that list, and Off → On
+  is then one strip leg and one follow. Relax, Bright and Dreams don't restore;
+  they call `light.turn_on` directly, so each names an effect:
+  - Relax is burnt orange (rgb 255,144,55) → effect `Burnt Orange`;
+  - Bright is 4255 K, on the cool side of the 3815 K split → `Cool White`;
+  - Dreams sets the Galaxy to hs 323/100. At level 1 there is no color wheel, and
+    even at level 2 snapping would choose for it, so Dreams names the effect
+    directly. **Starting value `Hot Pink`**, not a fixed choice: its strip value
+    `FF0080` sits at hue ~330 against Cerise's ~315, a hair nearer 323, and
+    `palette.rs` already calls it "intense synthwave/Barbie pink". JD adjusts by
+    eye once it's live.
+- **Test: Off → Relax inside 5 s.** Run `script.studio_off`, then Relax within
+  five seconds. The strip goes off, then Burnt Orange; the card's `off` never
+  runs. The follow collapses to a single card command — Relax's,
+  `burntorange --gpu` — so the card is written once.
+- **The PC asleep.** Tested live with a probe entity: a script step that targets
+  an unavailable MQTT light is skipped — nothing is published — HA logs one
+  warning ("Referenced entities … are missing or not currently available"), and
+  the script continues and returns normally. A sleeping PC doesn't break the
+  Studio scripts. Repeat once with the real light as an acceptance check.
+
 ## Traps
 
 1. **Never forward HA's RGB as hex.** It would look right on the strip and
@@ -642,6 +921,9 @@ second. That suits this light, and the GPU pacing makes faster pointless.
   its own GPU writes; the CLI's 1.5 s floor still governs between callers.
 - TLS, Windows credential storage, a custom HA integration in Python.
 - Two entities, multi-user arbitration, a listener of any kind on the PC.
+- **Matter**, for this house: there is no Matter server, and HomeKit already
+  covers Apple Home. An install that wants it would need a community bridge
+  (Appendix A); nothing in the bridge would change.
 
 ## Open questions, to settle by eye or by test
 
@@ -656,7 +938,7 @@ second. That suits this light, and the GPU pacing makes faster pointless.
 
 ## Appendix A — verified findings
 
-Checked on this machine on 2026-10-30:
+Checked on this machine on 2026-10-29:
 
 - **Discovery writes to the device:** `open_controller` calls `read_config`,
   which sends a request report (`src/main.rs:523`, `request` at `:556`).
@@ -664,8 +946,15 @@ Checked on this machine on 2026-10-30:
   `src/palette.rs:597-604`. **The GPU records after its lock is released:**
   `apply_gpu_colors` (`src/main.rs:456`) returns before `record(true, …)` at
   `src/main.rs:403`. **`turn_on` reads state before opening any device**
-  (`src/main.rs:1269`). **`keeping_lit` writes back a whole-state snapshot**
-  (`src/palette.rs:630`).
+  (`src/main.rs:1269`). **`keeping_lit` writes both snapshotted lit records
+  back over freshly read state** (`src/palette.rs:630`; `update` re-reads, and
+  `keep_lit_from` replaces only `mb_lit` and `gpu_lit`). **`set_solid` commits
+  before it records** (`src/main.rs:589-590`). **Every stash has the same fixed
+  header** (`stash_now`, `src/main.rs`), so identical lighting stashes to
+  identical bytes, and **a `--stash` with a stash present returns without
+  touching it** (`src/main.rs:1161`). **`record` rewrites the state file even
+  when nothing changed** (`update`, `src/palette.rs:604`), which is what makes a
+  revision counter meaningful.
 - **A bare apply clears the stash:** `src/main.rs:160-170`; `on` and `restore`
   are excluded by `is_apply`.
 - **Only the strip's solid path commits flash:** `CTRL_COMMIT` is sent only from
@@ -696,9 +985,13 @@ Checked on this machine on 2026-10-30:
   color mode.
 - **`rumqttc` 0.25.1** (docs.rs source): `Client::publish`, `subscribe` and
   `disconnect` are blocking sends on the bounded request channel; `try_*`
-  variants exist; `Connection::recv_timeout` exists, which is what lets one
-  thread both poll and publish; `handle_incoming_suback` ignores the SUBACK's
-  return codes. Default features can be turned off for a TLS-free build.
+  variants exist; `handle_incoming_suback` ignores the SUBACK's return codes.
+  `Connection::recv_timeout` creates a new `eventloop.poll()` future per call
+  and drops it on timeout, while `EventLoop::poll` assigns `self.network` only
+  after TCP connect and CONNACK both complete — so a short `recv_timeout` aborts
+  any slower handshake. `recv` and `iter` block on the poll with no timeout; the
+  handshake is bounded by `network_options.connection_timeout()`. Default
+  features can be turned off for a TLS-free build.
   *From review, not independently checked:* the event loop reconnects on the next
   poll with no delay of its own. The plan's 1 s wait is harmless either way.
 - **`restore` deletes the stash unconditionally** once its legs land
@@ -707,9 +1000,24 @@ Checked on this machine on 2026-10-30:
   end a killed process's children.
 - **Hue:** HA's Hue docs state one event per second per device and describe
   `hue_event` and device triggers.
-- **Matter:** HA's own Matter integration is a controller only. The original
-  Home Assistant Matter Hub ended maintenance in January 2026 and was archived on
-  2026-03-11; a community fork and Matterbridge's HA plugin remain.
+- **Matter** (out of scope for this house): HA's own Matter integration is a
+  controller only. The original Home Assistant Matter Hub ended maintenance in
+  January 2026 and was archived on 2026-03-11; a community fork and
+  Matterbridge's HA plugin remain.
+- **The broker, from the PC** (2026-10-29, single TCP connects, no MQTT): the
+  Mac mini's own addresses refused both 1884 and 1883; the HA VM's own LAN
+  address, supplied by the broker's owner, accepted 1884.
+- **Live checks by the HA owner** (HA 2026.10.4, Mosquitto 2.0.22, a throwaway
+  probe entity using this plan's level-1 payload, cleaned up afterwards):
+  discovery renders with no warnings — `supported_color_modes` `[onoff]`,
+  `supported_features` 4 (effect), 29 effects, entity named after the device;
+  `"effect": null` clears the attribute and `"state": null` shows as unknown;
+  HA sends `{"state":"OFF"}`, `{"state":"ON"}` and
+  `{"state":"ON","effect":"Cerise"}`; discovery prefix and birth message are the
+  defaults; HA's own client has full access on its own listener; **Mosquitto
+  grants an ACL-denied subscription with SUBACK `0`** and enforces read at
+  delivery; a script step on an unavailable light is skipped with a warning and
+  the script continues; a `scene.create` restore sends effect only.
 
 ## Appendix B — review log
 
@@ -771,3 +1079,70 @@ strip**, replaying the latest strip command, re-observed before it runs.
 | 7 | No reconnect delay | Adopted: 1 s, de-duplicated logging |
 | 8 | `--unpublish` waited for the broker to close | Adopted: client closes after `Outgoing::Disconnect`; one overall deadline |
 | 9 | Race window, 1.5 s gap and plain-`on` repair overstated | Adopted: wording corrected |
+
+**Round 4** — 8 findings, each checked against the code or the pinned
+`rumqttc` source first.
+
+| # | Finding | Disposition |
+|---|---|---|
+| 1 | The always-allowed `off` keyed on the record allows unbounded commits if recording fails; an empty bucket could drop an `OFF` a lit card needs | Adopted: `off` allowance of one per 5 min counted on attempt; a dropped strip leg still creates the follow |
+| 2 | Contents can't identify a stash: identical lighting, identical bytes | Adopted: `stash-id` comment, used by restore checks, conditional delete and follow observations |
+| 3 | `recv_timeout(100 ms)` cancels every handshake slower than 100 ms | Adopted, verified in 0.25.1 source: network thread back on blocking `iter()`; worker publishes state only, non-blocking, while *ready* |
+| 4 | A redundant plain `ON` replaces a colour follow with a no-op `on --gpu` | Adopted: a plain `ON` that changed nothing keeps a still-valid follow; new worked case |
+| 5 | A stale retained `online` survives a refused subscription | Adopted: retained `offline` first on every connection |
+| 6 | `light.toggle` reverses wrongly while the card's `off` is pending | Adopted by changing the projection rather than the automation: while a follow is pending, the strip alone is reported; two-press acceptance check |
+| 7 | Job handle lifetime; `--unpublish` could be ended by its own job | Adopted: non-inheritable handle held for the process lifetime; setup failure exits; `--unpublish` skips the job |
+| 8 | Appendix A overstated `keeping_lit` | Adopted: wording corrected (the body was already right) |
+
+**Round 5** — 3 findings.
+
+| # | Finding | Disposition |
+|---|---|---|
+| 1 | A reused stash keeps its id, so a paused restore can finish over a newer borrow | Adopted: every `--stash` re-stamps the id, keeping the first snapshot's colors |
+| 2 | Value observations miss a write that repeats the same values; invalidation only before spawning delays the honest projection | Adopted: follow observes a `rev` counter (not mtime, for clock granularity) and the stash id, re-checked every tick |
+| 3 | Reconnect and HA birth published a projection of the raw file, undoing the pending-follow rule | Adopted: the worker maintains a latest-state slot; the network thread publishes only from it |
+
+**Round 6** — 3 findings.
+
+| # | Finding | Disposition |
+|---|---|---|
+| 1 | Two publishers of the slot can enqueue an older projection after a newer one | Adopted: one mutex held across choosing the payload and `try_publish`; interleaving test |
+| 2 | A lifecycle `try_*` refused by a full queue is lost, leaving the connection unready | Adopted, verified in 0.25.1: a stage machine that advances only on acceptance and retries on the next event; queue of 32; *ready* only after all startup messages are accepted |
+| 3 | The tick was gated on `rev`, but a stash can change without one | Adopted: every tick checks the stash identity; `rev` only gates recomputing the projection |
+
+**Round 8** — `VERDICT: READY`, with 3 minor findings, all adopted: the shared
+spawn result keeps a successful child's stderr so a skipped record reaches
+`ha.log`; the echo's guarantee is stated as `/echo` plus the expected wildcard
+grant, with *not ready* distinguished from a broker-side `offline` that a revoked
+`write` can't publish; and the echo timeout is handled on the next network
+event, normally within the 30 s keepalive.
+
+**Round 7** — 3 findings.
+
+| # | Finding | Disposition |
+|---|---|---|
+| 1 | Command resolution ignored the pending-follow override, so a command while the card lagged could resolve against the card's stale look | Adopted: while a follow is pending the base is the strip, including its lit record; two worked cases |
+| 2 | The anonymous ACL doesn't isolate one anonymous client from another | Adopted: wording now says anonymous clients share one allowlist; the threat model was already "anyone on the LAN" |
+| 3 | SUBACK doesn't expose a missing read permission on Mosquitto | Already resolved by the live checks (below): the echo, and an acceptance step for HA's commands reaching the strip, now sharpened |
+
+**The house's HA setup** — feedback from the HA owner, 2026-10-29.
+
+| # | Feedback | Disposition |
+|---|---|---|
+| 1 | No add-ons: HA in Docker in a Lima VM, Mosquitto its own container | Adopted: *This install*; "the existing broker" |
+| 2 | Anonymous on the 1884 LAN listener, ACL'd; no secret on the PC | Adopted, with one correction: `readwrite` on `jdrgb/jdrgb_<name>/#`, because the bridge subscribes to its command topic there. `user`/`password` kept optional. Listener address left as a placeholder |
+| 3 | Keep MQTT discovery | Kept; the reason (`--unpublish`) is now stated |
+| 4 | HomeKit Bridge takes an explicit include list | Adopted as a Phase 3 acceptance step |
+| 5 | Matter out of scope for this house | Adopted |
+| 6 | Scenes: true state at once, Off → Relax, asleep, Dreams effect | Adopted as *Scenes*. Off → Relax collapses to one card command, which is `on --gpu` only if Relax sends a plain ON |
+| 7 | Dates were UTC | Fixed to 2026-10-29 |
+
+**Live checks on the house's HA** — by the HA owner, 2026-10-29.
+
+| Result | What changed |
+|---|---|
+| Mosquitto 2.0.22 grants ACL-denied subscriptions (SUBACK `0`) | The SUBACK check no longer claims to catch ACL mistakes; the bridge proves `read`/`write` with an echo before `online`; acceptance adds "an HA command changes the strip" |
+| The 1884 listener is on the HA VM's own LAN address | Confirmed from the PC; kept out of this document |
+| Discovery renders cleanly on 2026.10.4; entity named after the device | Default device name is now the computer's name plus "LEDs", so two PCs can't collide |
+| HA skips calls to an unavailable light; scripts continue | *Exit* and *Scenes* corrected: buffering only inside the ~45 s before the will |
+| A restore sends effect only | *Scenes*: restores are exact; Studio wiring named (Relax, Bright, Dreams) |
