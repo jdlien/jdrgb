@@ -35,7 +35,7 @@ the hardware can do continuous color it has never been calibrated for.
 | Brightness | New `--level N` on `jdrgb.exe`: scale after per-device calibration, record the wire value |
 | Source of truth | The state file. The bridge *recognises* (preset, level) from it |
 | Flash | Strip solid and `off` applies commit, exactly as a tray click does. Strip frames and GPU applies don't; the bridge never runs `--gpu save` |
-| GPU traffic | Each command goes to the strip at once; the card then *follows the strip*, replaying the same command once the light has settled, at most once a minute. Between callers, the CLI's default 1.5 s gap is unchanged |
+| GPU traffic | Each command goes to the strip at once; the card then *follows the strip*, replaying the same command once the light has settled, at most once every 5 s. Between callers, the CLI's default 1.5 s gap is unchanged |
 | Duplicate commands | Reach the CLI, like tray clicks — with one narrow exception for the bridge repeating itself |
 | One entity or two? | One. Presets resolve per device, so one name looks the same on both |
 | Boot task | Mutually exclusive with `-Ha`, enforced whichever is installed first |
@@ -583,13 +583,13 @@ observations no longer match, someone else has acted, and the plain `ON`
 replaces the follow as usual. A plain `ON` that turned the strip back on always
 replaces it.
 
-The follow runs once the light has been quiet for 5 s and the bridge's previous
-GPU leg was at least 60 s ago (pacing, below). The worker re-checks both
+The follow runs once the light has been quiet for 1 s and the bridge's previous
+GPU leg was at least 5 s ago (pacing, below). The worker re-checks both
 observations **on every tick**, not just before spawning, and once more
 immediately before spawning. **Any difference means someone else acted since** —
 a tray click, a terminal, a UPS hook — so the follow is dropped at once, logged,
-and the ordinary projection published at once (*State out*), rather than a
-minute later when pacing would have let it run. Because the observations are
+and the ordinary projection published at once (*State out*), rather than
+whenever pacing would have let it run. Because the observations are
 taken *after* the strip leg's child, the strip leg's own write and any stash it
 cleared don't count as differences.
 
@@ -625,10 +625,10 @@ signature reads included, which happen before `space_out_writes` paces anything.
 - **One child at a time**, one pending intent, one follow.
 - **The strip leg goes at once.** It costs USB HID writes and, for a solid or
   `off`, one flash commit — a tray click's worth.
-- **The follow waits** until the light has been quiet for 5 s *and* the bridge's
-  own previous GPU leg was at least 60 s ago. As a courtesy it also waits while
+- **The follow waits** until the light has been quiet for 1 s *and* the bridge's
+  own previous GPU leg was at least 5 s ago. As a courtesy it also waits while
   the CLI's machine-wide marker (`%ProgramData%\jdrgb\gpu-last-write`,
-  `src/gpu.rs:211`) shows a GPU write by anyone in the last 60 s; a missing or
+  `src/gpu.rs:211`) shows a GPU write by anyone in the last 5 s; a missing or
   malformed marker is ignored. That courtesy is best-effort: another caller can
   write between the check and the child taking the bus. Between callers the
   floor is the CLI's own gap — 1500 ms by default, itself best-effort (skipped
@@ -650,7 +650,7 @@ signature reads included, which happen before `space_out_writes` paces anything.
     succeeds, and an exemption keyed on "strip not recorded off" would then let
     every repeated `OFF` commit flash;
   - the **follow is still created**, with its observations taken at the moment
-    the strip leg was dropped. The card has its own pacing, at most once a minute, so
+    the strip leg was dropped. The card has its own pacing, at most once every 5 s, so
     an `OFF` reaches a lit card even when the strip's bucket is empty or the strip
     was already off.
 
@@ -865,7 +865,7 @@ worth pinning down:
 - **A scene sees the true requested state at once.** The strip changes within
   about a second, and while a follow is pending the bridge reports the strip
   (Phase 3, *State out*), so a snapshot or restore never waits on the card. The
-  card visibly arrives 5–60 s after the strip in a scene change. That is the
+  card visibly arrives 1–5 s after the strip in a scene change. That is the
   pacing working, not a bug, and the user-facing docs say so.
 - **A restore lands on the same preset.** Tested live on the level-1 payload: a
   snapshot taken at Warm White restores as `{"state":"ON","effect":"Warm White"}`
@@ -878,18 +878,20 @@ worth pinning down:
   restores that list with `scene.turn_on`: the light joins that list, and Off → On
   is then one strip leg and one follow. Relax, Bright and Dreams don't restore;
   they call `light.turn_on` directly, so each names an effect:
-  - Relax is burnt orange (rgb 255,144,55) → effect `Burnt Orange`;
+  - Relax is burnt orange (rgb 255,144,55) → effect `Orange`. It started as
+    `Burnt Orange`, which read far too red next to the Relax lamps once live;
   - Bright is 4255 K, on the cool side of the 3815 K split → `Cool White`;
   - Dreams sets the Galaxy to hs 323/100. At level 1 there is no color wheel, and
     even at level 2 snapping would choose for it, so Dreams names the effect
     directly. **Starting value `Hot Pink`**, not a fixed choice: its strip value
     `FF0080` sits at hue ~330 against Cerise's ~315, a hair nearer 323, and
     `palette.rs` already calls it "intense synthwave/Barbie pink". JD adjusts by
-    eye once it's live.
-- **Test: Off → Relax inside 5 s.** Run `script.studio_off`, then Relax within
-  five seconds. The strip goes off, then Burnt Orange; the card's `off` never
-  runs. The follow collapses to a single card command — Relax's,
-  `burntorange --gpu` — so the card is written once.
+    eye once it's live. *Once live it became `Violet`: between indigo and
+    magenta was the look wanted.*
+- **Test: Off → Relax.** Run `script.studio_off`, then Relax. Inside the 1 s
+  quiet window the strip goes off, then Orange, and the card's `off` never runs:
+  the follow collapses to a single card command, Relax's `orange --gpu`. Slower
+  than that, the card goes off and then to Orange at least 5 s later.
 - **The PC asleep.** Tested live with a probe entity: a script step that targets
   an unavailable MQTT light is skipped — nothing is published — HA logs one
   warning ("Referenced entities … are missing or not currently available"), and
@@ -900,8 +902,8 @@ worth pinning down:
 
 1. **Never forward HA's RGB as hex.** It would look right on the strip and
    wrong on the card.
-2. **The card lags, on purpose.** At least five seconds behind the strip, and up
-   to a minute after recent GPU activity. That is the display-safety rule.
+2. **The card lags, on purpose.** About a second behind the strip, and up to
+   5 s after recent GPU activity. That is the display-safety rule.
 3. **A busy bus fails after 10 s.** `BusLock::acquire` waits `LOCK_TIMEOUT_MS`
    (`src/gpu.rs:197`) and fails as transient. During a `tune` or `preview`
    session the bridge's GPU legs fail; they retire and the truth is published.
@@ -952,7 +954,11 @@ worth pinning down:
    perceptual waits on the slider in use.*
 2. **The bridge's 60 s GPU interval and 5 s settle.** Guesses between "seconds
    apart glitched" and "minutes apart didn't", like the CLI's own 1500 ms. Lower
-   them only on evidence.
+   them only on evidence. *Lowered to 5 s and 1 s on the real install. The card
+   trailing a scene change by up to a minute was unacceptable in use. The glitch
+   that set the 60 s was two writes about a second apart, before each write's I2C
+   traffic was more than halved, and nine CLI card writes 15–20 s apart on the
+   day showed nothing. Raise it again if the monitor flickers on a change.*
 3. **The HomeKit wheel with a snapped echo.** Verify Apple Home settles on the
    reported color rather than fighting it. If it fights, `mode=presets` in
    `ha.conf` (below) is the fallback.

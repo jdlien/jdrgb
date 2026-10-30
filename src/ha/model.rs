@@ -21,8 +21,12 @@ pub struct Timing {
     /// How long the light must be quiet before the card follows the strip.
     pub quiet: Ms,
     /// The least time between the bridge's own GPU legs — and, as a courtesy,
-    /// since anyone's GPU write. Writes *seconds* apart have glitched the
-    /// display; writes minutes apart have not (docs/ups-wedge-incident.md).
+    /// since anyone's GPU write. Two writes about a second apart once glitched
+    /// the display (docs/ups-wedge-incident.md), before each write's I2C traffic
+    /// was cut by more than half; the CLI's own floor between callers is 1.5 s.
+    /// This was 60 s, a guess that made the card trail a scene change by up to
+    /// a minute in live use. 5 s keeps a margin over the CLI's floor; raise it
+    /// if the monitor ever flickers on a change.
     pub gpu_interval: Ms,
     /// A strip leg identical to the previous one is skipped within this window.
     pub repeat_window: Ms,
@@ -36,8 +40,8 @@ impl Default for Timing {
     fn default() -> Timing {
         Timing {
             settle: 250,
-            quiet: 5_000,
-            gpu_interval: 60_000,
+            quiet: 1_000,
+            gpu_interval: 5_000,
             repeat_window: 10_000,
             refill: 60_000,
             off_allowance: 5 * 60_000,
@@ -982,8 +986,8 @@ mod tests {
         assert_eq!(run(&mut m, &mut obs, 30), vec![Leg::Strip(Cmd::Preset { name: "green", level: 40 })]);
     }
 
-    /// Off → a scene within 5 s: one card command, Relax's, and the card's
-    /// `off` never runs.
+    /// Off → a scene before the light is quiet: one card command, the scene's,
+    /// and the card's `off` never runs.
     #[test]
     fn off_then_a_scene_collapses_the_card_to_one_command() {
         let mut m = Model::new(fast(), 0);

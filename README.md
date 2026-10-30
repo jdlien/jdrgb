@@ -750,11 +750,12 @@ go.
 ### The card follows the strip
 
 Every command goes to the strip at once. The card replays the same command once
-the light has been quiet for 5 seconds, and the bridge never writes the card
-more than once a minute — two GPU writes seconds apart once glitched the
-display. So the dimmer's off turns the strip off at once and the card a few
-seconds later, and twenty presses of brightness-up step the strip twenty times
-and the card once. While the card is catching up, HA is shown the strip's state.
+the light has been quiet for a second, and the bridge never writes the card
+more than once every 5 seconds, because two GPU writes about a second apart
+once glitched the display. So the dimmer's off turns the strip off at once and
+the card a second later. A run of quick changes steps the strip every time and
+the card at most every 5 seconds, always ending on the last one. While the card
+is catching up, HA is shown the strip's state.
 
 Nothing ever overrides a later decision: if the tray, a terminal or a UPS hook
 changes the lights in between, the card's pending follow is dropped and HA is
