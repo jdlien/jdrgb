@@ -79,14 +79,14 @@ if ($installed) {
             # refresh. CloseMainWindow() is no use here — the tray's window is
             # never shown, so it has no MainWindowHandle to close.
             & taskkill.exe /PID $_.Id 2>&1 | Out-Null
-            if (-not $_.WaitForExit(3000)) { $_.Kill() }
+            if (-not $_.WaitForExit(3000)) { try { $_.Kill() } catch {} }
             Write-Host "Stopped the running tray."
         }
     # Ending the bridge ends its children too — it runs them in a kill-on-close
     # job — but wait for them to be gone rather than assume it.
     Get-Process -Name "jdrgb-ha" -ErrorAction SilentlyContinue |
         Where-Object { $_.Path -eq $haExe } |
-        ForEach-Object { $_.Kill(); Write-Host "Stopped the running bridge." }
+        ForEach-Object { try { $_.Kill() } catch {}; Write-Host "Stopped the running bridge." }
 
     # Gone means gone: nothing from here still running — the tray's or the boot
     # task's jdrgb.exe included — and the bridge's singleton no longer held; it

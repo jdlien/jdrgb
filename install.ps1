@@ -258,7 +258,7 @@ try {
     }
     Get-Process -Name "jdrgb-ha" -ErrorAction SilentlyContinue |
         Where-Object { $_.Path -eq $haTarget } |
-        ForEach-Object { $_.Kill(); $script:bridgeStopped = $true }
+        ForEach-Object { try { $_.Kill() } catch {}; $script:bridgeStopped = $true }  # it may exit on its own first
     Wait-Until "the bridge to exit" {
         -not (Get-Process -Name "jdrgb-ha" -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $haTarget })
     }
@@ -271,7 +271,7 @@ try {
         Where-Object { $_.Path -eq $trayTarget } |
         ForEach-Object {
             & taskkill.exe /PID $_.Id 2>&1 | Out-Null
-            if (-not $_.WaitForExit(3000)) { $_.Kill() }
+            if (-not $_.WaitForExit(3000)) { try { $_.Kill() } catch {} }
             $script:trayStopped = $true
         }
     Wait-Until "the tray to exit" {
