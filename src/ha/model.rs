@@ -30,7 +30,10 @@ pub struct Timing {
     pub gpu_interval: Ms,
     /// A strip leg identical to the previous one is skipped within this window.
     pub repeat_window: Ms,
-    /// The runaway guard refills one token per this long.
+    /// The runaway guard refills one token per this long. 15 s is four a
+    /// minute: about what a person kept up over ten minutes of tapping
+    /// swatches in live use, so sustained play holds the bucket level. It
+    /// was 60 s, which that play drained in eleven minutes.
     pub refill: Ms,
     /// With the guard empty, one `off` still gets through per this long.
     pub off_allowance: Ms,
@@ -43,14 +46,16 @@ impl Default for Timing {
             quiet: 1_000,
             gpu_interval: 5_000,
             repeat_window: 10_000,
-            refill: 60_000,
+            refill: 15_000,
             off_allowance: 5 * 60_000,
         }
     }
 }
 
-/// The runaway guard's capacity, in strip legs.
-pub const BUCKET_CAPACITY: u32 = 30;
+/// The runaway guard's capacity, in strip legs: room for bursts of a dozen a
+/// minute on top of the refill. It was 30, which ten minutes of playing with
+/// the color wheel and swatches emptied.
+pub const BUCKET_CAPACITY: u32 = 120;
 
 // ---------------------------------------------------------------------------
 // Commands in
@@ -547,7 +552,13 @@ impl Model {
             if off_allowed {
                 self.last_off_allowance = Some(now);
             } else {
-                self.set_follow(cmd, obs);
+                // Only an `off` still reaches the card. A dropped color sent
+                // on alone splits the light — in live use that looked like a
+                // wedged strip — so the card stays with the strip, and any
+                // follow already pending stands.
+                if cmd == Cmd::Off {
+                    self.set_follow(cmd, obs);
+                }
                 return Step::Note(format!(
                     "runaway guard: dropped `jdrgb {}` — more than {BUCKET_CAPACITY} strip changes in too short a time",
                     args.join(" ")
@@ -1100,24 +1111,65 @@ mod tests {
         assert_eq!(run(&mut m, &mut obs, 30), vec![], "black at 50% is the same bytes as black");
     }
 
-    #[test]
-    fn the_guard_drops_strip_legs_but_still_lets_off_through_and_the_card_follow() {
-        let mut m = Model::new(fast(), 0);
-        let mut obs = both("blue", 100);
+    /// `fast()`, with a refill slow enough that nothing comes back while
+    /// `drain` runs.
+    fn guarded() -> Timing {
+        Timing { refill: 60_000, ..fast() }
+    }
+
+    /// Empty the guard with strip legs 20 ms apart, alternating so none is a
+    /// repeat. Ends with Green on the strip and its follow pending; returns the
+    /// time after the last.
+    fn drain(m: &mut Model, obs: &mut Observed) -> Ms {
         let names = ["red", "green"];
         for i in 0..BUCKET_CAPACITY as u64 {
-            m.on_message(&effect(names[(i % 2) as usize]), i);
-            assert_eq!(run(&mut m, &mut obs, i + 10).len(), 1, "leg {i} within capacity");
+            m.on_message(&effect(names[(i % 2) as usize]), 20 * i);
+            assert_eq!(run(m, obs, 20 * i + 10).len(), 1, "leg {i} within capacity");
         }
-        m.on_message(&effect("amber"), 100);
-        assert_eq!(run(&mut m, &mut obs, 110), vec![], "the 31st strip leg is dropped");
-        assert_eq!(m.follow().unwrap().cmd, Cmd::Preset { name: "amber", level: 100 }, "but the card still follows");
+        20 * BUCKET_CAPACITY as u64
+    }
 
-        m.on_message(&off(), 120);
-        assert_eq!(run(&mut m, &mut obs, 130), vec![Leg::Strip(Cmd::Off)], "an off always gets through once");
-        m.on_message(&on(None, None), 140);
-        run(&mut m, &mut obs, 150);
-        m.on_message(&off(), 160);
-        assert_eq!(run(&mut m, &mut obs, 170), vec![], "but only once per allowance");
+    #[test]
+    fn the_guard_drops_strip_legs_but_still_lets_off_through_to_both() {
+        let mut m = Model::new(guarded(), 0);
+        let mut obs = both("blue", 100);
+        let t = drain(&mut m, &mut obs);
+        m.on_message(&effect("amber"), t + 10);
+        assert_eq!(run(&mut m, &mut obs, t + 20), vec![], "one more strip leg is dropped");
+        assert_eq!(
+            m.follow().unwrap().cmd,
+            Cmd::Preset { name: "green", level: 100 },
+            "the card keeps following the strip, not the dropped color"
+        );
+
+        m.on_message(&off(), t + 30);
+        assert_eq!(run(&mut m, &mut obs, t + 40), vec![Leg::Strip(Cmd::Off)], "an off always gets through once");
+        m.on_message(&on(None, None), t + 50);
+        assert_eq!(run(&mut m, &mut obs, t + 60), vec![], "a plain ON is dropped like a color");
+        assert_eq!(m.follow().unwrap().cmd, Cmd::Off, "so the card still follows the strip off");
+        // Past the repeat window, so it's the allowance that stops this one.
+        m.on_message(&off(), t + 150);
+        assert_eq!(run(&mut m, &mut obs, t + 160), vec![], "a second off is past the allowance");
+        assert_eq!(m.follow().unwrap().cmd, Cmd::Off, "but still reaches the card");
+    }
+
+    /// In live use a dropped color still went to the card, so the card changed
+    /// and the strip didn't, which read as a wedged strip. A dropped color now
+    /// leaves the whole light as it was.
+    #[test]
+    fn a_dropped_color_leaves_the_card_with_the_strip() {
+        let mut m = Model::new(guarded(), 0);
+        let mut obs = both("blue", 100);
+        let t = drain(&mut m, &mut obs);
+        assert_eq!(
+            run(&mut m, &mut obs, t + 300),
+            vec![Leg::Gpu(Cmd::Preset { name: "green", level: 100 })],
+            "the card catches up with the strip"
+        );
+        m.on_message(&effect("amber"), t + 310);
+        assert_eq!(run(&mut m, &mut obs, t + 320), vec![], "amber is dropped");
+        assert!(m.follow().is_none(), "and nothing is queued for the card");
+        assert_eq!(run(&mut m, &mut obs, t + 900), vec![], "not even once the light is quiet");
+        assert_eq!(obs.state.gpu, Some(color("green", true, 100)));
     }
 }

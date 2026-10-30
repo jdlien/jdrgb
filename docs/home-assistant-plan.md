@@ -641,22 +641,35 @@ signature reads included, which happen before `space_out_writes` paces anything.
   reaches the CLI, like a tray click: a record matching a command is not proof
   the hardware does (trap 4), and the same color picked during a UPS borrow must
   make it the new normal, as from the tray.
-- **A runaway guard on the strip.** A token bucket of 30 strip legs, refilling
-  one a minute, counted on *attempt*, whatever the outcome. An empty bucket drops
-  the strip leg, logs it and publishes the truth. Two things still happen:
+- **A runaway guard on the strip.** A token bucket of 120 strip legs, refilling
+  one every 15 s, counted on *attempt*, whatever the outcome. An empty bucket
+  drops the strip leg, logs it and publishes the truth. For an `OFF`, two things
+  still happen:
   - an `off` strip leg gets through at most once every 5 minutes, so the light
     can always be turned off. That allowance counts attempts too, never records:
     a record can fail to land (1b keeps recording best-effort) while the write
     succeeds, and an exemption keyed on "strip not recorded off" would then let
     every repeated `OFF` commit flash;
-  - the **follow is still created**, with its observations taken at the moment
-    the strip leg was dropped. The card has its own pacing, at most once every 5 s, so
-    an `OFF` reaches a lit card even when the strip's bucket is empty or the strip
-    was already off.
+  - a dropped `off` still **creates the follow**, with its observations taken at
+    the moment the strip leg was dropped. The card has its own pacing, at most
+    once every 5 s, so an `OFF` reaches a lit card even when the strip's bucket
+    is empty or the strip was already off.
+
+  Any other dropped leg leaves the card alone too, and a follow already pending
+  stands, so the light changes as a whole or not at all.
 
   The bucket lives in memory and starts full on every launch. It guards against
   a looping automation; it is not a wear budget, since the controller's flash
   endurance is unknown.
+
+  *Changed after live use (2026-10-30):* the guard was first 30 legs refilling
+  one a minute, and a dropped leg of any kind still created the follow. Ten
+  minutes of tapping swatches and dragging the wheel (over 40 strip legs, up
+  to 14 in one minute) emptied it. After that the strip took one change a
+  minute while the card took every one, which looked exactly like a wedged
+  strip. The refill is now about the rate that play kept up, and the capacity
+  covers its bursts several times over. A looping automation is still held to
+  four strip commits a minute.
 
 In practice: the dimmer's off button turns the strip off at once and the card
 off five seconds later. Twenty presses of brightness-up step the strip twenty

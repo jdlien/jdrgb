@@ -762,8 +762,10 @@ is catching up, HA is shown the strip's state.
 
 Nothing ever overrides a later decision: if the tray, a terminal or a UPS hook
 changes the lights in between, the card's pending follow is dropped and HA is
-shown what is really there. A runaway automation is capped at 30 strip changes,
-refilling one a minute; an `off` still gets through once every 5 minutes.
+shown what is really there. A runaway automation is capped at 120 strip changes,
+refilling one every 15 seconds. Past that a change is dropped for the whole
+light, card included, and logged; an `off` still gets through once every 5
+minutes.
 
 ### The Hue dimmer
 
