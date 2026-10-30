@@ -23,12 +23,17 @@ if (-not $admin) {
     return
 }
 
-# --- The Home Assistant bridge goes first, and in order ----------------------
-# 1. Stop it, and wait until neither it nor any jdrgb.exe it started is running:
-#    a cleanup racing a resident would have the resident republish the entity.
-# 2. Delete the light from HA with `jdrgb-ha.exe --unpublish`, using the config
-#    of the user the bridge ran as.
-# 3. Only then remove its task and binary, below.
+# --- Stop everything first, and confirm it stopped ---------------------------
+# Every caller of jdrgb.exe — the boot task, the tray, the bridge — is disabled
+# and stopped before anything is removed. Otherwise a tray click or a boot-task
+# trigger mid-uninstall could start a jdrgb.exe that then blocks deleting it,
+# after the tasks were already gone — a half-uninstalled machine. Then, in order:
+#   1. wait until nothing from the install directory runs, and the bridge's
+#      singleton is free — a cleanup racing a live bridge would have it
+#      republish the entity;
+#   2. delete the light from HA with `jdrgb-ha.exe --unpublish`, using the config
+#      of the user the bridge ran as;
+#   3. only then remove the tasks and binaries.
 $haTask = Get-ScheduledTask -TaskName $HaTaskName -ErrorAction SilentlyContinue
 $haConf = $null
 if ($haTask) {
@@ -41,41 +46,72 @@ if ($haTask) {
     }
     $profileDir = (Get-CimInstance Win32_UserProfile -Filter "SID='$sid'" -ErrorAction SilentlyContinue).LocalPath
     if ($profileDir) { $haConf = Join-Path $profileDir "AppData\Local\jdrgb\ha.conf" }
-
-    Disable-ScheduledTask -TaskName $HaTaskName -ErrorAction SilentlyContinue | Out-Null
-    Stop-ScheduledTask -TaskName $HaTaskName -ErrorAction SilentlyContinue
 }
 
-$haExe = $null
-try { $haExe = Join-Path (Resolve-Path -LiteralPath $InstallDir -ErrorAction Stop).ProviderPath "jdrgb-ha.exe" } catch {}
-if ($haExe) {
-    $cliExe = Join-Path (Split-Path $haExe) "jdrgb.exe"
+$disabled = @()
+foreach ($name in @($TaskName, $TrayTaskName, $HaTaskName)) {
+    $t = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+    if (-not $t) { continue }
+    if ($t.State -ne "Disabled") {
+        Disable-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue | Out-Null
+        $disabled += $name
+    }
+    if ((Get-ScheduledTask -TaskName $name).State -eq "Running") {
+        Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+    }
+}
+
+$installed = $null
+try { $installed = (Resolve-Path -LiteralPath $InstallDir -ErrorAction Stop).ProviderPath } catch {}
+$haExe = if ($installed) { Join-Path $installed "jdrgb-ha.exe" } else { $null }
+if ($installed) {
+    $cliExe = Join-Path $installed "jdrgb.exe"
+    $trayExe = Join-Path $installed "jdrgb-tray.exe"
+    # A running tray holds its own image open, and can start jdrgb.exe on a
+    # click. Matched by full path, not by name: `Stop-Process -Name jdrgb-tray`
+    # would also kill a copy someone is running from a build directory.
+    Get-Process -Name "jdrgb-tray" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -eq $trayExe } |
+        ForEach-Object {
+            # taskkill without /F posts WM_CLOSE, which the tray answers by
+            # removing its icon and then exiting. Kill() outright would leave a
+            # ghost icon in the notification area until something forced a
+            # refresh. CloseMainWindow() is no use here — the tray's window is
+            # never shown, so it has no MainWindowHandle to close.
+            & taskkill.exe /PID $_.Id 2>&1 | Out-Null
+            if (-not $_.WaitForExit(3000)) { $_.Kill() }
+            Write-Host "Stopped the running tray."
+        }
     # Ending the bridge ends its children too — it runs them in a kill-on-close
-    # job — but wait for both to be gone rather than assume it.
+    # job — but wait for them to be gone rather than assume it.
     Get-Process -Name "jdrgb-ha" -ErrorAction SilentlyContinue |
         Where-Object { $_.Path -eq $haExe } |
         ForEach-Object { $_.Kill(); Write-Host "Stopped the running bridge." }
-    # Gone means gone: no bridge or jdrgb.exe from here still running, and the
-    # bridge's singleton no longer held — it outlives the process only while
-    # some other bridge, perhaps under another account, still has it. Carrying
-    # on otherwise would race a cleanup against a live bridge that republishes
-    # what it deletes, and delete binaries out from under running processes.
+
+    # Gone means gone: nothing from here still running — the tray's or the boot
+    # task's jdrgb.exe included — and the bridge's singleton no longer held; it
+    # outlives the process only while some other bridge, perhaps under another
+    # account, still has it. On a timeout nothing is removed, and the tasks this
+    # disabled are enabled again, so the machine is left as it was found.
     $deadline = (Get-Date).AddSeconds(30)
     $held = $null
     while ($true) {
-        $running = @(Get-Process -Name "jdrgb-ha", "jdrgb" -ErrorAction SilentlyContinue |
-                         Where-Object { $_.Path -eq $haExe -or $_.Path -eq $cliExe })
+        $running = @(Get-Process -Name "jdrgb-ha", "jdrgb", "jdrgb-tray" -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Path -eq $haExe -or $_.Path -eq $cliExe -or $_.Path -eq $trayExe })
         $singleton = [System.Threading.Mutex]::TryOpenExisting("Global\jdrgb-ha", [ref]$held)
         if ($held) { $held.Dispose(); $held = $null }
         if ($running.Count -eq 0 -and -not $singleton) { break }
         if ((Get-Date) -ge $deadline) {
+            foreach ($name in $disabled) { Enable-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue | Out-Null }
             $what = if ($running.Count) { "$($running.Count) jdrgb process(es) still running" } else { "another jdrgb-ha still holding Global\jdrgb-ha" }
-            Write-Host "UNINSTALL STOPPED: $what after 30s. Nothing was removed; stop it and run this again." -ForegroundColor Red
+            Write-Host "UNINSTALL STOPPED: $what after 30s. Nothing was removed and the tasks were re-enabled; stop it and run this again." -ForegroundColor Red
             exit 1
         }
         Start-Sleep -Milliseconds 250
     }
+}
 
+if ($haExe) {
     if ((Test-Path -LiteralPath $haExe) -and $haConf -and (Test-Path -LiteralPath $haConf)) {
         Write-Host "Removing the light from Home Assistant..."
         $errFile = [IO.Path]::GetTempFileName()
@@ -126,23 +162,8 @@ elseif (-not (Test-Path -LiteralPath (Join-Path $resolved "jdrgb.exe"))) {
     Write-Warning "If this really is the install directory, remove it by hand."
 }
 else {
-    # A running tray holds its own image open, so it has to go before the file
-    # can. Matched by full path, not by name: `Stop-Process -Name jdrgb-tray`
-    # would also kill a copy someone is running from a build directory.
-    $trayExe = Join-Path $resolved "jdrgb-tray.exe"
-    Get-Process -Name "jdrgb-tray" -ErrorAction SilentlyContinue |
-        Where-Object { $_.Path -eq $trayExe } |
-        ForEach-Object {
-            # taskkill without /F posts WM_CLOSE, which the tray answers by
-            # removing its icon and then exiting. Kill() outright would leave a
-            # ghost icon in the notification area until something forced a
-            # refresh. CloseMainWindow() is no use here — the tray's window is
-            # never shown, so it has no MainWindowHandle to close.
-            & taskkill.exe /PID $_.Id 2>&1 | Out-Null
-            if (-not $_.WaitForExit(3000)) { $_.Kill() }
-            Write-Host "Stopped the running tray."
-        }
-
+    # Everything that could hold these files open was stopped, and confirmed
+    # stopped, at the top.
     foreach ($name in $Artifacts) {
         $file = Join-Path $resolved $name
         if (Test-Path -LiteralPath $file) {

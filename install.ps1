@@ -262,6 +262,21 @@ try {
     Wait-Until "the bridge to exit" {
         -not (Get-Process -Name "jdrgb-ha" -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $haTarget })
     }
+    # The tray too, whatever this run installs: a click mid-upgrade would start
+    # a jdrgb.exe between the check below and the copy. taskkill without /F
+    # posts WM_CLOSE, which the tray answers by removing its icon before exiting.
+    # Matched on the full path so a development copy is left alone.
+    $script:trayStopped = $false
+    Get-Process -Name "jdrgb-tray" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -eq $trayTarget } |
+        ForEach-Object {
+            & taskkill.exe /PID $_.Id 2>&1 | Out-Null
+            if (-not $_.WaitForExit(3000)) { $_.Kill() }
+            $script:trayStopped = $true
+        }
+    Wait-Until "the tray to exit" {
+        -not (Get-Process -Name "jdrgb-tray" -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $trayTarget })
+    }
     Wait-Until "every jdrgb.exe from $InstallDir to exit" {
         -not (Get-Process -Name "jdrgb" -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $target })
     }
@@ -270,16 +285,7 @@ try {
     Write-Host "Installed binary: $target"
 
     if ($Tray) {
-        # A running tray holds a lock on its own image, so an upgrade has to
-        # stop it first. Matched on the full path so a development copy running
-        # from target\release is left alone. taskkill without /F posts WM_CLOSE,
-        # which the tray answers by removing its icon before exiting.
-        Get-Process -Name "jdrgb-tray" -ErrorAction SilentlyContinue |
-            Where-Object { $_.Path -eq $trayTarget } |
-            ForEach-Object {
-                & taskkill.exe /PID $_.Id 2>&1 | Out-Null
-                if (-not $_.WaitForExit(3000)) { $_.Kill() }
-            }
+        # A running tray holds a lock on its own image; it was stopped above.
         Copy-Item -Path $traySource -Destination $trayTarget -Force
         Write-Host "Installed binary: $trayTarget"
     }
@@ -463,6 +469,11 @@ try {
         Start-ScheduledTask -TaskName $HaTaskName
         Write-Host "Restarted the Home Assistant bridge."
     }
+    # And the tray, if it was running and this run didn't reinstall it.
+    if ($script:trayStopped -and -not $Tray -and (Get-ScheduledTask -TaskName $TrayTaskName -ErrorAction SilentlyContinue)) {
+        Start-ScheduledTask -TaskName $TrayTaskName
+        Write-Host "Restarted the tray."
+    }
 
     if (-not $Boot) {
         $parts = @()
@@ -510,6 +521,10 @@ catch {
     if ($script:bridgeStopped -and (Get-ScheduledTask -TaskName $HaTaskName -ErrorAction SilentlyContinue)) {
         Start-ScheduledTask -TaskName $HaTaskName -ErrorAction SilentlyContinue
         Write-Host "Restarted the Home Assistant bridge."
+    }
+    if ($script:trayStopped -and (Get-ScheduledTask -TaskName $TrayTaskName -ErrorAction SilentlyContinue)) {
+        Start-ScheduledTask -TaskName $TrayTaskName -ErrorAction SilentlyContinue
+        Write-Host "Restarted the tray."
     }
 }
 finally {

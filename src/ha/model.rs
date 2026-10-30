@@ -365,9 +365,14 @@ pub enum Step {
     Idle,
 }
 
+/// The bridge's last strip leg that *succeeded*. A failed one leaves none: it
+/// may have changed the lights live without recording anything, so nothing
+/// about the record can be trusted to say what is showing.
 struct StripDone {
     at: Ms,
     rev_after: u64,
+    /// What that leg's command put on the record.
+    wrote: Last,
 }
 
 /// What the strip's record would say after `cmd` landed, for the repeat filter.
@@ -513,10 +518,19 @@ impl Model {
         // window, and no stash. Comparing against the *record* rather than
         // the last command is what lets a retry after a failed apply through:
         // that apply recorded nothing, so the record still shows the old color.
+        //
+        // And it must repeat the bridge's previous *successful* leg. Matching
+        // the record alone isn't enough: a Red that failed part-way can have
+        // changed the lights live without recording, so the record still says
+        // Blue — and a Blue sent to undo it would look like a repeat.
         let repeat = obs.stash.is_none()
-            && expected_strip(&cmd).is_some_and(|want| obs.state.mb == Some(want))
-            && self.last_strip.as_ref().is_some_and(|l| {
-                now.saturating_sub(l.at) < self.timing.repeat_window && obs.state.rev == l.rev_after
+            && expected_strip(&cmd).is_some_and(|want| {
+                obs.state.mb == Some(want)
+                    && self.last_strip.as_ref().is_some_and(|l| {
+                        l.wrote == want
+                            && now.saturating_sub(l.at) < self.timing.repeat_window
+                            && obs.state.rev == l.rev_after
+                    })
             });
         if repeat {
             self.set_follow(cmd, obs);
@@ -561,12 +575,15 @@ impl Model {
         Step::Run(leg)
     }
 
-    /// A leg's child exited — success or not; each is attempted once. `obs`
-    /// is what was on disk afterwards.
-    pub fn on_done(&mut self, obs: &Observed, now: Ms) {
+    /// A leg's child exited, `ok` or not; each is attempted once. `obs` is what
+    /// was on disk afterwards.
+    pub fn on_done(&mut self, obs: &Observed, now: Ms, ok: bool) {
         match self.running.take() {
             Some(Leg::Strip(cmd)) => {
-                self.last_strip = Some(StripDone { at: now, rev_after: obs.state.rev });
+                self.last_strip = match expected_strip(&cmd) {
+                    Some(wrote) if ok => Some(StripDone { at: now, rev_after: obs.state.rev, wrote }),
+                    _ => None,
+                };
                 self.last_activity = Some(now);
                 // Observed *after* the strip leg, so its own write — and a
                 // stash it cleared — don't count as someone else acting.
@@ -642,7 +659,7 @@ mod tests {
             match m.next(obs, now) {
                 Step::Run(leg) => {
                     apply(&mut obs.state, &leg);
-                    m.on_done(obs, now);
+                    m.on_done(obs, now, true);
                     legs.push(leg);
                 }
                 Step::Note(_) => {}
@@ -1044,9 +1061,27 @@ mod tests {
         let mut obs = both("blue", 100);
         m.on_message(&effect("red"), 0);
         assert_eq!(m.next(&obs, 10), Step::Run(Leg::Strip(Cmd::Preset { name: "red", level: 100 })));
-        m.on_done(&obs, 10); // the child failed: nothing recorded, rev unchanged
+        m.on_done(&obs, 10, false); // the child failed: nothing recorded, rev unchanged
         m.on_message(&effect("red"), 20);
         assert_eq!(run(&mut m, &mut obs, 30), vec![Leg::Strip(Cmd::Preset { name: "red", level: 100 })]);
+    }
+
+    /// A Red that failed part-way — the color changed live, the commit or the
+    /// record didn't land — leaves the record saying Blue. A Blue sent to undo
+    /// it matches the record but is no repeat of anything the bridge did: it
+    /// must reach the strip.
+    #[test]
+    fn a_correction_after_a_partial_failure_is_not_a_repeat() {
+        let mut m = Model::new(fast(), 0);
+        let mut obs = both("blue", 100);
+        // A successful Blue first, so a "previous leg" exists to be confused with.
+        m.on_message(&effect("blue"), 0);
+        run(&mut m, &mut obs, 10);
+        m.on_message(&effect("red"), 20);
+        assert_eq!(m.next(&obs, 30), Step::Run(Leg::Strip(Cmd::Preset { name: "red", level: 100 })));
+        m.on_done(&obs, 30, false); // failed; the record still says Blue
+        m.on_message(&effect("blue"), 40);
+        assert_eq!(run(&mut m, &mut obs, 50), vec![Leg::Strip(Cmd::Preset { name: "blue", level: 100 })]);
     }
 
     /// The plan's rule is the wire value: `black` at 50% and `black` at full are

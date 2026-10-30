@@ -84,7 +84,7 @@ impl<R: Runner, O: Observer> Worker<R, O> {
                         self.log.line(&format!("  warning: {}", out.stderr));
                     }
                     obs = self.observer.observe();
-                    self.model.on_done(&obs, now_ms());
+                    self.model.on_done(&obs, now_ms(), out.ok);
                     self.publish_state(&obs);
                 }
                 Step::Note(note) => {
