@@ -427,9 +427,11 @@ carry it through unchanged.
 It is a plain multiplier, which keeps a color's ratios until the 8-bit channels
 run out of room: `coolwhite` at 2% is `(5,4,4)`, and presets start rounding to
 the same bytes. The CLI takes the whole 1–100 range anyway; `MIN_LEVEL` in
-`src/palette.rs` (10 for now — the lowest level at which no two presets share a
-value on either device) is the floor anything driving a slider should map onto.
-Whether 10% still looks like the right color is a question for the eye.
+`src/palette.rs` is the floor anything driving a slider should map onto. It is
+3: the lowest level at which no two presets share a value on the strip, which is
+what the bridge reads back. (The card's presets stay distinct only from 10, but
+the ones that merge below that are the same color there anyway.) Warm white
+still looks right on both devices at 1.
 
 `--level` applies to a solid color only. `off` has nothing to dim, and `on`,
 `load` and `restore` put back recorded values that already carry their level —
@@ -741,8 +743,7 @@ go.
   on the nearest preset and the light reports where it really is. White
   temperature has two stops, Warm White at 2700 K and Cool White at 6500 K,
   split near 3815 K.
-- **Brightness** is `--level`, mapped onto `MIN_LEVEL` (10%, provisional) to
-  100%.
+- **Brightness** is `--level`, mapped onto `MIN_LEVEL` (3%) to 100%.
 - A hand-tuned hex or a per-LED pattern shows as on, with no effect, and its
   color reported as an approximation.
 

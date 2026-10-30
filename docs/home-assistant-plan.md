@@ -277,6 +277,15 @@ devices, and an exhaustive test finds no two presets that round to the same
 wire value at any level from `MIN_LEVEL` up. (Today the lowest collision-free
 floor is 10: Cerise and Hot Pink both become `(23,0,2)` on the GPU at 9.)
 
+*Settled on the real install:* `MIN_LEVEL` is **3**. The collision test now
+applies to the strip, which is the device the bridge reads, resolves against
+and reports, unless the strip is dark and the card alone is lit. The strip is
+collision-free from 3; at 2, Cobalt and Sapphire both become `(0,1,5)`. The
+card keeps its own bound of 10. Below it, the presets that merge are reds and
+pinks that are the same bytes at that level, so the worst case is a card lit
+alone being labelled as its twin. By eye, warm white still looked right on
+both devices at 1.
+
 Linear scaling is the starting point because the LEDs are PWM-driven. Whether
 the slider wants a perceptual curve is decided by eye in Phase 4, in the
 bridge's mapping — never in `--level`, which stays a plain multiplier.
@@ -809,7 +818,8 @@ table*).
 Tests, all pure:
 
 - exhaustive (device, preset, level) → wire → recognise: the recognised pair
-  produces the same wire value, and from `MIN_LEVEL` up it is the same preset;
+  produces the same wire value, and from the device's floor up it is the same
+  preset (`MIN_LEVEL` on the strip, 10 on the card);
 - every *eligible* candidate's own appearance snaps to itself (`black` and
   `white` excluded, since they are not candidates);
 - kelvin snapping at and either side of the midpoint;
@@ -938,7 +948,8 @@ worth pinning down:
 
 1. **`MIN_LEVEL`, and linear vs perceptual brightness.** Tune on both devices at
    once with `--level`, the same way the presets were tuned; the collision test
-   sets its lower bound.
+   sets its lower bound. *`MIN_LEVEL` settled at 3 (Phase 2). Linear vs
+   perceptual waits on the slider in use.*
 2. **The bridge's 60 s GPU interval and 5 s settle.** Guesses between "seconds
    apart glitched" and "minutes apart didn't", like the CLI's own 1500 ms. Lower
    them only on evidence.
@@ -1026,9 +1037,16 @@ bridge.
 **Implementation review, round 3** (on f01688c, which adds only a guard for a
 process that exits before it is killed) — `VERDICT: SHIP`, no findings.
 
-Still to do on the real install, in order: Phase 1 and 2 by hand on the LEDs
-(`--level` on both devices, choosing `MIN_LEVEL` by eye); then Phase 3
-acceptance (*Acceptance, in this house*); then the Hue dimmer and the scenes.
+**On the real install** (2026-10-30). Phases 1 and 2 were checked by hand on
+both devices. `off --all` then `on --all` brought back the prior amber, and
+warm white was stepped through 40, 10, 7, 5, 3 and 1. It looked right
+throughout, so `MIN_LEVEL` is 3 (see Phase 2). The bridge is installed: it
+connected, got its echo back and published. Home Assistant shows the light on,
+as Amber, with the expected modes, effects and device, and neither HA nor
+Mosquitto logged warnings or denials.
+
+Still to do, in order: the rest of Phase 3 acceptance (*Acceptance, in this
+house*), then the Hue dimmer and the scenes.
 
 ## Appendix A — verified findings
 

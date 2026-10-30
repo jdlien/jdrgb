@@ -290,19 +290,23 @@ pub fn scale(rgb: (u8, u8, u8), level: u8) -> (u8, u8, u8) {
     (s(rgb.0), s(rgb.1), s(rgb.2))
 }
 
-/// The lowest level a slider should reach. Below it the 8-bit channels lose
-/// their ratios — `coolwhite` at 2% is `(5,4,4)` — and presets start rounding
-/// to the same bytes, so a dimmed value can no longer say which preset it was.
+/// The lowest level a slider should reach. Below it presets start rounding to
+/// the same bytes on the strip, so a dimmed value can no longer say which
+/// preset it was — and dimming to the bottom and back up could come back as
+/// the other one.
 ///
-/// **Provisional.** 10 is the lowest floor at which no two presets share a
-/// wire value at any level on either device (`no_two_presets_share_a_wire_value
-/// from_min_level_up` pins that; Cerise and Hot Pink both become `(23,0,2)` on
-/// the card at 9). Whether 10% still *looks* like the right color on both
-/// devices is a question for the eye, and the answer may raise it.
+/// 3 is the lowest floor at which no two presets share a wire value on the
+/// strip (`no_two_presets_share_a_wire_value_from_each_floor_up` pins that; at
+/// 2, Cobalt and Sapphire both become `(0,1,5)`). The strip is what counts: it
+/// is what the bridge reads, resolves against and reports, unless the strip is
+/// dark and the card alone is lit. The card's own floor is 10 — below it a few
+/// reds and pinks share bytes there, which can only mislabel a card lit alone
+/// as a preset that is, at that level, the same color. Chosen by eye on
+/// 2026-10-30: warm white still looked right on both devices at 1.
 ///
 /// The CLI accepts the whole 1–100 range; this is the floor the Home Assistant
 /// bridge maps its brightness slider onto.
-pub const MIN_LEVEL: u8 = 10;
+pub const MIN_LEVEL: u8 = 3;
 
 /// Which preset, at which level, `--level` would have turned into exactly this
 /// recorded value on this device — the inverse of `scale(Paint::rgb(gpu), l)`.
@@ -1508,16 +1512,27 @@ mod tests {
         assert_ne!(scale(p.rgb(true), 40), scale(p.rgb(false), 40));
     }
 
-    /// What `MIN_LEVEL` rests on: from it up, no wire value on either device
-    /// could have come from two different presets, at any pair of levels. Below
-    /// it, recognising which preset a dimmed value was stops being possible.
+    /// The card's equivalent of `MIN_LEVEL`: the lowest level at which no two
+    /// presets share a wire value on the GPU. Not a slider floor — only what
+    /// recognition guarantees for a card lit on its own.
+    const GPU_DISTINCT_LEVEL: u8 = 10;
+
+    /// The lowest level at which recognition is exact on this device.
+    fn distinct_from(gpu: bool) -> u8 {
+        if gpu { GPU_DISTINCT_LEVEL } else { MIN_LEVEL }
+    }
+
+    /// What `MIN_LEVEL` rests on, and `GPU_DISTINCT_LEVEL` for the card: from
+    /// it up, no wire value could have come from two different presets, at any
+    /// pair of levels. Below it, recognising which preset a dimmed value was
+    /// stops being possible.
     #[test]
-    fn no_two_presets_share_a_wire_value_from_min_level_up() {
+    fn no_two_presets_share_a_wire_value_from_each_floor_up() {
         for gpu in [false, true] {
             let mut seen: std::collections::HashMap<(u8, u8, u8), &str> = Default::default();
             for &(name, _) in PRESETS {
                 let rgb = Paint::Preset(name).rgb(gpu);
-                for level in MIN_LEVEL..=100 {
+                for level in distinct_from(gpu)..=100 {
                     if let Some(other) = seen.insert(scale(rgb, level), name) {
                         assert_eq!(other, name, "{name} and {other} collide at {level}% (gpu={gpu})");
                     }
@@ -1526,21 +1541,22 @@ mod tests {
         }
     }
 
-    /// And the floor is not lower than it needs to be: one step down, the
+    /// And neither floor is lower than it needs to be: one step down, the
     /// collision that set it is real.
     #[test]
-    fn one_below_min_level_two_presets_collide() {
-        let cerise = Paint::Preset("cerise").rgb(true);
-        let hotpink = Paint::Preset("hotpink").rgb(true);
-        assert_eq!(scale(cerise, MIN_LEVEL - 1), scale(hotpink, MIN_LEVEL - 1));
+    fn one_below_each_floor_two_presets_collide() {
+        let strip = |name| scale(Paint::Preset(name).rgb(false), MIN_LEVEL - 1);
+        assert_eq!(strip("cobalt"), strip("sapphire"));
+        let card = |name| scale(Paint::Preset(name).rgb(true), GPU_DISTINCT_LEVEL - 1);
+        assert_eq!(card("cerise"), card("hotpink"));
     }
 
     // ---- recognising what a recorded value was --------------------------
 
     /// Exhaustively: every preset at every level on both devices comes back as
-    /// a pair that produces the same bytes, and from `MIN_LEVEL` up as itself,
-    /// at its own level. The bridge reports state from this, so a wrong answer
-    /// here would be a wrong light in Home Assistant.
+    /// a pair that produces the same bytes, and from the device's floor up as
+    /// itself, at its own level. The bridge reports state from this, so a wrong
+    /// answer here would be a wrong light in Home Assistant.
     #[test]
     fn every_dimmed_preset_is_recognised() {
         for gpu in [false, true] {
@@ -1550,7 +1566,7 @@ mod tests {
                     let wire = scale(full, level);
                     let (got, at) = recognise(wire, gpu).unwrap_or_else(|| panic!("{name}@{level} unrecognised"));
                     assert_eq!(scale(Paint::Preset(got).rgb(gpu), at), wire, "{name}@{level} → {got}@{at}");
-                    if level >= MIN_LEVEL {
+                    if level >= distinct_from(gpu) {
                         assert_eq!(got, name, "{name}@{level} (gpu={gpu}) read back as {got}@{at}");
                         if name != "black" {
                             assert_eq!(at, level, "{name}@{level} (gpu={gpu}) read back at {at}");
