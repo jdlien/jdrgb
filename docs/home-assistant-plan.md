@@ -1023,6 +1023,9 @@ PowerShell test harness; both scripts are parse-checked, their pre-elevation
 paths exercised, and the uninstaller's singleton probe checked against a live
 bridge.
 
+**Implementation review, round 3** (on f01688c, which adds only a guard for a
+process that exits before it is killed) — `VERDICT: SHIP`, no findings.
+
 Still to do on the real install, in order: Phase 1 and 2 by hand on the LEDs
 (`--level` on both devices, choosing `MIN_LEVEL` by eye); then Phase 3
 acceptance (*Acceptance, in this house*); then the Hue dimmer and the scenes.
