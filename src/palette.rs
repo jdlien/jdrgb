@@ -304,6 +304,122 @@ pub fn scale(rgb: (u8, u8, u8), level: u8) -> (u8, u8, u8) {
 /// bridge maps its brightness slider onto.
 pub const MIN_LEVEL: u8 = 10;
 
+/// Which preset, at which level, `--level` would have turned into exactly this
+/// recorded value on this device — the inverse of `scale(Paint::rgb(gpu), l)`.
+///
+/// The state file holds wire values, so this is how anything reading it learns
+/// "Warm White at 40%" rather than "#64140F". The highest matching level wins,
+/// then table order, so an undimmed preset is always itself at 100 and `black`
+/// — zero at every level — is `black` at 100. Below `MIN_LEVEL` two presets can
+/// round to the same bytes and the answer may be the other one; that is what
+/// the floor is for.
+///
+/// 29 presets x 100 levels of integer arithmetic: nothing worth caching.
+pub fn recognise(rgb: (u8, u8, u8), gpu: bool) -> Option<(&'static str, u8)> {
+    let mut best: Option<(&'static str, u8)> = None;
+    for &(name, _) in PRESETS {
+        let full = Paint::Preset(name).rgb(gpu);
+        if let Some(level) = (1..=100u8).rev().find(|&l| scale(full, l) == rgb) {
+            if best.is_none_or(|(_, b)| level > b) {
+                best = Some((name, level));
+            }
+        }
+    }
+    best
+}
+
+// ---------------------------------------------------------------------------
+// Appearance: hue and saturation, for a color wheel
+// ---------------------------------------------------------------------------
+
+/// HSV hue (degrees, 0 up to 360) and saturation (0 to 1) of an sRGB value.
+///
+/// HSV, not the HSL that `tune` steps in: a near-white like `coolwhite`'s swatch
+/// is ~4% saturated in HSV and 100% in HSL, and a color wheel's saturation is
+/// HSV's — distance from the white centre.
+pub fn hsv_of((r, g, b): (u8, u8, u8)) -> (f64, f64) {
+    let (r, g, b) = (f64::from(r) / 255.0, f64::from(g) / 255.0, f64::from(b) / 255.0);
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let d = max - min;
+    let s = if max == 0.0 { 0.0 } else { d / max };
+    let h = if d == 0.0 {
+        0.0
+    } else if max == r {
+        60.0 * (((g - b) / d).rem_euclid(6.0))
+    } else if max == g {
+        60.0 * ((b - r) / d + 2.0)
+    } else {
+        60.0 * ((r - g) / d + 4.0)
+    };
+    (h.rem_euclid(360.0), s)
+}
+
+/// Where a preset *looks* like it sits on a color wheel: its `SWATCH`
+/// appearance as HSV. Never the wire value — `coolwhite` is pink on the wire.
+pub fn appearance_hs(name: &str) -> (f64, f64) {
+    hsv_of(swatch_rgb(name))
+}
+
+/// The preset nearest a requested hue (degrees) and saturation (0 to 100), the
+/// way a color wheel would place them.
+///
+/// Distance is taken on the disc — `(s·cos h, s·sin h)` — not along hue alone,
+/// which is what makes the whites and `pink` reachable: a low-saturation request
+/// lands on `coolwhite` or `warmwhite` by its hue, a soft pink on `pink`. Ties go
+/// to table order.
+///
+/// Every preset is a candidate except `black` (not a color) and `white` (an
+/// uncalibrated reference that reads green on the strip).
+pub fn snap_hs(hue: f64, sat_percent: f64) -> &'static str {
+    let point = |h: f64, s: f64| {
+        let t = h.to_radians();
+        (s * t.cos(), s * t.sin())
+    };
+    let (x, y) = point(hue, (sat_percent / 100.0).clamp(0.0, 1.0));
+    let mut best = ("coolwhite", f64::INFINITY);
+    for &(name, _) in PRESETS {
+        if name == "black" || name == "white" {
+            continue;
+        }
+        let (h, s) = appearance_hs(name);
+        let (px, py) = point(h, s);
+        let d = (px - x).powi(2) + (py - y).powi(2);
+        if d < best.1 {
+            best = (name, d);
+        }
+    }
+    best.0
+}
+
+/// The two whites, as color temperatures. Labels chosen to match how they look,
+/// not measurements: `warmwhite`'s `SWATCH` comment already calls it ~2700 K,
+/// and `coolwhite` reads as a clean daylight white.
+pub const WARM_KELVIN: u32 = 2700;
+pub const COOL_KELVIN: u32 = 6500;
+
+/// The white nearest a requested color temperature. Nearest in mireds, which is
+/// how temperature differences are perceived — the split falls near 3815 K, not
+/// at the arithmetic midpoint. Ties go to `warmwhite`.
+pub fn snap_kelvin(kelvin: u32) -> &'static str {
+    let mired = |k: u32| 1_000_000.0 / f64::from(k.max(1));
+    let k = mired(kelvin);
+    if (k - mired(WARM_KELVIN)).abs() <= (k - mired(COOL_KELVIN)).abs() {
+        "warmwhite"
+    } else {
+        "coolwhite"
+    }
+}
+
+/// A white preset's color temperature label, or `None` for anything else.
+pub fn kelvin_of(name: &str) -> Option<u32> {
+    match name {
+        "warmwhite" => Some(WARM_KELVIN),
+        "coolwhite" => Some(COOL_KELVIN),
+        _ => None,
+    }
+}
+
 /// Resolve a preset name (case-insensitive) or an `RRGGBB` hex string.
 pub fn parse_paint(s: &str) -> Option<Paint> {
     let lower = s.to_ascii_lowercase();
@@ -1364,6 +1480,106 @@ mod tests {
         let cerise = Paint::Preset("cerise").rgb(true);
         let hotpink = Paint::Preset("hotpink").rgb(true);
         assert_eq!(scale(cerise, MIN_LEVEL - 1), scale(hotpink, MIN_LEVEL - 1));
+    }
+
+    // ---- recognising what a recorded value was --------------------------
+
+    /// Exhaustively: every preset at every level on both devices comes back as
+    /// a pair that produces the same bytes, and from `MIN_LEVEL` up as itself,
+    /// at its own level. The bridge reports state from this, so a wrong answer
+    /// here would be a wrong light in Home Assistant.
+    #[test]
+    fn every_dimmed_preset_is_recognised() {
+        for gpu in [false, true] {
+            for &(name, _) in PRESETS {
+                let full = Paint::Preset(name).rgb(gpu);
+                for level in 1..=100u8 {
+                    let wire = scale(full, level);
+                    let (got, at) = recognise(wire, gpu).unwrap_or_else(|| panic!("{name}@{level} unrecognised"));
+                    assert_eq!(scale(Paint::Preset(got).rgb(gpu), at), wire, "{name}@{level} → {got}@{at}");
+                    if level >= MIN_LEVEL {
+                        assert_eq!(got, name, "{name}@{level} (gpu={gpu}) read back as {got}@{at}");
+                        if name != "black" {
+                            assert_eq!(at, level, "{name}@{level} (gpu={gpu}) read back at {at}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_undimmed_preset_is_itself_at_full_and_a_tuned_hex_is_nothing() {
+        assert_eq!(recognise(Paint::Preset("warmwhite").rgb(true), true), Some(("warmwhite", 100)));
+        assert_eq!(recognise((0, 0, 0), false), Some(("black", 100)));
+        assert_eq!(recognise((0x12, 0x34, 0x56), false), None);
+        // The strip's warm white on the card is not the card's warm white.
+        assert_ne!(recognise(Paint::Preset("warmwhite").rgb(false), true).map(|r| r.0), Some("warmwhite"));
+    }
+
+    // ---- the color wheel ---------------------------------------------------
+
+    fn near(a: f64, b: f64) -> bool {
+        (a - b).abs() < 0.5
+    }
+
+    #[test]
+    fn hsv_of_the_primaries_and_white() {
+        assert_eq!(hsv_of((255, 0, 0)), (0.0, 1.0));
+        let (h, s) = hsv_of((0, 255, 0));
+        assert!(near(h, 120.0) && s == 1.0);
+        let (h, s) = hsv_of((0, 0, 255));
+        assert!(near(h, 240.0) && s == 1.0);
+        assert_eq!(hsv_of((255, 255, 255)), (0.0, 0.0));
+        assert_eq!(hsv_of((0, 0, 0)), (0.0, 0.0));
+        let (_, s) = hsv_of(swatch_rgb("coolwhite"));
+        assert!(s < 0.05, "coolwhite looks nearly unsaturated: {s}");
+    }
+
+    /// Every preset the wheel can land on must be reachable by pointing at
+    /// where it looks like it is — otherwise HomeKit's thumb could never sit on
+    /// it, and HA would echo a color the user can't pick.
+    #[test]
+    fn every_eligible_preset_snaps_to_itself() {
+        for &(name, _) in PRESETS {
+            if name == "black" || name == "white" {
+                continue;
+            }
+            let (h, s) = appearance_hs(name);
+            assert_eq!(snap_hs(h, s * 100.0), name, "pointing at {name} ({h:.1}°, {:.0}%)", s * 100.0);
+        }
+    }
+
+    #[test]
+    fn the_wheel_never_lands_on_black_or_white() {
+        for h in (0..360).step_by(5) {
+            for s in [0, 10, 50, 100] {
+                let got = snap_hs(f64::from(h), f64::from(s));
+                assert!(got != "black" && got != "white", "{h}°/{s}% landed on {got}");
+            }
+        }
+        assert_eq!(snap_hs(0.0, 0.0), "coolwhite", "the centre of the wheel is the cleanest white");
+    }
+
+    /// The house's Synthwave Dreams scene sets hue 323; Hot Pink (~330) is a
+    /// hair nearer than Cerise (~315). The scene names its effect directly, but
+    /// the wheel should agree.
+    #[test]
+    fn hue_323_snaps_to_hot_pink() {
+        assert_eq!(snap_hs(323.0, 100.0), "hotpink");
+    }
+
+    #[test]
+    fn kelvin_splits_between_the_whites_in_mireds() {
+        assert_eq!(snap_kelvin(2700), "warmwhite");
+        assert_eq!(snap_kelvin(6500), "coolwhite");
+        assert_eq!(snap_kelvin(3800), "warmwhite", "just warm of the ~3815 K split");
+        assert_eq!(snap_kelvin(3830), "coolwhite", "just cool of it");
+        assert_eq!(snap_kelvin(4255), "coolwhite", "the house's Bright scene");
+        assert_eq!(snap_kelvin(2000), "warmwhite");
+        assert_eq!(snap_kelvin(10_000), "coolwhite");
+        assert_eq!(kelvin_of("warmwhite"), Some(WARM_KELVIN));
+        assert_eq!(kelvin_of("red"), None);
     }
 
     // ---- stash identity ---------------------------------------------------
