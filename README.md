@@ -40,6 +40,7 @@ jdrgb                 default color, coolwhite (#FFB0D0)
 jdrgb NAME            a named preset, e.g. jdrgb red   (see: jdrgb presets)
 jdrgb RRGGBB          a hex color, e.g. jdrgb ffcf9e
 jdrgb off             turn the LEDs off
+jdrgb on [color]      bring back what `off` turned off (color = if nothing kept)
 jdrgb presets         list the named color presets
 jdrgb load [file]     per-LED colors from a config file (default leds.conf)
 jdrgb template [file] write a starter config, one line per LED
@@ -373,6 +374,34 @@ Two things it can't do:
   has nothing to report until you set a color yourself. It says so and exits
   non-zero rather than writing a file that would restore you to darkness.
 
+#### `off` and `on`
+
+`jdrgb off` remembers what each device was showing, and `jdrgb on` puts it back
+— a solid, a per-LED pattern, or the two devices showing different things.
+Unlike the stash, this survives a reboot, so the lights can be turned off at
+night and back on to the same thing the next morning.
+
+```powershell
+jdrgb off --all    # dark, remembering what was lit
+jdrgb on --all     # back to it
+```
+
+It is built to sit behind a switch, so pressing either one twice is harmless.
+A second `off` keeps the color the first one saved, rather than saving "off".
+`on` only touches a device recorded as off, so with the lights already lit it
+sends nothing to the hardware and costs the strip no flash write.
+
+A device that is off with nothing saved — turned off by a jdrgb from before
+`on` existed — comes back in the default color, or `jdrgb on warmwhite` names
+one. A device never recorded at all is left alone, because nothing says it is
+off.
+
+`on` leaves the stash alone, so pressing it mid-outage can't drop what a UPS
+hook is waiting to restore. The two cooperate in the other direction too. Turn
+the lights off, let a UPS hook paint them amber with `--stash`, and when mains
+`restore`s them to off, `on` still brings back the color they were turned off
+from, not the amber.
+
 ### Tuning a color
 
 `jdrgb tune [color]` steps a color live in HSL — `h`/`s`/`l` nudge each channel
@@ -402,6 +431,21 @@ mb.pattern=FA9536,FA9536,...,FF0011
 
 A frame is only ever written alongside `multi`, and any other write to that slot
 clears it, so a frame can't outlive the state that produced it.
+
+A device that went from lit to off also keeps what it was showing, for `on`, in
+the same two-key shape:
+
+```
+mb=off
+mb.lit=FA9536
+gpu=off
+gpu.lit=multi
+gpu.lit.pattern=FF560A,FF5400,FF560A,FF5400
+```
+
+That record is written only on the way into off, and nothing else clears it.
+`on` only reads it for a device that is off, so a stale one on a lit device is
+never used.
 
 The split matters because the same look is a *different* RGB on each (see the
 calibration table above). A shared slot would hand `jdrgb --gpu tune` the strip's

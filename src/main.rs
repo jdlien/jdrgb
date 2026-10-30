@@ -70,6 +70,7 @@ enum Command {
     Template(String),        // write a starter config file
     State(Option<String>),   // dump what's set as a config (None = stdout)
     Restore(Option<Paint>),  // put back what --stash saved (arg = if none saved)
+    On(Option<Paint>),       // put back what `off` turned off (arg = if nothing kept)
     Tune(Option<Paint>),     // interactively dial in a color (None = pick up the last)
     Preview,                 // cycle through all presets
     Presets,                 // list keyword presets
@@ -196,6 +197,7 @@ fn main() -> ExitCode {
         }),
         Command::State(out) => dump_state(target, out.as_deref(), force),
         Command::Restore(fallback) => restore(target, fallback, wait),
+        Command::On(fallback) => turn_on(target, fallback, wait),
         // Tuning needs one concrete starting RGB even with --all, so a preset
         // resolves against whichever device is the focus: the GPU only when
         // it's the sole target. With no arg, that device's own last color is the
@@ -252,6 +254,18 @@ fn parse(args: &[&str]) -> Result<Command, String> {
                 None => None,
             };
             Ok(Command::Restore(fallback))
+        }
+        "on" => {
+            // The color is for a device that's off with nothing kept: dark
+            // since before anything was recorded, or turned off by a jdrgb
+            // that predates `on`.
+            let fallback = match args.get(1) {
+                Some(s) => {
+                    Some(parse_paint(s).ok_or_else(|| format!("'{s}' is not a color or preset"))?)
+                }
+                None => None,
+            };
+            Ok(Command::On(fallback))
         }
         "tune" => {
             // No arg stays unresolved here: which device's last color to pick up
@@ -1183,7 +1197,9 @@ fn restore(target: Target, fallback: Option<Paint>, wait: bool) -> Result<(), St
         Some(text) => {
             let conf = parse_led_config(&text, &shown)?;
             let mut done = Landed::default();
-            with_retry(wait, || apply_config(&conf, &shown, target, &mut done))?;
+            // A stash that says `off` would otherwise record the borrowed
+            // color as what `on` brings back. See `State::keep_lit_from`.
+            keeping_lit(|| with_retry(wait, || apply_config(&conf, &shown, target, &mut done)))?;
             // Only once it actually landed: a failed restore that dropped the
             // stash would leave nothing to try again with.
             let _ = std::fs::remove_file(&path);
@@ -1203,11 +1219,62 @@ fn restore(target: Target, fallback: Option<Paint>, wait: bool) -> Result<(), St
 ///
 /// `restore` is deliberately absent: it consumes the stash rather than
 /// replacing it, and clearing it first would leave nothing to restore.
+///
+/// So is `on`. It only puts back what `off` left, and it's a switch — pressed
+/// with the lights already lit, mid-outage, it must not drop the snapshot a
+/// UPS hook is waiting to restore.
 fn is_apply(command: &Command) -> bool {
     matches!(
         command,
         Command::Solid(..) | Command::Rainbow(_) | Command::Load(_) | Command::Tune(_) | Command::Preview
     )
+}
+
+// ---------------------------------------------------------------------------
+// Off, and back on
+// ---------------------------------------------------------------------------
+
+/// What `on` would put back, as a recorded state for `state_body` to turn into
+/// a config: each targeted device that is off, holding what it showed before
+/// it went dark — or `fallback` where nothing was kept.
+///
+/// A device that's lit is left out, so `on` never repaints what's already
+/// showing, or spends a flash write on the strip to do nothing. So is one never
+/// recorded: nothing says it's off, and a machine set only by the boot task is
+/// usually lit.
+fn on_state(st: &State, target: Target, fallback: Paint) -> State {
+    let mut out = State::default();
+    for gpu in [false, true] {
+        let wanted = if gpu { target.gpu() } else { target.mb() };
+        if !wanted || st.slot(gpu) != Some(Last::Off) {
+            continue;
+        }
+        match st.lit(gpu) {
+            Some(Lit::Color(rgb)) => out.record(gpu, Last::Color(*rgb)),
+            Some(Lit::Frame(frame)) => out.record_pattern(gpu, frame),
+            None => out.record(gpu, Last::Color(fallback.rgb(gpu))),
+        }
+    }
+    out
+}
+
+/// Bring back whatever `off` turned off.
+///
+/// It goes out through the same config path as `restore`, so a per-LED frame
+/// comes back as a frame and each device gets its own recorded value — the
+/// GPU's calibrated warmwhite, not the strip's. With nothing off it touches no
+/// hardware, which is what makes it safe to bind to a button.
+fn turn_on(target: Target, fallback: Option<Paint>, wait: bool) -> Result<(), String> {
+    let fallback = fallback.unwrap_or(Paint::Preset(DEFAULT_PRESET));
+    let (body, _) = state_body(&on_state(&load_state_full(), target, fallback), target);
+    if body.is_empty() {
+        println!("jdrgb: nothing recorded as off, leaving the lights alone");
+        return Ok(());
+    }
+    let what = "the record of what was lit";
+    let conf = parse_led_config(&body, what)?;
+    let mut done = Landed::default();
+    with_retry(wait, || apply_config(&conf, what, target, &mut done))
 }
 
 /// A `dev:` line, naming the preset in a trailing comment when the value is one.
@@ -1866,6 +1933,7 @@ fn print_help() {
          \x20 jdrgb NAME            a named preset, e.g. jdrgb red  (`jdrgb presets` lists them)\n\
          \x20 jdrgb RRGGBB          a hex color, e.g. jdrgb ffcf9e\n\
          \x20 jdrgb off             turn the LEDs off\n\
+         \x20 jdrgb on [color]      bring back what `off` turned off (color = if nothing kept)\n\
          \x20 jdrgb presets         list the named color presets\n\
          \x20 jdrgb load [file]     per-LED colors from a config file (default leds.conf)\n\
          \x20 jdrgb template [file] write a starter config, one line per LED\n\
@@ -1990,6 +2058,7 @@ mod tests {
             mb_pattern: Some(frame.clone()),
             gpu: Some(Last::Multi),
             gpu_pattern: Some(vec![(1, 2, 3), (4, 5, 6)]),
+            ..State::default()
         };
         let conf = reload(&st);
         assert_eq!(conf.mb, Some(Zone::Frame(frame)));
@@ -2116,6 +2185,87 @@ mod tests {
             Ok(Command::Restore(Some(Paint::Preset("coolwhite"))))
         ));
         assert!(parse(&["restore", "nonsense"]).is_err());
+    }
+
+    /// What `on` would apply, read back the way `turn_on` reads it.
+    fn on_config(st: &State, target: Target, fallback: Paint) -> Option<LedConfig> {
+        let (body, omitted) = state_body(&on_state(st, target, fallback), target);
+        assert!(omitted.is_empty(), "dropped a device: {omitted:?}");
+        (!body.is_empty()).then(|| parse_led_config(&body, "on").expect("on wrote a config it cannot read"))
+    }
+
+    /// The regression, end to end: `off` then `on` puts back what was showing,
+    /// each device its own value. Before the lit record, `off` overwrote the
+    /// only copy and there was nothing to come back to.
+    #[test]
+    fn on_brings_back_what_off_turned_off() {
+        let gpu_warm = Paint::Preset("warmwhite").rgb(true);
+        let mut st = State::default();
+        st.record(false, Last::Color((0xFA, 0x95, 0x36)));
+        st.record(true, Last::Color(gpu_warm));
+        st.record(false, Last::Off);
+        st.record(true, Last::Off);
+        let st = parse_state(&encode_state(&st)); // `off` and `on` are separate runs
+
+        let conf = on_config(&st, Target::All, Paint::Preset("red")).expect("on had nothing to do");
+        assert_eq!(conf.mb, Some(Zone::Solid { mode: MODE_STATIC, rgb: (0xFA, 0x95, 0x36) }));
+        assert_eq!(conf.gpu, Some(Zone::Solid { mode: MODE_STATIC, rgb: gpu_warm }), "not the strip's value");
+    }
+
+    #[test]
+    fn on_brings_back_a_per_led_frame_as_a_frame() {
+        let frame: Vec<(u8, u8, u8)> = (0..STRIP_LEDS).map(|i| (i as u8, 0x95, 0x36)).collect();
+        let mut st = State::default();
+        st.record_pattern(false, &frame);
+        st.record(false, Last::Off);
+        let conf = on_config(&st, Target::Mb, Paint::Preset("red")).unwrap();
+        assert_eq!(conf.mb, Some(Zone::Frame(frame)));
+    }
+
+    /// A switch gets pressed when it's already on. That must touch nothing —
+    /// no repaint, and no flash write on the strip.
+    #[test]
+    fn on_leaves_a_lit_device_alone() {
+        let st = State { mb: Some(Last::Color((1, 2, 3))), gpu: Some(Last::Multi), ..State::default() };
+        assert_eq!(on_config(&st, Target::All, Paint::Preset("red")), None);
+    }
+
+    /// Nothing says an unrecorded device is off — on a machine set only by the
+    /// boot task it is usually lit — so `on` leaves it be.
+    #[test]
+    fn on_leaves_an_unrecorded_device_alone() {
+        let st = State { mb: Some(Last::Off), ..State::default() };
+        let conf = on_config(&st, Target::All, Paint::Preset("red")).unwrap();
+        assert!(conf.mb.is_some());
+        assert_eq!(conf.gpu, None);
+    }
+
+    /// Off with nothing kept — a state file from before `on` existed — still
+    /// has to light up, or the button looks broken. The fallback is a preset,
+    /// so each device gets its own calibration of it.
+    #[test]
+    fn on_falls_back_when_off_kept_nothing() {
+        let st = parse_state("mb=off\ngpu=off\n");
+        let conf = on_config(&st, Target::All, Paint::Preset(DEFAULT_PRESET)).unwrap();
+        let rgb = |gpu| Paint::Preset(DEFAULT_PRESET).rgb(gpu);
+        assert_eq!(conf.mb, Some(Zone::Solid { mode: MODE_STATIC, rgb: rgb(false) }));
+        assert_eq!(conf.gpu, Some(Zone::Solid { mode: MODE_STATIC, rgb: rgb(true) }));
+    }
+
+    #[test]
+    fn on_respects_the_target() {
+        let st = parse_state("mb=off\nmb.lit=FA9536\ngpu=off\ngpu.lit=FF560A\n");
+        let conf = on_config(&st, Target::Gpu, Paint::Preset("red")).unwrap();
+        assert_eq!(conf.mb, None, "--gpu turned the strip on");
+        assert!(conf.gpu.is_some());
+    }
+
+    #[test]
+    fn on_takes_an_optional_fallback_and_keeps_the_stash() {
+        assert!(matches!(parse(&["on"]), Ok(Command::On(None))));
+        assert!(matches!(parse(&["on", "warmwhite"]), Ok(Command::On(Some(Paint::Preset("warmwhite"))))));
+        assert!(parse(&["on", "nonsense"]).is_err());
+        assert!(!is_apply(&Command::On(None)), "pressing on mid-outage would drop the UPS stash");
     }
 
     #[test]

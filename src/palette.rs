@@ -377,15 +377,111 @@ impl Last {
 /// **Invariant: a pattern is only ever written by `record_pattern`, and any
 /// other write to that slot clears it.** That is what makes a stale pattern
 /// impossible rather than merely unlikely — see `record`.
+///
+/// The `*_lit` fields are what `jdrgb on` brings back. Without them `off` was
+/// one-way: it overwrote the only record of what had been showing.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct State {
     pub mb: Option<Last>,
     pub gpu: Option<Last>,
     pub mb_pattern: Option<Vec<(u8, u8, u8)>>,
     pub gpu_pattern: Option<Vec<(u8, u8, u8)>>,
+    pub mb_lit: Option<Lit>,
+    pub gpu_lit: Option<Lit>,
+}
+
+/// What a device was showing the last time it went from lit to off.
+///
+/// Only replayable states are kept — never `Off`, and never a `Multi` whose
+/// frame was lost — because the one thing this is for is putting them back.
+///
+/// It is written only on the way *into* off, and survives everything else on
+/// purpose. A second `off` must not trade the colour for "nothing", and a
+/// borrowed colour painted over a dark room must not become what `on` brings
+/// back (see `keep_lit_from`).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Lit {
+    Color((u8, u8, u8)),
+    Frame(Vec<(u8, u8, u8)>),
+}
+
+impl Lit {
+    /// Back from the file's two keys. `off` was never a lit state and a
+    /// `multi` without its frame can't be replayed; both read as nothing kept,
+    /// so `on` falls back rather than guessing.
+    fn from_parts(last: Option<Last>, pattern: Option<Vec<(u8, u8, u8)>>) -> Option<Lit> {
+        match (last?, pattern) {
+            (Last::Color(rgb), _) => Some(Lit::Color(rgb)),
+            (Last::Multi, Some(frame)) => Some(Lit::Frame(frame)),
+            _ => None,
+        }
+    }
 }
 
 impl State {
+    /// `record`'s edit, without the file I/O.
+    pub fn record(&mut self, gpu: bool, last: Last) {
+        if last == Last::Off && self.slot(gpu) != Some(Last::Off) {
+            let showing = self.replayable(gpu);
+            *self.lit_mut(gpu) = showing;
+        }
+        let (slot, pattern) = self.slot_mut(gpu);
+        *slot = Some(last);
+        *pattern = None;
+    }
+
+    /// `record_pattern`'s edit, without the file I/O.
+    pub fn record_pattern(&mut self, gpu: bool, colors: &[(u8, u8, u8)]) {
+        let (slot, pattern) = self.slot_mut(gpu);
+        *slot = Some(Last::Multi);
+        *pattern = Some(colors.to_vec());
+    }
+
+    /// Put back the lit records from `before`, undoing what an apply in
+    /// between did to them.
+    ///
+    /// For `restore`. Lights off, a UPS hook paints them amber with `--stash`,
+    /// mains restores them to off — and that restore is a move from lit into
+    /// off, which on its own would record *amber* as what to bring back. The
+    /// stash put the room back; it should put this back too.
+    pub fn keep_lit_from(&mut self, before: &State) {
+        self.mb_lit = before.mb_lit.clone();
+        self.gpu_lit = before.gpu_lit.clone();
+    }
+
+    pub fn lit(&self, gpu: bool) -> Option<&Lit> {
+        if gpu {
+            self.gpu_lit.as_ref()
+        } else {
+            self.mb_lit.as_ref()
+        }
+    }
+
+    /// What this device is showing, in a form `on` could replay.
+    fn replayable(&self, gpu: bool) -> Option<Lit> {
+        match (self.slot(gpu), self.pattern(gpu)) {
+            (Some(Last::Color(rgb)), _) => Some(Lit::Color(rgb)),
+            (Some(Last::Multi), Some(frame)) => Some(Lit::Frame(frame.to_vec())),
+            _ => None,
+        }
+    }
+
+    fn slot_mut(&mut self, gpu: bool) -> (&mut Option<Last>, &mut Option<Vec<(u8, u8, u8)>>) {
+        if gpu {
+            (&mut self.gpu, &mut self.gpu_pattern)
+        } else {
+            (&mut self.mb, &mut self.mb_pattern)
+        }
+    }
+
+    fn lit_mut(&mut self, gpu: bool) -> &mut Option<Lit> {
+        if gpu {
+            &mut self.gpu_lit
+        } else {
+            &mut self.mb_lit
+        }
+    }
+
     /// One device's slot, by the `Paint::rgb(gpu)` convention used everywhere.
     pub fn slot(&self, gpu: bool) -> Option<Last> {
         if gpu {
@@ -413,6 +509,9 @@ pub fn parse_state(text: &str) -> State {
         return State { mb: Last::decode(text), ..State::default() };
     }
     let mut s = State::default();
+    // A lit record is two keys, like the live slot, so it can only be put
+    // together once every line has been seen.
+    let (mut mb_lit, mut mb_lit_pattern, mut gpu_lit, mut gpu_lit_pattern) = (None, None, None, None);
     for line in text.lines() {
         let Some((key, value)) = line.split_once('=') else { continue };
         let value = value.trim();
@@ -421,9 +520,15 @@ pub fn parse_state(text: &str) -> State {
             "gpu" => s.gpu = Last::decode(value),
             "mb.pattern" => s.mb_pattern = decode_pattern(value),
             "gpu.pattern" => s.gpu_pattern = decode_pattern(value),
+            "mb.lit" => mb_lit = Last::decode(value),
+            "gpu.lit" => gpu_lit = Last::decode(value),
+            "mb.lit.pattern" => mb_lit_pattern = decode_pattern(value),
+            "gpu.lit.pattern" => gpu_lit_pattern = decode_pattern(value),
             _ => {}
         }
     }
+    s.mb_lit = Lit::from_parts(mb_lit, mb_lit_pattern);
+    s.gpu_lit = Lit::from_parts(gpu_lit, gpu_lit_pattern);
     s
 }
 
@@ -458,6 +563,15 @@ pub fn encode_state(s: &State) -> String {
     }
     if let Some(p) = &s.gpu_pattern {
         out.push_str(&format!("gpu.pattern={}\n", encode_pattern(p)));
+    }
+    for (dev, lit) in [("mb", &s.mb_lit), ("gpu", &s.gpu_lit)] {
+        match lit {
+            Some(Lit::Color(rgb)) => out.push_str(&format!("{dev}.lit={}\n", Last::Color(*rgb).encode())),
+            Some(Lit::Frame(f)) => {
+                out.push_str(&format!("{dev}.lit=multi\n{dev}.lit.pattern={}\n", encode_pattern(f)))
+            }
+            None => {}
+        }
     }
     out
 }
@@ -499,30 +613,25 @@ fn update(edit: impl FnOnce(&mut State)) {
 /// pattern in hand calls `record_pattern`; one without is by definition not
 /// describing a frame we could replay, so any frame on file is from an older
 /// state and must go.
+///
+/// Recording `Off` over something lit keeps what was lit, for `jdrgb on`.
 pub fn record(gpu: bool, last: Last) {
-    update(|s| {
-        if gpu {
-            s.gpu = Some(last);
-            s.gpu_pattern = None;
-        } else {
-            s.mb = Some(last);
-            s.mb_pattern = None;
-        }
-    });
+    update(|s| s.record(gpu, last));
 }
 
 /// Record a per-LED frame: `Multi` for anything reading the colour slot, plus
 /// the colours themselves so `jdrgb state` can reproduce it.
 pub fn record_pattern(gpu: bool, colors: &[(u8, u8, u8)]) {
-    update(|s| {
-        if gpu {
-            s.gpu = Some(Last::Multi);
-            s.gpu_pattern = Some(colors.to_vec());
-        } else {
-            s.mb = Some(Last::Multi);
-            s.mb_pattern = Some(colors.to_vec());
-        }
-    });
+    update(|s| s.record_pattern(gpu, colors));
+}
+
+/// Run an apply without letting it change what `on` will bring back. See
+/// `State::keep_lit_from` for why `restore` needs this.
+pub fn keeping_lit<T>(apply: impl FnOnce() -> T) -> T {
+    let before = load_state_full();
+    let out = apply();
+    update(|s| s.keep_lit_from(&before));
+    out
 }
 
 /// The last solid color set on one device, if there is one to resume from.
@@ -788,10 +897,9 @@ mod tests {
             mb_pattern: Some(vec![(1, 2, 3)]),
             gpu: Some(Last::Multi),
             gpu_pattern: Some(vec![(4, 5, 6)]),
+            ..State::default()
         };
-        // What record(false, Color) does.
-        s.mb = Some(Last::Color((0xFF, 0x00, 0x00)));
-        s.mb_pattern = None;
+        s.record(false, Last::Color((0xFF, 0x00, 0x00)));
         let back = parse_state(&encode_state(&s));
         assert_eq!(back.pattern(false), None, "a frame outlived the state that produced it");
         assert_eq!(back.pattern(true), Some(&[(4, 5, 6)][..]), "cleared the other device's frame");
@@ -819,5 +927,74 @@ mod tests {
     fn garbage_state_is_ignored_not_fatal() {
         assert_eq!(parse_state("mb=nonsense\ngpu=\n"), State::default());
         assert_eq!(parse_state(""), State::default());
+    }
+
+    const WARM: (u8, u8, u8) = (0xFA, 0x95, 0x36);
+    const AMBER: (u8, u8, u8) = (0xFF, 0x87, 0x00);
+
+    /// The regression: `off` overwrote the only record of what was showing, so
+    /// nothing could turn the lights back on to it. It has to survive the trip
+    /// through the file, too — the next `jdrgb on` is a different process.
+    #[test]
+    fn turning_off_keeps_what_was_showing() {
+        let mut s = slots(Some(Last::Color(WARM)), Some(Last::Color((0xFF, 0x56, 0x0A))));
+        s.record(false, Last::Off);
+        s.record(true, Last::Off);
+        let back = parse_state(&encode_state(&s));
+        assert_eq!(back.mb, Some(Last::Off));
+        assert_eq!(back.lit(false), Some(&Lit::Color(WARM)));
+        assert_eq!(back.lit(true), Some(&Lit::Color((0xFF, 0x56, 0x0A))), "the card kept the strip's colour");
+    }
+
+    #[test]
+    fn turning_off_keeps_a_per_led_frame() {
+        let frame = vec![WARM, (0xFF, 0x00, 0x11), (0, 0, 0)];
+        let mut s = State::default();
+        s.record_pattern(false, &frame);
+        s.record(false, Last::Off);
+        let back = parse_state(&encode_state(&s));
+        assert_eq!(back.lit(false), Some(&Lit::Frame(frame)));
+        assert_eq!(back.pattern(false), None, "the live frame outlived the off");
+    }
+
+    /// Pressing off twice is the normal case for a switch. The second press is
+    /// a move from off to off, and must not replace the colour with nothing.
+    #[test]
+    fn a_second_off_keeps_the_first_ones_colour() {
+        let mut s = slots(Some(Last::Color(WARM)), None);
+        s.record(false, Last::Off);
+        s.record(false, Last::Off);
+        assert_eq!(s.lit(false), Some(&Lit::Color(WARM)));
+    }
+
+    /// Lights off; a UPS hook borrows them with `--stash`; mains restores the
+    /// stash, which says `off`. That last step is a move from lit into off, so
+    /// on its own it records the *borrowed* amber — and the next `on` comes up
+    /// amber instead of the colour the room was turned off from.
+    #[test]
+    fn putting_back_off_keeps_what_on_brings_back() {
+        let mut s = slots(Some(Last::Color(WARM)), None);
+        s.record(false, Last::Off);
+        s.record(false, Last::Color(AMBER)); // borrowed
+        let before = s.clone();
+        s.record(false, Last::Off); // the stash, put back
+        assert_eq!(s.lit(false), Some(&Lit::Color(AMBER)), "precondition: off alone records the borrow");
+        s.keep_lit_from(&before);
+        assert_eq!(s.lit(false), Some(&Lit::Color(WARM)));
+        assert_eq!(s.mb, Some(Last::Off));
+    }
+
+    /// A lit record that can't be replayed is no record. `on` falls back to the
+    /// default for it, which beats replaying something wrong.
+    #[test]
+    fn an_unreplayable_lit_record_reads_as_none() {
+        assert_eq!(parse_state("mb=off\nmb.lit=off\n").mb_lit, None);
+        assert_eq!(parse_state("mb=off\nmb.lit=multi\n").mb_lit, None, "a multi without its frame");
+        assert_eq!(parse_state("mb=off\nmb.lit=multi\nmb.lit.pattern=FA9536,nonsense\n").mb_lit, None);
+        // Order in the file doesn't matter: the pattern may come first.
+        assert_eq!(
+            parse_state("mb.lit.pattern=FA9536,000000\nmb.lit=multi\n").mb_lit,
+            Some(Lit::Frame(vec![WARM, (0, 0, 0)]))
+        );
     }
 }
