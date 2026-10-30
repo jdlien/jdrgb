@@ -14,7 +14,7 @@ mod worker;
 use std::sync::mpsc::Sender;
 
 use draw::Swatch;
-use jdrgb::palette::{Last, PRESETS, display_name, load_state, preset_for_rgb, swatch_rgb};
+use jdrgb::palette::{Last, PRESETS, display_name, load_state, preset_for_rgb, recognise, swatch_rgb};
 
 use windows_sys::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
@@ -45,6 +45,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 const WM_TRAY: u32 = WM_APP + 1;
 /// A finished job coming back from the worker; lParam owns a `worker::Outcome`.
 const WM_APPLY_DONE: u32 = WM_APP + 2;
+
+/// The timer that re-reads the state file. Home Assistant, a terminal or a UPS
+/// hook change the lights without telling the tray, so it looks for itself.
+const TIMER_STATE: usize = 1;
+/// Once a second, as the Home Assistant bridge does: the file is a few dozen
+/// bytes, and the icon is redrawn only when what it shows has changed.
+const STATE_POLL_MS: u32 = 1_000;
 
 /// Notification-icon events. `NIN_SELECT`/`NIN_KEYSELECT` are `WM_USER`-based
 /// and windows-sys doesn't surface them.
@@ -155,6 +162,9 @@ impl Target {
 /// goes stale silently.
 enum Current {
     Named(&'static str),
+    /// A preset at a `--level` below 100, as the bridge's brightness sets it.
+    /// `rgb` is what was recorded, which is what a status row re-sends.
+    Dimmed { name: &'static str, level: u8, rgb: (u8, u8, u8) },
     Hex((u8, u8, u8)),
     /// The controller's own off mode. Distinct from the `black` preset, which
     /// is a static #000000 — they look the same but read back differently, and
@@ -184,6 +194,11 @@ impl Current {
             Target::Gpu => gpu,
             Target::All => match (&mb, &gpu) {
                 (Current::Named(x), Current::Named(y)) if x == y => mb,
+                (Current::Dimmed { name: x, level: a, .. }, Current::Dimmed { name: y, level: b, .. })
+                    if x == y && a == b =>
+                {
+                    mb
+                }
                 _ => Current::Mixed,
             },
         }
@@ -197,7 +212,9 @@ impl Current {
     fn arg(&self) -> Option<String> {
         match self {
             Current::Named(name) => Some((*name).to_string()),
-            Current::Hex((r, g, b)) => Some(format!("{r:02X}{g:02X}{b:02X}")),
+            Current::Hex((r, g, b)) | Current::Dimmed { rgb: (r, g, b), .. } => {
+                Some(format!("{r:02X}{g:02X}{b:02X}"))
+            }
             Current::Off => Some("off".to_string()),
             Current::Multi | Current::Unknown | Current::Mixed => None,
         }
@@ -210,14 +227,19 @@ impl Current {
             Some(Last::Off) => Current::Off,
             Some(Last::Color(rgb)) => match preset_for_rgb(rgb, gpu) {
                 Some(name) => Current::Named(name),
-                None => Current::Hex(rgb),
+                None => match recognise(rgb, gpu) {
+                    Some((name, level)) if level < 100 => Current::Dimmed { name, level, rgb },
+                    _ => Current::Hex(rgb),
+                },
             },
         }
     }
 
     fn swatch(&self) -> Swatch {
         match self {
-            Current::Named(name) => Swatch::Solid(swatch_rgb(name)),
+            // A dimmed preset shows the preset's own colour, not the dimmed
+            // bytes: at 3% those are close to black, and say nothing.
+            Current::Named(name) | Current::Dimmed { name, .. } => Swatch::Solid(swatch_rgb(name)),
             Current::Hex(rgb) => Swatch::Solid(*rgb),
             _ => Swatch::Empty,
         }
@@ -227,6 +249,7 @@ impl Current {
     fn label(&self) -> String {
         match self {
             Current::Named(name) => display_name(name),
+            Current::Dimmed { name, level, .. } => format!("{} {level}%", display_name(name)),
             Current::Hex((r, g, b)) => format!("#{r:02X}{g:02X}{b:02X}"),
             Current::Off => "Off".to_string(),
             Current::Multi => "Per-LED pattern".to_string(),
@@ -268,7 +291,7 @@ impl Swatches {
     /// `scratch` for the caller to free once the menu closes.
     unsafe fn bitmap_for(&self, cur: &Current, scratch: &mut Vec<HBITMAP>) -> Option<HBITMAP> {
         match cur {
-            Current::Named(name) => PRESETS
+            Current::Named(name) | Current::Dimmed { name, .. } => PRESETS
                 .iter()
                 .position(|&(p, _)| p == *name)
                 .map(|i| self.presets[i]),
@@ -294,6 +317,7 @@ struct App {
     nid: NOTIFYICONDATAW,
     icon: HICON,
     icon_swatch: Option<Swatch>,
+    icon_tip: String,
     taskbar_created: u32,
     target: Target,
     swatches: Option<Swatches>,
@@ -349,6 +373,7 @@ fn main() {
             nid: core::mem::zeroed(),
             icon: core::ptr::null_mut(),
             icon_swatch: None,
+            icon_tip: String::new(),
             taskbar_created: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
             target: Target::load(),
             swatches: None,
@@ -361,6 +386,7 @@ fn main() {
 
         add_icon(app);
         refresh_icon(app);
+        SetTimer(hwnd, TIMER_STATE, STATE_POLL_MS, None);
 
         let mut msg: MSG = core::mem::zeroed();
         while GetMessageW(&mut msg, core::ptr::null_mut(), 0, 0) > 0 {
@@ -479,13 +505,32 @@ unsafe fn add_icon(app: *mut App) {
     unsafe { Shell_NotifyIconW(NIM_SETVERSION, nid) };
 }
 
-/// Redraw the icon if the colour it should show has changed.
+/// What the icon shows for a target.
+///
+/// With both devices targeted, the strip's colour, even when the card differs.
+/// The strip leads: the bridge changes it first and the card follows a second
+/// or more later, and Home Assistant reports the strip meanwhile. A hollow
+/// "differ" icon would flash on every change from there. The tooltip and the
+/// menu's two rows still say what each device shows.
+fn icon_swatch(target: Target, mb: &Current, gpu: &Current) -> Swatch {
+    match target {
+        Target::Mb | Target::All => mb.swatch(),
+        Target::Gpu => gpu.swatch(),
+    }
+}
+
+/// Redraw the icon and tooltip if what they should show has changed. Runs
+/// every second, so it reads the state file once and does nothing more when
+/// nothing changed.
 unsafe fn refresh_icon(app: *mut App) {
     let target = unsafe { (*app).target };
-    let current = Current::read(target);
-    let swatch = current.swatch();
+    let (mb, gpu) = Current::both();
+    let swatch = icon_swatch(target, &mb, &gpu);
+    // Both devices, for the same reason the menu shows two rows: the icon can
+    // only be one colour, so the tooltip is where the other half goes.
+    let tip = format!("jdrgb — Strip: {}  ·  GPU: {}", mb.label(), gpu.label());
 
-    if unsafe { (*app).icon_swatch } == Some(swatch) {
+    if unsafe { (*app).icon_swatch } == Some(swatch) && unsafe { (*app).icon_tip == tip } {
         return;
     }
 
@@ -503,13 +548,8 @@ unsafe fn refresh_icon(app: *mut App) {
         let nid = &mut (*app).nid;
         nid.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
         nid.hIcon = icon;
-        // Both devices, for the same reason the menu shows two rows: the icon
-        // can only be one colour, so the tooltip is where the other half goes.
-        let (mb, gpu) = Current::both();
-        set_field(
-            &mut nid.szTip,
-            &format!("jdrgb — Strip: {}  ·  GPU: {}", mb.label(), gpu.label()),
-        );
+        set_field(&mut nid.szTip, &tip);
+        (*app).icon_tip = tip;
         Shell_NotifyIconW(NIM_MODIFY, nid);
         if !old.is_null() {
             DestroyIcon(old);
@@ -602,7 +642,7 @@ unsafe fn show_menu(app: *mut App, x: i32, y: i32) {
     let target = unsafe { (*app).target };
     let current = Current::read(target);
     let current_name = match &current {
-        Current::Named(n) => Some(*n),
+        Current::Named(n) | Current::Dimmed { name: n, .. } => Some(*n),
         _ => None,
     };
 
@@ -834,6 +874,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
+        WM_TIMER if wp == TIMER_STATE => {
+            unsafe { refresh_icon(app) };
+            0
+        }
         WM_CLOSE => {
             unsafe { DestroyWindow(hwnd) };
             0
@@ -941,6 +985,37 @@ mod tests {
         assert_eq!(black.arg().as_deref(), Some("black"));
         assert!(matches!(off.swatch(), Swatch::Empty));
         assert!(matches!(black.swatch(), Swatch::Solid(_)));
+    }
+
+    /// Home Assistant's brightness records a preset at a level. Read as a bare
+    /// hex, it made the two devices "differ" and the icon go hollow.
+    #[test]
+    fn a_dimmed_preset_is_read_as_the_preset_at_its_level() {
+        use jdrgb::palette::{Paint, scale};
+        let strip = scale(Paint::Preset("warmwhite").rgb(false), 40);
+        let card = scale(Paint::Preset("warmwhite").rgb(true), 40);
+        for (cur, rgb) in [(Current::from_slot(Some(Last::Color(strip)), false), strip),
+                           (Current::from_slot(Some(Last::Color(card)), true), card)] {
+            assert!(matches!(cur, Current::Dimmed { name: "warmwhite", level: 40, .. }), "{}", cur.label());
+            assert_eq!(cur.label(), "Warm White 40%");
+            assert!(cur.swatch() == Swatch::Solid(swatch_rgb("warmwhite")), "the preset's colour, not the dim bytes");
+            let (r, g, b) = rgb;
+            assert_eq!(cur.arg(), Some(format!("{r:02X}{g:02X}{b:02X}")), "a status row re-sends what was recorded");
+        }
+        // A hex that is no preset at any level stays a hex.
+        assert!(matches!(Current::from_slot(Some(Last::Color((0x12, 0x34, 0x56))), false), Current::Hex(_)));
+    }
+
+    /// While the card catches up with a change from Home Assistant the two
+    /// devices differ for a second or more; the icon follows the strip rather
+    /// than flashing hollow.
+    #[test]
+    fn with_both_targeted_the_icon_follows_the_strip() {
+        let (mb, gpu) = (Current::Named("orange"), Current::Named("coolwhite"));
+        assert!(icon_swatch(Target::All, &mb, &gpu) == mb.swatch());
+        assert!(icon_swatch(Target::Mb, &mb, &gpu) == mb.swatch());
+        assert!(icon_swatch(Target::Gpu, &mb, &gpu) == gpu.swatch());
+        assert!(mb.swatch() != gpu.swatch(), "the case is only a test if they differ");
     }
 
     /// A menu is not the CLI: every existing `jdrgb COLOR` invocation has to

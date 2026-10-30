@@ -623,7 +623,10 @@ Remove everything with:
 
 `jdrgb-tray.exe` is a notification-area menu for picking a preset without
 opening a terminal. The icon *is* the current color — a filled dot, or a hollow
-ring when the LEDs are off.
+ring when the LEDs are off. It re-reads the state file every second, so a change
+from a terminal or Home Assistant shows within a second. A dimmed preset shows
+as the preset, with its level in the tooltip. With both devices targeted the
+icon follows the strip, which leads; the tooltip names what each device shows.
 
 ```powershell
 .\install.ps1 -Tray                               # the tray at logon, no boot task
