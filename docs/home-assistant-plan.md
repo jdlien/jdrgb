@@ -1010,6 +1010,19 @@ differs from, or adds to, the plan above:
 | 8 | A brightness while off snapped a saved non-preset color | Plain `on`, as the plan says; test |
 | 9 | Hyphenated computer names fell outside the documented ACL | Hyphens kept; exact ACL printed and logged; test |
 
+**Implementation review, round 2** (on 0a2e2d9) — `FIX FIRST`; seven of the nine
+fixes confirmed, two problems found in the other two, both adopted:
+
+| # | Finding | Fix |
+|---|---|---|
+| 1 | The tray could still start a `jdrgb.exe` mid-install or mid-uninstall | Both installers stop it with the other callers, first; uninstall disables every task up front and re-enables them if it times out |
+| 2 | The repeat filter judged against the record alone, so a partial failure could make a correction look like a repeat | A repeat must also match what the previous *successful* strip leg wrote; `on_done` takes the child's outcome; test |
+
+Not adopted: mocked PowerShell tests for the installers — the repo has no
+PowerShell test harness; both scripts are parse-checked, their pre-elevation
+paths exercised, and the uninstaller's singleton probe checked against a live
+bridge.
+
 Still to do on the real install, in order: Phase 1 and 2 by hand on the LEDs
 (`--level` on both devices, choosing `MIN_LEVEL` by eye); then Phase 3
 acceptance (*Acceptance, in this house*); then the Hue dimmer and the scenes.
