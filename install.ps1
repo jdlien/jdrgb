@@ -6,12 +6,21 @@
   registers the Scheduled Tasks you ask for. Writes a log to install.log next to
   this script.
 
-  Nothing is installed unless you pass -Tray, -Boot, or both. Run it bare to
-  print the usage.
+  Nothing is installed unless you pass -Tray, -Ha, -Boot, or a combination. Run
+  it bare to print the usage.
 .PARAMETER Tray
   Install jdrgb-tray.exe and start it at logon: a notification-area menu for
   picking a preset colour. Runs as you, unelevated — the boot task runs as
   SYSTEM in session 0 and cannot show a tray icon, so they are separate tasks.
+.PARAMETER Ha
+  Install jdrgb-ha.exe and start it at logon: the Home Assistant bridge, which
+  makes the LEDs a light in HA over MQTT. Runs as you, unelevated, reading
+  %LOCALAPPDATA%\jdrgb\ha.conf. See docs/home-assistant-plan.md.
+
+  Never installed alongside the boot task: -Ha -Boot is an error, -Ha removes
+  an existing boot task (stopping it first if it is running), and -Boot refuses
+  while the bridge's task exists. The two would race at logon across accounts,
+  which the controller locks can't serialise.
 .PARAMETER Boot
   Register the boot task: run as SYSTEM at startup, at logon and on resume from
   sleep, setting the LEDs to a static color before anyone logs in.
@@ -38,8 +47,8 @@
 .PARAMETER All
   Boot task only: set both the motherboard strip and the GPU LEDs.
 .PARAMETER TrayUser
-  Internal. The SID of the user the tray task belongs to, captured before
-  elevation. Not meant to be passed by hand.
+  Internal. The SID of the user the tray and bridge tasks belong to, captured
+  before elevation. Not meant to be passed by hand.
 #>
 [CmdletBinding()]
 param(
@@ -50,6 +59,7 @@ param(
     [switch]$Gpu,
     [switch]$All,
     [switch]$Tray,
+    [switch]$Ha,
     [switch]$Boot,
     [string]$TrayUser = ""
 )
@@ -57,6 +67,7 @@ param(
 $ErrorActionPreference = "Stop"
 $TaskName = "jdrgb"
 $TrayTaskName = "jdrgb-tray"
+$HaTaskName = "jdrgb-ha"
 
 # --- Nothing is installed by default -----------------------------------------
 # Installing the boot task unasked is how this machine ended up with one quietly
@@ -69,8 +80,13 @@ function Show-Usage {
 jdrgb install - pick what to install; nothing happens without one of these.
 
   .\install.ps1 -Tray              the notification-area menu, at logon
+  .\install.ps1 -Ha                the Home Assistant bridge, at logon
+  .\install.ps1 -Tray -Ha          both of those
   .\install.ps1 -Boot              the SYSTEM boot task, default colour
-  .\install.ps1 -Tray -Boot        both
+  .\install.ps1 -Tray -Boot        the menu and the boot task
+
+-Ha and -Boot can't be installed together. The bridge reads
+%LOCALAPPDATA%\jdrgb\ha.conf; see docs/home-assistant-plan.md.
 
 Boot task options (each requires -Boot):
   -Color <name|RRGGBB>   colour to set at boot (default: coolwhite)
@@ -91,7 +107,7 @@ Remove everything with .\uninstall.ps1.
 "@
 }
 
-if (-not $Tray -and -not $Boot) {
+if (-not $Tray -and -not $Boot -and -not $Ha) {
     Show-Usage
     return
 }
@@ -99,6 +115,14 @@ if (-not $Tray -and -not $Boot) {
 # --- Reject combinations that would install a permanently failing task -------
 if ($Gpu -and $All) {
     throw "-Gpu and -All are mutually exclusive."
+}
+# The boot task runs as SYSTEM and the bridge as you, and the controller locks
+# can't serialise across accounts (the mutexes inherit their creator's DACL).
+# At logon both fire. Rather than fix that, the two are never installed together.
+if ($Ha -and $Boot) {
+    throw ("-Ha and -Boot can't be installed together: the SYSTEM boot task and the bridge would " +
+           "race at logon in a way the controller locks can't serialise. The color is held in " +
+           "flash anyway, so -Ha on its own is the usual choice.")
 }
 # These only ever configured the boot task. Silently ignoring them would look
 # like the color had been set up when nothing was listening.
@@ -130,15 +154,17 @@ if (-not $admin) {
     if ($NoWake) { $argList += "-NoWake" }
     if ($Gpu)    { $argList += "-Gpu" }
     if ($All)    { $argList += "-All" }
-    if ($Tray)   {
+    if ($Tray -or $Ha) {
         # Carry the *invoking* user's SID across the elevation boundary. If UAC
         # is answered with a different administrator's credentials, the elevated
         # process is that administrator — so reading the identity over there
-        # would register the tray for the wrong account, and it would never
-        # appear for the person who ran this.
+        # would register the tray (or the bridge) for the wrong account, and it
+        # would never run for the person who ran this.
         $sid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
-        $argList += @("-Tray", "-TrayUser", $sid)
+        $argList += @("-TrayUser", $sid)
     }
+    if ($Tray)   { $argList += "-Tray" }
+    if ($Ha)     { $argList += "-Ha" }
     if ($Boot)   { $argList += "-Boot" }
     if ($PSBoundParameters.ContainsKey("InstallDir")) { $argList += @("-InstallDir", "`"$InstallDir`"") }
     Start-Process -FilePath (Get-Process -Id $PID).Path -Verb RunAs -ArgumentList $argList
@@ -154,6 +180,13 @@ try { Start-Transcript -Path $log -Force | Out-Null } catch {}
 $failed = $false
 
 try {
+    # The other half of the exclusion, which only an elevated process can check:
+    # a per-user task isn't always visible to the user who isn't its admin.
+    if ($Boot -and (Get-ScheduledTask -TaskName $HaTaskName -ErrorAction SilentlyContinue)) {
+        throw ("the Home Assistant bridge is installed, and it can't run alongside the boot task. " +
+               "Remove it first with .\uninstall.ps1, or install without -Boot.")
+    }
+
     # Locate and copy the binary.
     $source = Join-Path $PSScriptRoot "target\release\jdrgb.exe"
     if (-not (Test-Path $source)) {
@@ -204,6 +237,23 @@ try {
             }
         Copy-Item -Path $traySource -Destination $trayTarget -Force
         Write-Host "Installed binary: $trayTarget"
+    }
+
+    $haTarget = Join-Path $InstallDir "jdrgb-ha.exe"
+    if ($Ha) {
+        $haSource = Join-Path $PSScriptRoot "target\release\jdrgb-ha.exe"
+        if (-not (Test-Path $haSource)) {
+            throw "jdrgb-ha.exe not found at $haSource. Build it first: cargo build --release"
+        }
+        # An upgrade has to stop the running bridge to replace its image. It has
+        # no window to close, so it is ended outright; its kill-on-close job
+        # takes any jdrgb.exe it was running with it. Matched on the full path so
+        # a development copy is left alone.
+        Get-Process -Name "jdrgb-ha" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -eq $haTarget } |
+            ForEach-Object { $_.Kill(); $_.WaitForExit(5000) | Out-Null }
+        Copy-Item -Path $haSource -Destination $haTarget -Force
+        Write-Host "Installed binary: $haTarget"
     }
 
     # --- The boot task, which only -Boot installs ----------------------------
@@ -279,6 +329,16 @@ try {
         # Upgrading an install that had one. Leaving it would keep writing flash
         # on every boot behind your back, and keep overwriting whatever you last
         # set — the exact thing that made this opt-in.
+        #
+        # A run in progress is stopped and waited out first: unregistering alone
+        # would leave its jdrgb.exe writing — and with -Ha, racing the bridge.
+        if ((Get-ScheduledTask -TaskName $TaskName).State -eq "Running") {
+            Stop-ScheduledTask -TaskName $TaskName
+            $deadline = (Get-Date).AddSeconds(90)
+            while ((Get-ScheduledTask -TaskName $TaskName).State -eq "Running" -and (Get-Date) -lt $deadline) {
+                Start-Sleep -Milliseconds 500
+            }
+        }
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
         Write-Host "Removed the existing boot task '$TaskName' (no -Boot)."
     }
@@ -319,9 +379,51 @@ try {
         }
     }
 
+    # --- The Home Assistant bridge, a per-user task like the tray -----------
+    if ($Ha) {
+        $sid = if ($TrayUser) { $TrayUser } else { ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value }
+        try {
+            $who = (New-Object Security.Principal.SecurityIdentifier($sid)).Translate([Security.Principal.NTAccount]).Value
+        } catch { $who = $sid }
+
+        # ha.conf lives in *that user's* profile, not the elevated admin's.
+        $profileDir = (Get-CimInstance Win32_UserProfile -Filter "SID='$sid'" -ErrorAction SilentlyContinue).LocalPath
+        $haConf = if ($profileDir) { Join-Path $profileDir "AppData\Local\jdrgb\ha.conf" } else { $null }
+        $haLog = if ($haConf) { Join-Path (Split-Path $haConf) "ha.log" } else { "%LOCALAPPDATA%\jdrgb\ha.log" }
+
+        $haAction = New-ScheduledTaskAction -Execute $haTarget
+        $haPrincipal = New-ScheduledTaskPrincipal -UserId $sid -LogonType Interactive -RunLevel Limited
+        $haSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+                          -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero)
+        $haTrigger = New-ScheduledTaskTrigger -AtLogOn -User $sid
+        Register-ScheduledTask -TaskName $HaTaskName -Action $haAction -Trigger $haTrigger `
+            -Principal $haPrincipal -Settings $haSettings -Force `
+            -Description "jdrgb Home Assistant bridge: the LEDs as an HA light over MQTT." | Out-Null
+        Write-Host "Registered task '$HaTaskName' to start at logon for $who."
+
+        if ($haConf -and -not (Test-Path $haConf)) {
+            Write-Warning "No bridge config yet at $haConf. Create it with:"
+            Write-Host "    host=<the broker's LAN address>"
+            Write-Host "    port=1884"
+            Write-Host "  (user= and password= only if your broker wants them; name= to rename the light)"
+            Write-Host "  then start the bridge: Start-ScheduledTask -TaskName $HaTaskName"
+        } else {
+            Start-ScheduledTask -TaskName $HaTaskName
+            Start-Sleep -Milliseconds 1500
+            if (Get-Process -Name "jdrgb-ha" -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $haTarget }) {
+                Write-Host "The bridge is running. Its log: $haLog"
+            } else {
+                Write-Warning "The bridge task started but the process isn't running — see $haLog"
+            }
+        }
+    }
+
     if (-not $Boot) {
+        $parts = @()
+        if ($Tray) { $parts += "the tray" }
+        if ($Ha) { $parts += "the Home Assistant bridge" }
         Write-Host ""
-        Write-Host "SUCCESS. The tray will start at logon."
+        Write-Host "SUCCESS. $($parts -join ' and ') will start at logon."
         Write-Host "No boot task: the color is already held in the controllers' flash, so it"
         Write-Host "survives a cold boot on its own. Set it once with jdrgb and leave it."
         return

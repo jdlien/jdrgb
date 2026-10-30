@@ -669,6 +669,132 @@ boot the menu says "not set from here" rather than naming the color you're
 looking at — it knows what you set from the tray or from a terminal, and
 nothing else. The first pick from the menu syncs it up.
 
+## Home Assistant (optional)
+
+`jdrgb-ha.exe` makes the LEDs a light in Home Assistant — on/off, the presets as
+effects, a color wheel, white temperature and brightness — so a Hue dimmer, a
+scene, or Apple Home through HA's HomeKit Bridge can drive them like any other
+bulb. The design, and every decision behind it, is in
+`docs/home-assistant-plan.md`.
+
+It is a third binary and a third per-user logon task, like the tray, and like
+the tray it never touches hardware: it spawns `jdrgb.exe`. It connects *out* to
+an MQTT broker, so nothing listens on the PC. One bridge per machine.
+
+```powershell
+.\install.ps1 -Ha          # or -Tray -Ha for both
+```
+
+`-Ha` and `-Boot` can't be installed together (see *Being a good neighbour on
+the bus*); `-Ha` removes an existing boot task.
+
+### Configuring it
+
+`%LOCALAPPDATA%\jdrgb\ha.conf`:
+
+```
+host=<the broker's LAN address>
+port=1884
+```
+
+| Key | |
+|---|---|
+| `host` | required: the broker |
+| `port` | default 1883 |
+| `name` | the device's name in HA, which names the entity. Default: the computer's name plus "LEDs" — `light.desk_leds` on a PC called DESK |
+| `user`, `password` | only if the broker wants a login. Without them the bridge connects anonymously, so no secret lives on the PC |
+| `mode` | `wheel` (default), or `presets` for on/off and effects only — the fallback if a client fights the snapped color wheel |
+
+The broker needs an ACL entry for the bridge, with `<name>` the computer's
+lowercased name:
+
+```
+topic readwrite jdrgb/jdrgb_<name>/#
+topic write     homeassistant/light/jdrgb_<name>/#
+topic read      homeassistant/status
+```
+
+`readwrite` on the first line, because the bridge subscribes to its own command
+topic there. On an anonymous listener those lines join an allowlist every
+anonymous client shares; the ACL bounds what anonymous LAN clients can do as a
+group, it doesn't isolate one from another.
+
+Some brokers — Mosquitto 2.0 among them — grant a subscription their ACL denies
+and quietly deliver nothing, and no MQTT 3.1.1 broker can refuse a publish. So
+before it goes online the bridge publishes a random value to its own
+`jdrgb/jdrgb_<name>/echo` and waits for it to come back. If it doesn't, the
+light stays unavailable and `ha.log` says the ACL looks wrong.
+
+Its log is `%LOCALAPPDATA%\jdrgb\ha.log`. There is nowhere else for an error to
+go.
+
+### What Home Assistant sees
+
+- **Effects** are the 29 presets by name. Picking one sends the *name* to
+  `jdrgb.exe`, so each device gets its own calibration.
+- **The color wheel and the white-temperature slider snap to presets.** The
+  calibration tables are points, not a continuous function, so the wheel lands
+  on the nearest preset and the light reports where it really is. White
+  temperature has two stops, Warm White at 2700 K and Cool White at 6500 K,
+  split near 3815 K.
+- **Brightness** is `--level`, mapped onto `MIN_LEVEL` (10%, provisional) to
+  100%.
+- A hand-tuned hex or a per-LED pattern shows as on, with no effect, and its
+  color reported as an approximation.
+
+### The card follows the strip
+
+Every command goes to the strip at once. The card replays the same command once
+the light has been quiet for 5 seconds, and the bridge never writes the card
+more than once a minute — two GPU writes seconds apart once glitched the
+display. So the dimmer's off turns the strip off at once and the card a few
+seconds later, and twenty presses of brightness-up step the strip twenty times
+and the card once. While the card is catching up, HA is shown the strip's state.
+
+Nothing ever overrides a later decision: if the tray, a terminal or a UPS hook
+changes the lights in between, the card's pending follow is dropped and HA is
+shown what is really there. A runaway automation is capped at 30 strip changes,
+refilling one a minute; an `off` still gets through once every 5 minutes.
+
+### The Hue dimmer
+
+Keep the dimmer paired to the Hue Bridge, so the room lights keep their native
+response, and add an automation on its `hue_event` — check the exact event data
+under Developer Tools → Events, listening for `hue_event`:
+
+```yaml
+automation:
+  - alias: Dimmer drives the PC LEDs
+    triggers:
+      - trigger: event
+        event_type: hue_event
+        event_data: { device_id: <the dimmer's device id>, type: short_release }
+    actions:
+      - choose:
+          - conditions: "{{ trigger.event.data.subtype == 1 }}"   # on/off
+            sequence: [{ action: light.toggle, target: { entity_id: light.desk_leds } }]
+          - conditions: "{{ trigger.event.data.subtype == 2 }}"   # brighter
+            sequence: [{ action: light.turn_on, target: { entity_id: light.desk_leds }, data: { brightness_step_pct: 10 } }]
+          - conditions: "{{ trigger.event.data.subtype == 3 }}"   # dimmer
+            sequence: [{ action: light.turn_on, target: { entity_id: light.desk_leds }, data: { brightness_step_pct: -10 } }]
+```
+
+HA's Hue integration delivers at most one event per second per remote, which
+suits a light whose card is paced anyway.
+
+### Scenes
+
+A `scene.create` snapshot restores as `{"state":"ON","effect":"<preset>"}`, so a
+restored scene comes back as exactly the preset it was. Scripts that set the
+light directly should name an effect rather than a color — the wheel would snap
+it anyway. A scene that includes the light while the PC sleeps simply skips it.
+
+### Removing it
+
+`.\uninstall.ps1` stops the bridge, removes the light from Home Assistant
+(`jdrgb-ha.exe --unpublish`), and then the task and binary. It leaves `ha.conf`
+where it is, since on an install that uses one it holds a password.
+
 ## How it works
 
 The ASUS Aura USB controller speaks a simple HID protocol: 65-byte reports whose

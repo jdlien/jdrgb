@@ -1,10 +1,11 @@
 # Plan: the LEDs as a Home Assistant light
 
-Status: **ready to implement.** Written 2026-10-29 and revised the same night
-through eight rounds of external review — the last returning READY — and
-feedback and live checks from the house's own HA setup (Appendix B). The work —
-starting with the `off`/`on` pair it builds on — happens on the `home-assistant`
-branch.
+Status: **implemented on the `home-assistant` branch; acceptance on the real
+install pending.** Written 2026-10-29 and revised the same night through eight
+rounds of external review — the last returning READY — and feedback and live
+checks from the house's own HA setup (Appendix B). Phases 1–5 are built and
+tested without hardware; where the build departs from or adds to this plan,
+*Implementation notes* below says so.
 
 The consumer is this house's Home Assistant, and through it a Hue dimmer switch
 and Apple Home (via HA's HomeKit Bridge). The goal is that the PC's LEDs show
@@ -934,7 +935,49 @@ worth pinning down:
    apart glitched" and "minutes apart didn't", like the CLI's own 1500 ms. Lower
    them only on evidence.
 3. **The HomeKit wheel with a snapped echo.** Verify Apple Home settles on the
-   reported color rather than fighting it.
+   reported color rather than fighting it. If it fights, `mode=presets` in
+   `ha.conf` (below) is the fallback.
+
+## Implementation notes
+
+Built on the `home-assistant` branch, 2026-10-29, all without touching hardware:
+every CLI run had `JDRGB_NO_HW=1`, and nothing was installed. Where the build
+differs from, or adds to, the plan above:
+
+- **Levels 1 and 2 shipped together.** The light is the full one — wheel, white
+  temperature, brightness, effects — and `mode=presets` in `ha.conf` drops back
+  to the level-1 payload (`onoff`, effects only). Added for open question 3: if
+  Apple Home fights the snapped echo, that is a one-line way out without a
+  rebuild.
+- **`on` looks twice.** The plan has `on` decide under each device's lock; it
+  also first checks the record unlocked, so that with nothing off it opens no
+  device — opening the strip sends a config request, which a redundant press
+  shouldn't cost. A device that looks off is re-decided under its lock.
+- **The bridge skips spawning a no-op.** A plain `ON` with the strip already
+  lit, and an `on --gpu` follow for a card that isn't off, are decided in the
+  bridge rather than by spawning a `jdrgb on` that would open nothing. Same
+  outcome, one process fewer.
+- **A record that can't be written** is reported by `jdrgb.exe` at exit
+  (`palette::record_failed`), not printed from `palette.rs`, which stays
+  print-free. The bridge logs a successful child's stderr as a warning.
+- **The state lock** is std's `File::try_lock` on `state.lock` — `LockFileEx`
+  underneath — in a bounded retry loop, rather than raw `LockFileEx`.
+- **Brightness 0** from HA is treated as 1, the bottom of the slider; HA sends
+  `OFF` for off.
+- **Sizes,** release: `jdrgb.exe` 260,608 bytes and `jdrgb-tray.exe` 249,856,
+  both identical before and after `rumqttc` was added; `jdrgb-ha.exe` 462,848.
+- **Tests** (all hardware-free): the strip lock, the state file under threads
+  and torn reads, stash identity, `--level` and the exhaustive `MIN_LEVEL`
+  collision check, recognition across every device/preset/level, wheel and
+  kelvin snapping, the model's worked cases on a fake clock, the lifecycle stage
+  machine with forced queue refusals, the slot's publish ordering under two
+  threads, the job object ending a child, and the real `rumqttc` client against
+  a fake broker — a healthy one, one that grants but never delivers, one that
+  refuses, and `--unpublish`.
+
+Still to do on the real install, in order: Phase 1 and 2 by hand on the LEDs
+(`--level` on both devices, choosing `MIN_LEVEL` by eye); then Phase 3
+acceptance (*Acceptance, in this house*); then the Hue dimmer and the scenes.
 
 ## Appendix A — verified findings
 

@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
-  Remove the jdrgb scheduled task and installed binary.
+  Remove the jdrgb scheduled tasks and installed binaries — and, if the Home
+  Assistant bridge was installed, the light it created in Home Assistant.
 #>
 [CmdletBinding()]
 param(
@@ -10,6 +11,7 @@ param(
 $ErrorActionPreference = "Stop"
 $TaskName = "jdrgb"
 $TrayTaskName = "jdrgb-tray"
+$HaTaskName = "jdrgb-ha"
 
 # --- Self-elevate if not running as Administrator ---------------------------
 $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -21,7 +23,67 @@ if (-not $admin) {
     return
 }
 
-foreach ($name in @($TaskName, $TrayTaskName)) {
+# --- The Home Assistant bridge goes first, and in order ----------------------
+# 1. Stop it, and wait until neither it nor any jdrgb.exe it started is running:
+#    a cleanup racing a resident would have the resident republish the entity.
+# 2. Delete the light from HA with `jdrgb-ha.exe --unpublish`, using the config
+#    of the user the bridge ran as.
+# 3. Only then remove its task and binary, below.
+$haTask = Get-ScheduledTask -TaskName $HaTaskName -ErrorAction SilentlyContinue
+$haConf = $null
+if ($haTask) {
+    # Whose ha.conf: the task's own principal, which may be stored as a SID or
+    # as an account name.
+    $principal = $haTask.Principal.UserId
+    $sid = $principal
+    if ($principal -notmatch '^S-1-') {
+        try { $sid = (New-Object Security.Principal.NTAccount($principal)).Translate([Security.Principal.SecurityIdentifier]).Value } catch {}
+    }
+    $profileDir = (Get-CimInstance Win32_UserProfile -Filter "SID='$sid'" -ErrorAction SilentlyContinue).LocalPath
+    if ($profileDir) { $haConf = Join-Path $profileDir "AppData\Local\jdrgb\ha.conf" }
+
+    Disable-ScheduledTask -TaskName $HaTaskName -ErrorAction SilentlyContinue | Out-Null
+    Stop-ScheduledTask -TaskName $HaTaskName -ErrorAction SilentlyContinue
+}
+
+$haExe = $null
+try { $haExe = Join-Path (Resolve-Path -LiteralPath $InstallDir -ErrorAction Stop).ProviderPath "jdrgb-ha.exe" } catch {}
+if ($haExe) {
+    $cliExe = Join-Path (Split-Path $haExe) "jdrgb.exe"
+    # Ending the bridge ends its children too — it runs them in a kill-on-close
+    # job — but wait for both to be gone rather than assume it.
+    Get-Process -Name "jdrgb-ha" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -eq $haExe } |
+        ForEach-Object { $_.Kill(); Write-Host "Stopped the running bridge." }
+    $deadline = (Get-Date).AddSeconds(30)
+    while ((Get-Date) -lt $deadline -and
+           (Get-Process -Name "jdrgb-ha", "jdrgb" -ErrorAction SilentlyContinue |
+                Where-Object { $_.Path -eq $haExe -or $_.Path -eq $cliExe })) {
+        Start-Sleep -Milliseconds 250
+    }
+
+    if ((Test-Path -LiteralPath $haExe) -and $haConf -and (Test-Path -LiteralPath $haConf)) {
+        Write-Host "Removing the light from Home Assistant..."
+        $errFile = [IO.Path]::GetTempFileName()
+        # A windows-subsystem program: Start-Process -Wait is what makes PowerShell
+        # wait for it and hand back its exit code.
+        $p = Start-Process -FilePath $haExe -ArgumentList @("--unpublish", "--config", "`"$haConf`"") `
+                 -Wait -PassThru -NoNewWindow -RedirectStandardError $errFile
+        $err = (Get-Content -LiteralPath $errFile -Raw -ErrorAction SilentlyContinue)
+        Remove-Item -LiteralPath $errFile -Force -ErrorAction SilentlyContinue
+        if ($p.ExitCode -eq 0) {
+            Write-Host "Removed the light from Home Assistant."
+        } else {
+            Write-Warning "Couldn't remove the light from Home Assistant (exit $($p.ExitCode)): $err"
+            Write-Warning "Delete the device by hand under Settings > Devices > MQTT in Home Assistant."
+        }
+    } elseif ($haTask) {
+        Write-Warning "No bridge config found, so the light was not removed from Home Assistant."
+        Write-Warning "Delete the device by hand under Settings > Devices > MQTT in Home Assistant."
+    }
+}
+
+foreach ($name in @($TaskName, $TrayTaskName, $HaTaskName)) {
     if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
         Unregister-ScheduledTask -TaskName $name -Confirm:$false
         Write-Host "Removed scheduled task '$name'."
@@ -37,7 +99,7 @@ foreach ($name in @($TaskName, $TrayTaskName)) {
 # Instead: resolve the path, require our own binary in it as proof it's really an
 # install, delete the known artifacts by literal path, and only drop the
 # directory itself once it's empty.
-$Artifacts = @("jdrgb.exe", "jdrgb-tray.exe", "leds.conf")
+$Artifacts = @("jdrgb.exe", "jdrgb-tray.exe", "jdrgb-ha.exe", "leds.conf")
 
 $resolved = $null
 try { $resolved = (Resolve-Path -LiteralPath $InstallDir -ErrorAction Stop).ProviderPath } catch {}
@@ -81,6 +143,12 @@ else {
     } else {
         Write-Host "Left $resolved in place — it still contains $($leftover.Count) file(s) jdrgb did not install."
     }
+}
+
+if ($haConf -and (Test-Path -LiteralPath $haConf)) {
+    # Left on purpose: on an install that uses one it holds a password, which is
+    # for its owner to keep or delete deliberately.
+    Write-Host "Left the bridge's config in place: $haConf"
 }
 
 Write-Host "Uninstalled. (LEDs keep their current color until the next cold boot.)"
