@@ -270,6 +270,40 @@ pub fn lookup_preset(name: &str) -> Option<(u8, u8, u8)> {
     PRESETS.iter().find(|(n, _)| *n == name).map(|&(_, rgb)| rgb)
 }
 
+// ---------------------------------------------------------------------------
+// Brightness
+// ---------------------------------------------------------------------------
+
+/// Dim a device's own value to `level` percent: each channel becomes
+/// `(c × level + 50) / 100`, in integers.
+///
+/// Always applied *after* `Paint::rgb` has resolved the preset for the device,
+/// never before: scaling the shared value and then calibrating would dim the
+/// strip's value on the card, which is a different color there. And a plain
+/// multiplier, because the LEDs are PWM-driven, so equal scaling should keep the
+/// ratios — and with them the color — until the 8-bit channels run out of room.
+/// Whether a slider wants a perceptual curve is a question for whatever drives
+/// this, not for `--level`.
+pub fn scale(rgb: (u8, u8, u8), level: u8) -> (u8, u8, u8) {
+    let l = u32::from(level.min(100));
+    let s = |c: u8| ((u32::from(c) * l + 50) / 100) as u8;
+    (s(rgb.0), s(rgb.1), s(rgb.2))
+}
+
+/// The lowest level a slider should reach. Below it the 8-bit channels lose
+/// their ratios — `coolwhite` at 2% is `(5,4,4)` — and presets start rounding
+/// to the same bytes, so a dimmed value can no longer say which preset it was.
+///
+/// **Provisional.** 10 is the lowest floor at which no two presets share a
+/// wire value at any level on either device (`no_two_presets_share_a_wire_value
+/// from_min_level_up` pins that; Cerise and Hot Pink both become `(23,0,2)` on
+/// the card at 9). Whether 10% still *looks* like the right color on both
+/// devices is a question for the eye, and the answer may raise it.
+///
+/// The CLI accepts the whole 1–100 range; this is the floor the Home Assistant
+/// bridge maps its brightness slider onto.
+pub const MIN_LEVEL: u8 = 10;
+
 /// Resolve a preset name (case-insensitive) or an `RRGGBB` hex string.
 pub fn parse_paint(s: &str) -> Option<Paint> {
     let lower = s.to_ascii_lowercase();
@@ -1283,6 +1317,53 @@ mod tests {
         assert!(started.elapsed() < STATE_LOCK_WAIT * 3, "waited far longer than the bound");
         drop(held);
         assert!(update_at(&path, |s| s.record(false, Last::Off)), "the lock wasn't released");
+    }
+
+    // ---- brightness ------------------------------------------------------
+
+    #[test]
+    fn scale_is_identity_at_100_and_rounds_half_up() {
+        assert_eq!(scale(WARM, 100), WARM);
+        assert_eq!(scale((255, 255, 255), 50), (128, 128, 128), "127.5 rounds up");
+        assert_eq!(scale((255, 176, 208), 2), (5, 4, 4), "coolwhite at 2% — why MIN_LEVEL exists");
+        assert_eq!(scale((10, 20, 30), 0), (0, 0, 0));
+        assert_eq!(scale(WARM, 200), WARM, "a level above 100 is clamped, never brightened");
+    }
+
+    /// Calibrate, then dim. Dimming the shared value and calibrating after
+    /// would hand the card the strip's color at 40%.
+    #[test]
+    fn a_dimmed_preset_is_each_devices_own_value_dimmed() {
+        let p = Paint::Preset("warmwhite");
+        assert_eq!(scale(p.rgb(true), 40), scale((0xFF, 0x56, 0x0A), 40));
+        assert_ne!(scale(p.rgb(true), 40), scale(p.rgb(false), 40));
+    }
+
+    /// What `MIN_LEVEL` rests on: from it up, no wire value on either device
+    /// could have come from two different presets, at any pair of levels. Below
+    /// it, recognising which preset a dimmed value was stops being possible.
+    #[test]
+    fn no_two_presets_share_a_wire_value_from_min_level_up() {
+        for gpu in [false, true] {
+            let mut seen: std::collections::HashMap<(u8, u8, u8), &str> = Default::default();
+            for &(name, _) in PRESETS {
+                let rgb = Paint::Preset(name).rgb(gpu);
+                for level in MIN_LEVEL..=100 {
+                    if let Some(other) = seen.insert(scale(rgb, level), name) {
+                        assert_eq!(other, name, "{name} and {other} collide at {level}% (gpu={gpu})");
+                    }
+                }
+            }
+        }
+    }
+
+    /// And the floor is not lower than it needs to be: one step down, the
+    /// collision that set it is real.
+    #[test]
+    fn one_below_min_level_two_presets_collide() {
+        let cerise = Paint::Preset("cerise").rgb(true);
+        let hotpink = Paint::Preset("hotpink").rgb(true);
+        assert_eq!(scale(cerise, MIN_LEVEL - 1), scale(hotpink, MIN_LEVEL - 1));
     }
 
     // ---- stash identity ---------------------------------------------------

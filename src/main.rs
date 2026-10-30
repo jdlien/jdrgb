@@ -137,12 +137,21 @@ fn main() -> ExitCode {
         (false, false) => Target::Mb,
     };
 
+    let (level, rest) = match take_level(&args) {
+        Ok(split) => split,
+        Err(e) => {
+            eprintln!("jdrgb: {e}\n");
+            print_help();
+            return ExitCode::FAILURE;
+        }
+    };
+
     // Filter the known flags by name — a blanket "--" filter would swallow
     // --help and --version, which parse() handles as positional words.
-    let positional: Vec<&str> = args
+    let positional: Vec<&str> = rest
         .iter()
-        .filter(|a| !matches!(a.as_str(), "--wait" | "--gpu" | "--all" | "--force" | "--stash"))
-        .map(String::as_str)
+        .copied()
+        .filter(|a| !matches!(*a, "--wait" | "--gpu" | "--all" | "--force" | "--stash"))
         .collect();
 
     let command = match parse(&positional) {
@@ -153,6 +162,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    if level.is_some() && !takes_level(&command) {
+        eprintln!("jdrgb: --level applies to a solid color, e.g. `jdrgb warmwhite --level 40`");
+        return ExitCode::FAILURE;
+    }
 
     if let (Some(name), false) = (mb_only(&command), target == Target::Mb) {
         eprintln!("jdrgb: `{name}` is motherboard-only — drop --gpu/--all");
@@ -182,7 +196,7 @@ fn main() -> ExitCode {
         Command::Presets => list_presets(),
         Command::Probe => probe(target),
         Command::Save => save_gpu_flash(target),
-        Command::Solid(mode, color) => set_solid_targets(target, wait, mode, color),
+        Command::Solid(mode, color) => set_solid_targets(target, wait, mode, color, level),
         Command::Rainbow(n) => with_retry(wait, || set_rainbow(n)).map(|()| {
             println!("jdrgb: rainbow across {n} LEDs (white end-caps)");
         }),
@@ -230,6 +244,46 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// Pull `--level N` (or `--level=N`) out of the arguments, returning the level
+/// and everything else. It is the one flag that takes a value, so it has to come
+/// out before the rest are filtered by name.
+fn take_level(args: &[String]) -> Result<(Option<u8>, Vec<&str>), String> {
+    let mut level = None;
+    let mut rest = Vec::new();
+    let mut it = args.iter().map(String::as_str);
+    while let Some(a) = it.next() {
+        let value = if a == "--level" {
+            Some(it.next().ok_or("--level needs a value, 1 to 100")?)
+        } else {
+            a.strip_prefix("--level=")
+        };
+        match value {
+            Some(v) => {
+                if level.is_some() {
+                    return Err("--level given twice".into());
+                }
+                level = Some(parse_level(v)?);
+            }
+            None => rest.push(a),
+        }
+    }
+    Ok((level, rest))
+}
+
+fn parse_level(s: &str) -> Result<u8, String> {
+    match s.trim_end_matches('%').parse::<u8>() {
+        Ok(n @ 1..=100) => Ok(n),
+        _ => Err(format!("--level takes 1 to 100, not '{s}'")),
+    }
+}
+
+/// Whether `--level` means anything for this command. Only a solid color can be
+/// dimmed: `off` has nothing to scale, and `on`, `load` and `restore` put back
+/// recorded values, which already carry whatever level they were set at.
+fn takes_level(command: &Command) -> bool {
+    matches!(command, Command::Solid(MODE_STATIC, _))
 }
 
 fn parse(args: &[&str]) -> Result<Command, String> {
@@ -373,13 +427,20 @@ fn with_retry<T, E: Retryable>(wait: bool, mut f: impl FnMut() -> Result<T, E>) 
 // Multi-target dispatch
 // ---------------------------------------------------------------------------
 
-/// Set a solid color on every requested target.
+/// A device's resolved color at `level` percent, or as-is without one. Called
+/// with the value `Paint::rgb` already resolved for that device — calibrate
+/// first, then dim (see `palette::scale`).
+fn dim(rgb: (u8, u8, u8), level: Option<u8>) -> (u8, u8, u8) {
+    level.map_or(rgb, |l| scale(rgb, l))
+}
+
+/// Set a solid color on every requested target, dimmed to `level` if given.
 ///
 /// The two phases matter: discovery is retried until everything is ready, then
 /// each target is written exactly once. Retrying the *write* instead would
 /// re-issue the motherboard's flash commit on every attempt while waiting for
 /// the GPU to come up — hammering flash that has finite write cycles.
-fn set_solid_targets(target: Target, wait: bool, mode: u8, paint: Paint) -> Result<(), String> {
+fn set_solid_targets(target: Target, wait: bool, mode: u8, paint: Paint, level: Option<u8>) -> Result<(), String> {
     // Label each line only when there's more than one device to tell apart, so
     // plain `jdrgb warmwhite` prints exactly what it always has.
     let labelled = target == Target::All;
@@ -396,7 +457,7 @@ fn set_solid_targets(target: Target, wait: bool, mode: u8, paint: Paint) -> Resu
 
     for attempt in 0..tries {
         if !mb_ok {
-            let color = paint.rgb(false);
+            let color = dim(paint.rgb(false), level);
             match set_solid(mode, color) {
                 Ok(()) => {
                     report(labelled.then_some("mb"), mode, color);
@@ -406,7 +467,7 @@ fn set_solid_targets(target: Target, wait: bool, mode: u8, paint: Paint) -> Resu
             }
         }
         if !gpu_ok && !gpu_hopeless {
-            let color = paint.rgb(true);
+            let color = dim(paint.rgb(true), level);
             match apply_gpu_solid(mode, color) {
                 Ok(()) => {
                     report(labelled.then_some("gpu"), mode, color);
@@ -1329,7 +1390,7 @@ fn restore(target: Target, fallback: Option<Paint>, wait: bool) -> Result<(), St
             Ok(())
         }
         None => match fallback {
-            Some(p) => set_solid_targets(target, wait, MODE_STATIC, p),
+            Some(p) => set_solid_targets(target, wait, MODE_STATIC, p, None),
             None => {
                 println!("jdrgb: nothing stashed, leaving the lights alone");
                 Ok(())
@@ -2094,6 +2155,7 @@ fn print_help() {
          \x20 --gpu                 act on the GPU LEDs instead of the motherboard\n\
          \x20 --all                 act on both\n\
          \x20 --stash               before setting a color, save what's showing for `restore`\n\
+         \x20 --level N             dim a solid color to N percent (1-100), after per-device calibration\n\
          \n\
          TARGETS:\n\
          \x20 Without --gpu/--all, everything targets the motherboard strip, as always.\n\
@@ -2409,6 +2471,54 @@ mod tests {
         assert!(matches!(parse(&["on", "warmwhite"]), Ok(Command::On(Some(Paint::Preset("warmwhite"))))));
         assert!(parse(&["on", "nonsense"]).is_err());
         assert!(!is_apply(&Command::On(None)), "pressing on mid-outage would drop the UPS stash");
+    }
+
+    fn level_of(args: &[&str]) -> Result<(Option<u8>, Vec<String>), String> {
+        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        take_level(&owned).map(|(l, rest)| (l, rest.into_iter().map(str::to_string).collect()))
+    }
+
+    #[test]
+    fn level_comes_out_of_the_arguments_in_either_spelling() {
+        assert_eq!(level_of(&["warmwhite", "--level", "40", "--all"]).unwrap(), (Some(40), vec!["warmwhite".into(), "--all".into()]));
+        assert_eq!(level_of(&["--level=40%", "red"]).unwrap(), (Some(40), vec!["red".into()]));
+        assert_eq!(level_of(&["red"]).unwrap(), (None, vec!["red".into()]));
+    }
+
+    #[test]
+    fn level_is_bounded_and_needs_a_value() {
+        for bad in ["0", "101", "-5", "forty", ""] {
+            assert!(level_of(&["red", "--level", bad]).is_err(), "accepted --level {bad:?}");
+        }
+        assert!(level_of(&["red", "--level"]).is_err(), "a trailing --level with no value");
+        assert!(level_of(&["red", "--level", "40", "--level", "50"]).is_err(), "given twice");
+        assert_eq!(level_of(&["red", "--level", "1"]).unwrap().0, Some(1), "the CLI takes the whole range");
+    }
+
+    /// `off` has nothing to dim, and `on`, `load` and `restore` put back values
+    /// that already carry their level. Silently ignoring the flag there would
+    /// look like it had worked.
+    #[test]
+    fn only_a_solid_color_takes_a_level() {
+        assert!(takes_level(&Command::Solid(MODE_STATIC, Paint::Preset("red"))));
+        assert!(takes_level(&parse(&[]).unwrap()), "bare `jdrgb` is the default color");
+        for c in [
+            Command::Solid(MODE_OFF, Paint::Literal((0, 0, 0))),
+            Command::On(None),
+            Command::Load("x".into()),
+            Command::Restore(None),
+            Command::Rainbow(38),
+            Command::Tune(None),
+            Command::Preview,
+        ] {
+            assert!(!takes_level(&c));
+        }
+    }
+
+    #[test]
+    fn dim_without_a_level_is_the_value_itself() {
+        assert_eq!(dim((0xFA, 0x95, 0x36), None), (0xFA, 0x95, 0x36));
+        assert_eq!(dim((0xFA, 0x95, 0x36), Some(50)), scale((0xFA, 0x95, 0x36), 50));
     }
 
     #[test]

@@ -58,6 +58,7 @@ jdrgb --help
   --gpu               act on the GPU LEDs instead of the motherboard
   --all               act on both
   --stash             before setting a color, save what's showing for `restore`
+  --level N           dim a solid color to N percent (1-100), after calibration
 ```
 
 ### Targets
@@ -409,6 +410,30 @@ hook is waiting to restore. The two cooperate in the other direction too. Turn
 the lights off, let a UPS hook paint them amber with `--stash`, and when mains
 `restore`s them to off, `on` still brings back the color they were turned off
 from, not the amber.
+
+### Brightness: `--level`
+
+```powershell
+jdrgb warmwhite --all --level 40    # warm white at 40%, on both
+```
+
+Each device resolves the preset with its own calibration *first*, and then every
+channel is scaled — `(c × N + 50) / 100`. The order matters: dimming the shared
+value and calibrating afterwards would dim the strip's warm white on the card,
+which is a different color there. The dimmed value is what goes on the wire and
+what gets recorded, so `state`, `load`, `--stash`/`restore` and `off`/`on` all
+carry it through unchanged.
+
+It is a plain multiplier, which keeps a color's ratios until the 8-bit channels
+run out of room: `coolwhite` at 2% is `(5,4,4)`, and presets start rounding to
+the same bytes. The CLI takes the whole 1–100 range anyway; `MIN_LEVEL` in
+`src/palette.rs` (10 for now — the lowest level at which no two presets share a
+value on either device) is the floor anything driving a slider should map onto.
+Whether 10% still looks like the right color is a question for the eye.
+
+`--level` applies to a solid color only. `off` has nothing to dim, and `on`,
+`load` and `restore` put back recorded values that already carry their level —
+so with those it's an error rather than a flag that silently does nothing.
 
 ### Tuning a color
 
