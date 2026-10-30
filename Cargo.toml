@@ -18,6 +18,13 @@ path = "src/main.rs"
 name = "jdrgb-tray"
 path = "src/tray/main.rs"
 
+# The Home Assistant bridge: a resident MQTT client that spawns jdrgb.exe.
+# See docs/home-assistant-plan.md. Its dependencies below are linked into this
+# binary only — jdrgb.exe and jdrgb-tray.exe reference none of them.
+[[bin]]
+name = "jdrgb-ha"
+path = "src/ha/main.rs"
+
 [dependencies]
 # No hidapi. Its enumeration opens every HID device on the machine and asks the
 # matching ones for their string descriptors, which wedged a UPS — and the crate
@@ -41,7 +48,15 @@ windows-sys = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     "Win32_System_Threading",
     "Win32_Security", # CreateMutexW takes a SECURITY_ATTRIBUTES pointer
+    "Win32_System_JobObjects", # jdrgb-ha only: its children die with it
 ] }
+
+# jdrgb-ha only. MQTT with its default features off, which drops rustls: the
+# broker is on the LAN, and the plan's threat model doesn't need TLS. It brings
+# tokio underneath its synchronous API; the plan weighs that against hand-writing
+# MQTT framing, keepalive and reconnect, and lands here.
+rumqttc = { version = "0.25.1", default-features = false }
+serde_json = "1"
 
 [profile.release]
 opt-level = "z"     # optimize for size
@@ -49,3 +64,8 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[dev-dependencies]
+# The fake MQTT broker in jdrgb-ha's tests frames packets with rumqttc's own
+# codec, which works on `bytes::BytesMut`. Already in the tree via rumqttc.
+bytes = "1"
