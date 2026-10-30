@@ -836,6 +836,14 @@ The strip goes off and comes back, and the card is never touched — the second
 press saw `OFF`, because the pending follow made the strip's state the
 reported one.
 
+Acceptance check for dimming: five brightness-up presses about a second apart
+step the strip five times. HA doesn't send `brightness_step_pct` as a step: it
+computes an absolute brightness from the last *reported* state, so a press that
+arrives before the previous strip leg's state is published is computed from the
+stale value, and two presses collapse into one. At one Hue event per second and
+a 250 ms settle it should hold; if presses collapse, the fix is publishing state
+sooner, not changing HA.
+
 ### Scenes (documentation and acceptance, not code)
 
 The house's Studio scenes — `script.studio_off`, and Relax / Bright / Synthwave
@@ -966,6 +974,15 @@ differs from, or adds to, the plan above:
   `OFF` for off.
 - **Sizes,** release: `jdrgb.exe` 260,608 bytes and `jdrgb-tray.exe` 249,856,
   both identical before and after `rumqttc` was added; `jdrgb-ha.exe` 462,848.
+  After the implementation review's fixes: 261,120 (the stash-locking change in
+  `main.rs`), 249,856 unchanged, and 464,384.
+- **Topic ids keep hyphens.** The plan's `<name>` is "the lowercased computer
+  name"; turning `-` into `_` put a hyphenated PC outside its own documented ACL.
+  The installer prints the exact ACL lines and the bridge logs them at start.
+- **A SUBACK timeout** (30 s, then subscribe again) and clearing `rumqttc`'s
+  buffered events on every disconnect, neither in the plan: `MqttState::clean`
+  leaves events queued for the dead connection, and a stale `Outgoing::Subscribe`
+  could otherwise be taken for the new connection's and strand it.
 - **Tests** (all hardware-free): the strip lock, the state file under threads
   and torn reads, stash identity, `--level` and the exhaustive `MIN_LEVEL`
   collision check, recognition across every device/preset/level, wheel and
@@ -973,7 +990,25 @@ differs from, or adds to, the plan above:
   machine with forced queue refusals, the slot's publish ordering under two
   threads, the job object ending a child, and the real `rumqttc` client against
   a fake broker — a healthy one, one that grants but never delivers, one that
-  refuses, and `--unpublish`.
+  refuses, one that drops the connection mid-subscribe, and `--unpublish`.
+- **Under Task Scheduler**, the bridge was run once from a temporary per-user
+  task (closed-port config, removed straight after) to confirm it can join its
+  kill-on-close job inside the scheduler's own: it can.
+
+**Implementation review** (Codex, gpt-6-astra, xhigh, on e2999b7) — `FIX FIRST`,
+9 findings, every one checked against the code and adopted:
+
+| # | Finding | Fix |
+|---|---|---|
+| 1 | Installers carried on past their shutdown deadlines | Timeouts abort; uninstall also waits for the bridge's singleton to be released |
+| 2 | Stash removals went ahead when the state lock wasn't had | `clear_stash` / `remove_stash_if` in `palette.rs`, which refuse without it; contention test |
+| 3 | `write_atomic` fell back to writing in place | It fails and leaves the original; test with a reader that denies delete |
+| 4 | The installer replaced `jdrgb.exe` before stopping its callers | Boot task disabled and waited out, bridge ended, no `jdrgb.exe` left running — then copy; a failure puts back what it stopped |
+| 5 | Stale `rumqttc` events after a reconnect could strand the subscription | Events cleared on disconnect; SUBACK timeout; reconnect-mid-subscribe test |
+| 6 | Log trimming could slice inside a UTF-8 character and abort the bridge | Trimmed as bytes at a newline, serialised with appends; em-dash and bad-UTF-8 tests |
+| 7 | The repeat filter could swallow a retry after a failed apply | Judged by the record's wire value, not the last command's arguments; tests for both |
+| 8 | A brightness while off snapped a saved non-preset color | Plain `on`, as the plan says; test |
+| 9 | Hyphenated computer names fell outside the documented ACL | Hyphens kept; exact ACL printed and logged; test |
 
 Still to do on the real install, in order: Phase 1 and 2 by hand on the LEDs
 (`--level` on both devices, choosing `MIN_LEVEL` by eye); then Phase 3
@@ -1061,6 +1096,19 @@ Checked on this machine on 2026-10-29:
   grants an ACL-denied subscription with SUBACK `0`** and enforces read at
   delivery; a script step on an unavailable light is skipped with a warning and
   the script continues; a `scene.create` restore sends effect only.
+- **Second live pass, on the implementation** (e2999b7; same install, a throwaway
+  probe using `payload::discovery()` exactly, cleaned up afterwards): the wheel
+  payload renders with no warnings — `supported_color_modes` `[color_temp, hs]`,
+  2700–6500 K, features 4; Warm White lands as `color_temp` 2700 and Orange as
+  hs (30, 100). With `color_temp_kelvin` true HA sends `color_temp` in kelvin.
+  A wheel-mode `scene.create` restore sends color and brightness alongside
+  `effect` — `{"state":"ON","color":{"h":30.0,"s":100.0},"brightness":102,"effect":"Orange"}`
+  — and `resolve` takes the effect and `level_for(brightness)`, so it lands on
+  the exact preset and level; `level_for(brightness_for(L)) == L` for every level
+  from `MIN_LEVEL`, so repeated off/on can't drift. `brightness_step_pct` arrives
+  as an absolute brightness computed from the last reported state (Phase 5,
+  dimming check). The broker's ACL is installed: an echo on the bridge's topic
+  comes back, one on another machine's doesn't.
 
 ## Appendix B — review log
 

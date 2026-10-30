@@ -91,7 +91,11 @@ pub fn run(
     let mut lc = Lifecycle::new(seed);
     log.line(&format!("connecting to {}:{} as {}", cfg.host, cfg.port, cfg.client_id()));
 
-    for event in connection.iter() {
+    // An explicit `recv()` loop rather than `iter()`, so the connection can be
+    // reached between polls — see the error branch.
+    loop {
+        // `recv` errs only once every client handle is gone: nothing left to do.
+        let Ok(event) = connection.recv() else { return };
         let now = now_ms();
         match event {
             Ok(Event::Incoming(Packet::ConnAck(_))) => {
@@ -126,6 +130,12 @@ pub fn run(
             Err(e) => {
                 ready.store(false, Ordering::SeqCst);
                 lc.on_down();
+                // rumqttc keeps events it buffered for the dead connection and
+                // hands them out after reconnecting — `MqttState::clean` doesn't
+                // clear them. A stale `Outgoing::Subscribe` would then be taken
+                // for the new connection's, and its real SUBACK ignored. Nothing
+                // the old connection queued means anything now.
+                connection.eventloop.state.events.clear();
                 log.once(&format!("broker connection: {e}"));
                 // rumqttc reconnects on the next poll with no delay of its own.
                 std::thread::sleep(Duration::from_secs(1));
@@ -169,18 +179,22 @@ mod tests {
         GrantsButDeaf,
         /// Refuses the command subscription outright, as some brokers do.
         Refuses,
+        /// Drops the first connection the moment it sees the SUBSCRIBE, then
+        /// behaves — a reconnect in the middle of the lifecycle.
+        DropsFirstSubscribe,
     }
 
     #[derive(Default)]
     struct Seen {
         connect: Option<rumqttc::Connect>,
+        connects: usize,
         /// (topic, payload, retain) in the order they arrived.
         publishes: Vec<(String, String, bool)>,
         filters: Vec<String>,
     }
 
-    /// A broker just big enough for one client, framed with rumqttc's codec.
-    /// The returned sender pushes a publish to the client once it subscribes.
+    /// A broker for one client at a time, framed with rumqttc's codec. The
+    /// returned sender pushes a publish to the client once it subscribes.
     fn fake_broker(mode: Broker) -> (u16, Arc<Mutex<Seen>>, std::sync::mpsc::Sender<Publish>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -188,9 +202,12 @@ mod tests {
         let (inject_tx, inject_rx) = std::sync::mpsc::channel::<Publish>();
         let seen2 = seen.clone();
         std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
-            sock.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
-            serve(&mut sock, mode, &seen2, &inject_rx);
+            for (n, conn) in listener.incoming().enumerate() {
+                let Ok(mut sock) = conn else { return };
+                sock.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+                let this = if mode == Broker::DropsFirstSubscribe && n > 0 { Broker::Healthy } else { mode };
+                serve(&mut sock, this, &seen2, &inject_rx);
+            }
         });
         (port, seen, inject_tx)
     }
@@ -222,11 +239,15 @@ mod tests {
             while let Ok(packet) = Packet::read(&mut buf, 1 << 20) {
                 match packet {
                     Packet::Connect(c) => {
-                        seen.lock().unwrap().connect = Some(c);
+                        let mut seen = seen.lock().unwrap();
+                        seen.connect = Some(c);
+                        seen.connects += 1;
+                        drop(seen);
                         send_packet(sock, |o| {
                             ConnAck::new(ConnectReturnCode::Success, false).write(o).unwrap();
                         });
                     }
+                    Packet::Subscribe(_) if mode == Broker::DropsFirstSubscribe => return,
                     Packet::Subscribe(s) => {
                         let codes = (0..s.filters.len())
                             .map(|i| {
@@ -399,6 +420,20 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(crate::unpublish::run(&cfg, &Log::open(None, false)).is_err());
         assert!(started.elapsed() < crate::unpublish::DEADLINE + Duration::from_secs(1));
+    }
+
+    /// A connection dropped mid-lifecycle — after the SUBSCRIBE, before its
+    /// SUBACK — must recover on the next one: offline first again, a fresh
+    /// subscription, and online, with nothing from the dead connection in the way.
+    #[test]
+    fn a_reconnect_mid_subscribe_recovers_and_goes_online() {
+        let r = start(Broker::DropsFirstSubscribe, None);
+        wait_for("ready after the reconnect", || r.ready.load(Ordering::SeqCst));
+        let seen = r.seen.lock().unwrap();
+        assert_eq!(seen.connects, 2);
+        let avail: Vec<&str> =
+            seen.publishes.iter().filter(|(t, _, _)| t.ends_with("/availability")).map(|(_, p, _)| p.as_str()).collect();
+        assert_eq!(avail, ["offline", "offline", "online"], "offline first on each connection, online only on the live one");
     }
 
     #[test]

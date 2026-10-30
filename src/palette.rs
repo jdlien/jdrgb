@@ -818,23 +818,27 @@ fn lock_at(path: &Path) -> Option<StateLock> {
 /// `MoveFileExW` with replace on Windows. Rust's `File::open` shares delete
 /// access, so a Rust reader holding the file open doesn't block the rename.
 ///
-/// Something else can — a virus scanner opening a fresh file, say — so the
-/// rename is retried briefly, and if it still won't go the file is written in
-/// place: a torn read is a better outcome than a lost record. Returns whether
-/// anything was written.
+/// Something else can — a virus scanner opening a fresh file, say, or a reader
+/// that didn't share delete — so the rename is retried for a moment. If it
+/// still won't go, this **fails** and the original stays exactly as it was. It
+/// never falls back to writing in place: that would hand a reader the torn file
+/// this exists to prevent, and a write that then failed part-way would destroy
+/// the original — for the stash, the only copy of what to put back. Returns
+/// whether the file was replaced.
 pub fn write_atomic(path: &Path, text: &str) -> bool {
     let tmp = path.with_extension("tmp");
     if std::fs::write(&tmp, text).is_err() {
+        let _ = std::fs::remove_file(&tmp);
         return false;
     }
-    for _ in 0..10 {
+    for _ in 0..20 {
         if std::fs::rename(&tmp, path).is_ok() {
             return true;
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
     let _ = std::fs::remove_file(&tmp);
-    std::fs::write(path, text).is_ok()
+    false
 }
 
 /// Read-modify-write the state file, under the state lock, bumping `rev`.
@@ -931,6 +935,55 @@ pub fn stash_identity(text: &str) -> String {
 /// CLI's job (`read_stash` in `main.rs`), and it deletes one on sight.
 pub fn current_stash_identity() -> Option<String> {
     std::fs::read_to_string(stash_path()?).ok().map(|t| stash_identity(&t))
+}
+
+/// What happened when something tried to remove the stash.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StashRemoval {
+    Removed,
+    /// There was no stash, or not the one asked about — someone else's now.
+    LeftAlone,
+    /// The state lock couldn't be had, so nothing was touched. Removing without
+    /// it could delete a newer borrow written in between.
+    Busy,
+}
+
+/// Remove the stash — for a bare apply, which makes what it sets the new
+/// normal. Only under the state lock; without it, nothing is removed.
+pub fn clear_stash() -> StashRemoval {
+    match stash_path() {
+        Some(p) => clear_stash_at(&p),
+        None => StashRemoval::LeftAlone,
+    }
+}
+
+fn clear_stash_at(path: &Path) -> StashRemoval {
+    let Some(_lock) = lock_at(&path.with_file_name("state.lock")) else { return StashRemoval::Busy };
+    match std::fs::remove_file(path) {
+        Ok(()) => StashRemoval::Removed,
+        Err(_) => StashRemoval::LeftAlone,
+    }
+}
+
+/// Remove the stash only if it is still the one with identity `ours` — for
+/// `restore`, which must not delete a newer borrow created while it ran. Under
+/// the state lock, so the check and the removal can't be split by a writer.
+pub fn remove_stash_if(ours: &str) -> StashRemoval {
+    match stash_path() {
+        Some(p) => remove_stash_if_at(&p, ours),
+        None => StashRemoval::LeftAlone,
+    }
+}
+
+fn remove_stash_if_at(path: &Path, ours: &str) -> StashRemoval {
+    let Some(_lock) = lock_at(&path.with_file_name("state.lock")) else { return StashRemoval::Busy };
+    match std::fs::read_to_string(path) {
+        Ok(text) if stash_identity(&text) == ours => match std::fs::remove_file(path) {
+            Ok(()) => StashRemoval::Removed,
+            Err(_) => StashRemoval::LeftAlone,
+        },
+        _ => StashRemoval::LeftAlone,
+    }
 }
 
 /// Give a stash a new id, keeping everything else — the colors it holds are the
@@ -1602,6 +1655,39 @@ mod tests {
         let stamped = restamp_stash(legacy, "3-3");
         assert_eq!(stash_identity(&stamped), "3-3");
         assert!(stamped.contains("mb: off"));
+    }
+
+    /// A rename that won't go must leave the original exactly as it was — no
+    /// in-place fallback, which could tear it or, failing part-way, destroy it.
+    /// A reader that doesn't share delete is what makes the rename fail.
+    #[test]
+    fn a_failed_replace_leaves_the_original_untouched() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let path = scratch("noreplace");
+        std::fs::write(&path, "mb=FA9536\n").unwrap();
+        let blocker = std::fs::OpenOptions::new().read(true).share_mode(1 /* FILE_SHARE_READ only */).open(&path).unwrap();
+        assert!(!write_atomic(&path, "mb=off\n"), "replaced a file a reader holds without delete sharing");
+        drop(blocker);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "mb=FA9536\n");
+        assert!(!path.with_extension("tmp").exists(), "left its temporary file behind");
+    }
+
+    /// Removing the stash without the lock could delete a newer borrow; with
+    /// the lock held elsewhere, both kinds of removal must leave it alone.
+    #[test]
+    fn stash_removal_needs_the_lock() {
+        let path = scratch("stashlock").with_file_name("stash.conf");
+        std::fs::write(&path, "# stash-id: 1-1\nmb: off\n").unwrap();
+        let held = lock_at(&path.with_file_name("state.lock")).expect("lock");
+        assert_eq!(clear_stash_at(&path), StashRemoval::Busy);
+        assert_eq!(remove_stash_if_at(&path, "1-1"), StashRemoval::Busy);
+        assert!(path.exists(), "removed through someone else's lock");
+        drop(held);
+        assert_eq!(remove_stash_if_at(&path, "2-2"), StashRemoval::LeftAlone, "not ours: a newer borrow");
+        assert!(path.exists());
+        assert_eq!(remove_stash_if_at(&path, "1-1"), StashRemoval::Removed);
+        assert!(!path.exists());
+        assert_eq!(clear_stash_at(&path), StashRemoval::LeftAlone, "nothing there");
     }
 
     #[test]

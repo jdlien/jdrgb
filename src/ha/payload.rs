@@ -190,6 +190,24 @@ mod tests {
         assert_eq!(parse(r#"{"state":"ON","effect":"Cerise"}"#).look, Some(Look::Effect("cerise")));
     }
 
+    /// What a wheel-mode `scene.create` restore actually sends, measured on the
+    /// house's HA: color and brightness ride along with the effect. The effect
+    /// must win, and the brightness come back as the level it was reported from.
+    #[test]
+    fn a_scene_restore_lands_on_the_exact_preset_and_level() {
+        use crate::model::{Cmd, Intent, level_for, resolve};
+        let st = jdrgb::palette::State::default();
+        for (payload, name, brightness) in [
+            (r#"{"state":"ON","color":{"h":30.0,"s":100.0},"brightness":102,"effect":"Orange"}"#, "orange", 102),
+            (r#"{"state":"ON","brightness":255,"color_temp":2700,"effect":"Warm White"}"#, "warmwhite", 255),
+        ] {
+            let m = parse(payload);
+            assert_eq!(m.look, Some(Look::Effect(name)));
+            let intent = Intent::merge(None, &m).unwrap();
+            assert_eq!(resolve(&intent, &st, false), Some(Cmd::Preset { name, level: level_for(brightness) }));
+        }
+    }
+
     #[test]
     fn effect_beats_color_beats_color_temp_within_one_message() {
         let all = r#"{"state":"ON","effect":"Warm White","color":{"h":10,"s":90},"color_temp":6500}"#;

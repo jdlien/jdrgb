@@ -706,13 +706,17 @@ port=1884
 | `mode` | `wheel` (default), or `presets` for on/off and effects only — the fallback if a client fights the snapped color wheel |
 
 The broker needs an ACL entry for the bridge, with `<name>` the computer's
-lowercased name:
+name lowercased (hyphens kept; anything but letters, digits and hyphens
+becomes `_`):
 
 ```
 topic readwrite jdrgb/jdrgb_<name>/#
 topic write     homeassistant/light/jdrgb_<name>/#
 topic read      homeassistant/status
 ```
+
+You don't have to derive it: `install.ps1 -Ha` prints the exact lines, and the
+bridge logs them in `ha.log` every time it starts.
 
 `readwrite` on the first line, because the bridge subscribes to its own command
 topic there. On an anonymous listener those lines join an allowlist every

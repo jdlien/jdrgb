@@ -178,8 +178,10 @@ fn main() -> ExitCode {
     if is_apply(&command) {
         if stash {
             stash_now();
-        } else {
-            clear_stash();
+        } else if clear_stash() == StashRemoval::Busy {
+            // Removing it unlocked could delete a newer borrow; leaving it means
+            // a later `restore` could undo this choice. Say so either way.
+            eprintln!("jdrgb: warning: the state file is busy, so an earlier stash wasn't cleared");
         }
     }
 
@@ -1315,32 +1317,31 @@ fn read_stash(path: &std::path::Path) -> Option<String> {
 /// write one should still get on with setting the color.
 fn stash_now() {
     let Some(path) = stash_path() else { return };
-    let Some(_lock) = lock_state() else { return };
+    let Some(_lock) = lock_state() else {
+        eprintln!("jdrgb: warning: the state file is busy, so what's showing wasn't stashed");
+        return;
+    };
     let id = new_stash_id();
-    if let Some(text) = read_stash(&path) {
+    let written = if let Some(text) = read_stash(&path) {
         // An earlier hook already saved the original: keep its colors, stamp
         // this borrow.
-        write_atomic(&path, &restamp_stash(&text, &id));
-        return;
-    }
-    let (body, _) = state_body(&load_state_full(), Target::All);
-    if body.is_empty() {
-        return; // nothing recorded, so nothing to put back
-    }
-    write_atomic(
-        &path,
-        &format!(
-            "# jdrgb stash — what was showing before something borrowed the lights.\n\
-             # Written by --stash; `jdrgb restore` applies this and deletes it.\n\
-             {STASH_ID_PREFIX} {id}\n\n{body}"
-        ),
-    );
-}
-
-fn clear_stash() {
-    if let Some(p) = stash_path() {
-        let _lock = lock_state();
-        let _ = std::fs::remove_file(p);
+        write_atomic(&path, &restamp_stash(&text, &id))
+    } else {
+        let (body, _) = state_body(&load_state_full(), Target::All);
+        if body.is_empty() {
+            return; // nothing recorded, so nothing to put back
+        }
+        write_atomic(
+            &path,
+            &format!(
+                "# jdrgb stash — what was showing before something borrowed the lights.\n\
+                 # Written by --stash; `jdrgb restore` applies this and deletes it.\n\
+                 {STASH_ID_PREFIX} {id}\n\n{body}"
+            ),
+        )
+    };
+    if !written {
+        eprintln!("jdrgb: warning: couldn't write the stash at {}", path.display());
     }
 }
 
@@ -1360,8 +1361,10 @@ fn clear_stash() {
 fn restore(target: Target, fallback: Option<Paint>, wait: bool) -> Result<(), String> {
     let path = stash_path().ok_or("no LOCALAPPDATA, so no stash")?;
     let shown = path.display().to_string();
+    // Under the state lock: `read_stash` deletes a stash from a previous boot,
+    // and doing that unlocked could delete a fresh one written in between.
     let snapshot = {
-        let _lock = lock_state();
+        let _lock = lock_state().ok_or("the state file is busy (another jdrgb holds it) — nothing restored")?;
         read_stash(&path)
     };
     match snapshot {
@@ -1383,9 +1386,8 @@ fn restore(target: Target, fallback: Option<Paint>, wait: bool) -> Result<(), St
             // Only once it actually landed — a failed restore that dropped the
             // stash would leave nothing to try again with — and only if it is
             // still the stash this restored, not a newer borrow's.
-            let _lock = lock_state();
-            if current_stash_identity().as_deref() == Some(ours.as_str()) {
-                let _ = std::fs::remove_file(&path);
+            if remove_stash_if(&ours) == StashRemoval::Busy {
+                eprintln!("jdrgb: warning: the state file was busy, so the stash wasn't removed after restoring");
             }
             Ok(())
         }

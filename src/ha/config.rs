@@ -40,14 +40,33 @@ pub fn computer_name() -> String {
     std::env::var("COMPUTERNAME").unwrap_or_else(|_| "pc".into())
 }
 
-/// `DESK` → `desk`; `DESKTOP-AB12` → `desktop_ab12`. What MQTT topics and
+/// `DESK` → `desk`; `DESKTOP-AB12` → `desktop-ab12`. What MQTT topics and
 /// HA ids can carry without escaping, and what the broker's ACL names.
+///
+/// Hyphens are kept: a Windows computer name is letters, digits and hyphens,
+/// so for any real one this is just the name lowercased — which is what the
+/// setup instructions tell the broker's owner to put in the ACL. Turning `-`
+/// into `_` would have published under topics that ACL doesn't cover. Anything
+/// else becomes `_`; the bridge logs its exact ACL lines at startup either way.
 pub fn machine_id(computer: &str) -> String {
     let id: String = computer
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '_' })
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c.to_ascii_lowercase() } else { '_' })
         .collect();
     if id.is_empty() { "pc".into() } else { id }
+}
+
+impl Config {
+    /// The broker ACL entry this bridge needs, exactly — logged at startup and
+    /// printed by the installer, so nobody has to derive it by hand.
+    pub fn acl_lines(&self) -> [String; 3] {
+        let id = self.id();
+        [
+            format!("topic readwrite jdrgb/{id}/#"),
+            format!("topic write     homeassistant/light/{id}/#"),
+            format!("topic read      {BIRTH_TOPIC}"),
+        ]
+    }
 }
 
 /// `DESK` → `Desk LEDs`. A house can have more than one PC, so a fixed
@@ -179,7 +198,7 @@ mod tests {
         assert_eq!(c.name, "Desk Glow");
         assert_eq!(c.user.as_deref(), Some("jd"));
         assert_eq!(c.mode, Mode::Presets);
-        assert_eq!(c.id(), "jdrgb_desktop_ab12");
+        assert_eq!(c.id(), "jdrgb_desktop-ab12", "a hyphenated name keeps its hyphen, as the ACL instructions say");
     }
 
     #[test]
@@ -192,9 +211,25 @@ mod tests {
         assert!(Config::parse("just a line\n", "PC").is_err());
     }
 
+    /// The ACL the installer prints and the bridge logs must cover every topic
+    /// the bridge uses — including for a hyphenated name, the common Windows
+    /// case that an `_` substitution once put outside the documented ACL.
+    #[test]
+    fn the_acl_lines_cover_every_topic_for_a_hyphenated_name() {
+        let c = Config::parse("host=h", "DESKTOP-AB12").unwrap();
+        let acl = c.acl_lines();
+        assert_eq!(acl[0], "topic readwrite jdrgb/jdrgb_desktop-ab12/#");
+        assert_eq!(acl[1], "topic write     homeassistant/light/jdrgb_desktop-ab12/#");
+        assert_eq!(acl[2], "topic read      homeassistant/status");
+        for leaf in ["set", "state", "availability", "echo"] {
+            assert!(c.topic(leaf).starts_with("jdrgb/jdrgb_desktop-ab12/"), "{leaf}");
+        }
+        assert!(c.discovery_topic().starts_with("homeassistant/light/jdrgb_desktop-ab12/"));
+    }
+
     #[test]
     fn names_from_odd_computer_names() {
-        assert_eq!(machine_id("Desk-PC 2"), "desk_pc_2");
+        assert_eq!(machine_id("Desk-PC 2"), "desk-pc_2");
         assert_eq!(default_name("DESK"), "Desk LEDs");
         assert_eq!(machine_id(""), "pc");
     }

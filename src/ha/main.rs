@@ -93,6 +93,9 @@ fn main() -> ExitCode {
     }
 
     log.line(&format!("jdrgb-ha {} starting for \"{}\"", env!("CARGO_PKG_VERSION"), cfg.name));
+    // Exactly what the broker's owner needs, so a mismatch is visible here
+    // rather than derived by hand and got wrong.
+    log.line(&format!("broker ACL needed: {}", cfg.acl_lines().join(" | ")));
     let (client, connection) = net::client(&cfg);
     let slot = Arc::new(Slot::default());
     let ready = Arc::new(AtomicBool::new(false));

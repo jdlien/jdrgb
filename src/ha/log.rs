@@ -15,6 +15,9 @@ pub struct Log {
     /// The last `once` message, so a connection error repeating every second
     /// is logged once rather than every second.
     last_once: Mutex<Option<String>>,
+    /// Both threads log. One lock around trim-and-append keeps a trim from
+    /// racing another thread's append.
+    file: Mutex<()>,
 }
 
 impl Log {
@@ -22,7 +25,7 @@ impl Log {
         if let Some(d) = &dir {
             let _ = std::fs::create_dir_all(d);
         }
-        Log { path: dir.map(|d| d.join("ha.log")), stderr, last_once: Mutex::new(None) }
+        Log { path: dir.map(|d| d.join("ha.log")), stderr, last_once: Mutex::new(None), file: Mutex::new(()) }
     }
 
     pub fn line(&self, msg: &str) {
@@ -31,6 +34,7 @@ impl Log {
             eprint!("{line}");
         }
         let Some(path) = &self.path else { return };
+        let _held = self.file.lock().unwrap_or_else(|e| e.into_inner());
         if std::fs::metadata(path).is_ok_and(|m| m.len() > MAX_BYTES) {
             trim(path);
         }
@@ -58,11 +62,19 @@ impl Log {
 }
 
 /// Keep the newest half, starting at a line boundary.
+///
+/// In bytes, not `str`: the midpoint can land inside a multi-byte character —
+/// the bridge's own messages carry em dashes — and slicing a `str` there
+/// panics, which in a `panic = "abort"` release build ends the bridge, and the
+/// same file ends the next launch too. The cut is made just after a newline,
+/// which is always a character boundary. And bytes because a file torn by
+/// some earlier crash may not be valid UTF-8 at all, which `read_to_string`
+/// would refuse — leaving the log to grow forever.
 fn trim(path: &std::path::Path) {
-    let Ok(text) = std::fs::read_to_string(path) else { return };
-    let half = text.len() / 2;
-    let start = text[half..].find('\n').map_or(text.len(), |i| half + i + 1);
-    let _ = std::fs::write(path, &text[start..]);
+    let Ok(bytes) = std::fs::read(path) else { return };
+    let half = bytes.len() / 2;
+    let start = bytes[half..].iter().position(|&b| b == b'\n').map_or(bytes.len(), |i| half + i + 1);
+    let _ = std::fs::write(path, &bytes[start..]);
 }
 
 /// `2026-10-29T23:02:05Z`. UTC: `std` has no time zones, and a log read
@@ -109,6 +121,33 @@ mod tests {
         let kept = std::fs::read_to_string(&path).unwrap();
         assert!(kept.starts_with("line ") && kept.ends_with("line 99\n"), "{kept:?}");
         assert!(kept.len() < text.len() / 2 + 10);
+    }
+
+    /// The case that would have aborted the bridge: the midpoint inside an em
+    /// dash. And a file that isn't valid UTF-8 at all still gets trimmed.
+    #[test]
+    fn trimming_never_splits_a_character_and_survives_bad_utf8() {
+        let dir = std::env::temp_dir().join(format!("jdrgb-ha-utf8-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("ha.log");
+        // 1000 + 3 (the dash, bytes 1000..1003) + 988 + 1 + 10 = 2002 bytes, so
+        // the midpoint is byte 1001 — inside the dash.
+        let mut text = "a".repeat(1000);
+        text.push('—');
+        text.push_str(&"b".repeat(988));
+        text.push('\n');
+        text.push_str("last line\n");
+        assert!(!text.is_char_boundary(text.len() / 2), "the test must put the midpoint inside the dash");
+        std::fs::write(&path, &text).unwrap();
+        trim(&path);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "last line\n");
+
+        let mut bad = vec![b'x'; 100];
+        bad.extend_from_slice(&[0xFF, 0xFE, b'\n']);
+        bad.extend_from_slice(b"kept\n");
+        std::fs::write(&path, &bad).unwrap();
+        trim(&path);
+        assert_eq!(std::fs::read(&path).unwrap(), b"kept\n");
     }
 
     #[test]

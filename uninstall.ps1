@@ -55,10 +55,24 @@ if ($haExe) {
     Get-Process -Name "jdrgb-ha" -ErrorAction SilentlyContinue |
         Where-Object { $_.Path -eq $haExe } |
         ForEach-Object { $_.Kill(); Write-Host "Stopped the running bridge." }
+    # Gone means gone: no bridge or jdrgb.exe from here still running, and the
+    # bridge's singleton no longer held — it outlives the process only while
+    # some other bridge, perhaps under another account, still has it. Carrying
+    # on otherwise would race a cleanup against a live bridge that republishes
+    # what it deletes, and delete binaries out from under running processes.
     $deadline = (Get-Date).AddSeconds(30)
-    while ((Get-Date) -lt $deadline -and
-           (Get-Process -Name "jdrgb-ha", "jdrgb" -ErrorAction SilentlyContinue |
-                Where-Object { $_.Path -eq $haExe -or $_.Path -eq $cliExe })) {
+    $held = $null
+    while ($true) {
+        $running = @(Get-Process -Name "jdrgb-ha", "jdrgb" -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Path -eq $haExe -or $_.Path -eq $cliExe })
+        $singleton = [System.Threading.Mutex]::TryOpenExisting("Global\jdrgb-ha", [ref]$held)
+        if ($held) { $held.Dispose(); $held = $null }
+        if ($running.Count -eq 0 -and -not $singleton) { break }
+        if ((Get-Date) -ge $deadline) {
+            $what = if ($running.Count) { "$($running.Count) jdrgb process(es) still running" } else { "another jdrgb-ha still holding Global\jdrgb-ha" }
+            Write-Host "UNINSTALL STOPPED: $what after 30s. Nothing was removed; stop it and run this again." -ForegroundColor Red
+            exit 1
+        }
         Start-Sleep -Milliseconds 250
     }
 

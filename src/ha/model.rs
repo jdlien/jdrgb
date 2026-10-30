@@ -7,7 +7,7 @@
 //! fake clock and intervals of a few milliseconds, and the worker drives it with
 //! the real ones.
 
-use jdrgb::palette::{Last, Lit, MIN_LEVEL, State, hsv_of, recognise, snap_hs, snap_kelvin};
+use jdrgb::palette::{Last, Lit, MIN_LEVEL, Paint, State, hsv_of, recognise, scale, snap_hs, snap_kelvin};
 
 /// Milliseconds on a monotonic clock.
 pub type Ms = u64;
@@ -234,17 +234,20 @@ pub fn resolve(intent: &Intent, st: &State, follow_pending: bool) -> Option<Cmd>
         // A brightness alone scales whatever the base shows.
         None => match &base {
             Base::Preset(name, _) => name,
-            // A hex snaps to the nearest preset first. Scaling it directly
+            // A lit hex snaps to the nearest preset first. Scaling it directly
             // would compound rounding and never recognise again, so the slider
             // would jump back to 100% every time.
-            Base::Hex(rgb) => {
+            Base::Hex(rgb) if is_lit => {
                 let (h, s) = hsv_of(*rgb);
                 snap_hs(h, s * 100.0)
             }
-            // A frame has no preset to scale. Lit, the brightness is ignored;
-            // off, `on` brings it back as it was.
+            // A frame has no preset to scale: lit, the brightness is ignored.
             Base::Frame if is_lit => return None,
-            Base::Frame | Base::Nothing => return Some(Cmd::On),
+            // Off with a lit record nothing recognises — a hex or a frame —
+            // or nothing kept: `on` brings back what was there, as it was, and
+            // the brightness is ignored. Snapping a saved hex here would throw
+            // away the color `off` kept.
+            Base::Hex(_) | Base::Frame | Base::Nothing => return Some(Cmd::On),
         },
     };
     let level = match (brightness, &base) {
@@ -363,9 +366,18 @@ pub enum Step {
 }
 
 struct StripDone {
-    args: Vec<String>,
     at: Ms,
     rev_after: u64,
+}
+
+/// What the strip's record would say after `cmd` landed, for the repeat filter.
+/// `None` for `on`, which depends on the lit record and is decided elsewhere.
+fn expected_strip(cmd: &Cmd) -> Option<Last> {
+    match cmd {
+        Cmd::Off => Some(Last::Off),
+        Cmd::On => None,
+        Cmd::Preset { name, level } => Some(Last::Color(scale(Paint::Preset(name).rgb(false), *level))),
+    }
 }
 
 /// Token bucket for strip legs, counted on attempt.
@@ -495,12 +507,17 @@ impl Model {
         }
 
         let args = cmd.args(false);
-        let repeat = self.last_strip.as_ref().is_some_and(|l| {
-            l.args == args
-                && now.saturating_sub(l.at) < self.timing.repeat_window
-                && obs.state.rev == l.rev_after
-                && obs.stash.is_none()
-        });
+        // A repeat is a command whose result is already on the record — the
+        // same wire value, so `black` at any level is a repeat of `black` — with
+        // nothing written since the bridge's own last strip leg, inside the
+        // window, and no stash. Comparing against the *record* rather than
+        // the last command is what lets a retry after a failed apply through:
+        // that apply recorded nothing, so the record still shows the old color.
+        let repeat = obs.stash.is_none()
+            && expected_strip(&cmd).is_some_and(|want| obs.state.mb == Some(want))
+            && self.last_strip.as_ref().is_some_and(|l| {
+                now.saturating_sub(l.at) < self.timing.repeat_window && obs.state.rev == l.rev_after
+            });
         if repeat {
             self.set_follow(cmd, obs);
             return Step::Note(format!("skipped a repeat of `jdrgb {}`", args.join(" ")));
@@ -549,7 +566,7 @@ impl Model {
     pub fn on_done(&mut self, obs: &Observed, now: Ms) {
         match self.running.take() {
             Some(Leg::Strip(cmd)) => {
-                self.last_strip = Some(StripDone { args: cmd.args(false), at: now, rev_after: obs.state.rev });
+                self.last_strip = Some(StripDone { at: now, rev_after: obs.state.rev });
                 self.last_activity = Some(now);
                 // Observed *after* the strip leg, so its own write — and a
                 // stash it cleared — don't count as someone else acting.
@@ -709,6 +726,18 @@ mod tests {
         assert_eq!(resolve(&Intent::On { look: None, brightness: Some(100) }, &st, false), Some(Cmd::On));
     }
 
+    /// Off with a saved color nothing recognises: `on` brings it back as it
+    /// was. Snapping it to the nearest preset would throw away what `off` kept.
+    #[test]
+    fn a_brightness_while_off_over_a_saved_hex_is_a_plain_on() {
+        let mut st = State::default();
+        st.record(false, Last::Color((0xFF, 0x10, 0x10)));
+        st.record(true, Last::Color((0xFF, 0x10, 0x10)));
+        st.record(false, Last::Off);
+        st.record(true, Last::Off);
+        assert_eq!(resolve(&Intent::On { look: None, brightness: Some(128) }, &st, false), Some(Cmd::On));
+    }
+
     #[test]
     fn a_brightness_while_off_scales_what_was_lit() {
         let mut st = both("red", 100).state;
@@ -742,6 +771,16 @@ mod tests {
         for b in 1..=255u8 {
             let back = brightness_for(level_for(b));
             assert!((i32::from(back) - i32::from(b)).abs() <= bound, "{b} → {} → {back}", level_for(b));
+        }
+    }
+
+    /// A scene restore sends back the brightness the bridge reported, and the
+    /// bridge turns it into a level again. That round trip must be exact, or
+    /// every off/on cycle through a scene would drift the level a step.
+    #[test]
+    fn a_reported_brightness_comes_back_as_the_same_level() {
+        for level in MIN_LEVEL..=100 {
+            assert_eq!(level_for(brightness_for(level)), level, "level {level} drifted");
         }
     }
 
@@ -994,6 +1033,32 @@ mod tests {
         m.on_message(&effect("red"), 40);
         let legs = run(&mut m, &mut obs, 50);
         assert_eq!(legs, vec![Leg::Strip(Cmd::Preset { name: "red", level: 100 })], "a stash means it must reach the CLI");
+    }
+
+    /// A strip leg that failed recorded nothing, so the record still shows the
+    /// old color. A retry of the same command must reach the CLI, not be taken
+    /// for a repeat of one that landed.
+    #[test]
+    fn a_retry_after_a_failed_apply_is_not_a_repeat() {
+        let mut m = Model::new(fast(), 0);
+        let mut obs = both("blue", 100);
+        m.on_message(&effect("red"), 0);
+        assert_eq!(m.next(&obs, 10), Step::Run(Leg::Strip(Cmd::Preset { name: "red", level: 100 })));
+        m.on_done(&obs, 10); // the child failed: nothing recorded, rev unchanged
+        m.on_message(&effect("red"), 20);
+        assert_eq!(run(&mut m, &mut obs, 30), vec![Leg::Strip(Cmd::Preset { name: "red", level: 100 })]);
+    }
+
+    /// The plan's rule is the wire value: `black` at 50% and `black` at full are
+    /// the same bytes, so the second is a repeat.
+    #[test]
+    fn a_repeat_is_judged_by_wire_value_not_arguments() {
+        let mut m = Model::new(fast(), 0);
+        let mut obs = both("blue", 100);
+        m.on_message(&effect("black"), 0);
+        assert_eq!(run(&mut m, &mut obs, 10), vec![Leg::Strip(Cmd::Preset { name: "black", level: 100 })]);
+        m.on_message(&on(Some(Look::Effect("black")), Some(level_brightness(50))), 20);
+        assert_eq!(run(&mut m, &mut obs, 30), vec![], "black at 50% is the same bytes as black");
     }
 
     #[test]

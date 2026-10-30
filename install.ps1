@@ -216,15 +216,60 @@ try {
     }
 
     $target = Join-Path $InstallDir "jdrgb.exe"
+    $trayTarget = Join-Path $InstallDir "jdrgb-tray.exe"
+    $haTarget = Join-Path $InstallDir "jdrgb-ha.exe"
+    $traySource = Join-Path $PSScriptRoot "target\release\jdrgb-tray.exe"
+    $haSource = Join-Path $PSScriptRoot "target\release\jdrgb-ha.exe"
+    # Every source is checked before anything is stopped, so a missing build
+    # can't leave the old install stopped and not replaced.
+    if ($Tray -and -not (Test-Path $traySource)) {
+        throw "jdrgb-tray.exe not found at $traySource. Build it first: cargo build --release"
+    }
+    if ($Ha -and -not (Test-Path $haSource)) {
+        throw "jdrgb-ha.exe not found at $haSource. Build it first: cargo build --release"
+    }
+
+    # --- Stop everything that could be running our binaries, before replacing any
+    # Windows won't overwrite a running image, so an upgrade that copied first
+    # would fail on the first file with the old callers still running. So the
+    # boot task is disabled and any run waited out; the bridge is ended (its
+    # kill-on-close job takes its children); and nothing proceeds until no
+    # jdrgb.exe from the install directory is running. A timeout aborts the
+    # install with nothing replaced, rather than carrying on regardless.
+    function Wait-Until([string]$what, [scriptblock]$done, [int]$seconds = 60) {
+        $deadline = (Get-Date).AddSeconds($seconds)
+        while (-not (& $done)) {
+            if ((Get-Date) -ge $deadline) {
+                throw "timed out after ${seconds}s waiting for $what. Nothing was replaced; stop it and run this again."
+            }
+            Start-Sleep -Milliseconds 250
+        }
+    }
+    $script:bootDisabled = $false
+    $script:bridgeStopped = $false
+    if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+        # Disabled first, so no trigger can start it again while it is waited out.
+        Disable-ScheduledTask -TaskName $TaskName | Out-Null
+        $script:bootDisabled = $true
+        if ((Get-ScheduledTask -TaskName $TaskName).State -eq "Running") {
+            Stop-ScheduledTask -TaskName $TaskName
+        }
+        Wait-Until "the boot task to stop" { (Get-ScheduledTask -TaskName $TaskName).State -ne "Running" } 90
+    }
+    Get-Process -Name "jdrgb-ha" -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -eq $haTarget } |
+        ForEach-Object { $_.Kill(); $script:bridgeStopped = $true }
+    Wait-Until "the bridge to exit" {
+        -not (Get-Process -Name "jdrgb-ha" -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $haTarget })
+    }
+    Wait-Until "every jdrgb.exe from $InstallDir to exit" {
+        -not (Get-Process -Name "jdrgb" -ErrorAction SilentlyContinue | Where-Object { $_.Path -eq $target })
+    }
+
     Copy-Item -Path $source -Destination $target -Force
     Write-Host "Installed binary: $target"
 
-    $trayTarget = Join-Path $InstallDir "jdrgb-tray.exe"
     if ($Tray) {
-        $traySource = Join-Path $PSScriptRoot "target\release\jdrgb-tray.exe"
-        if (-not (Test-Path $traySource)) {
-            throw "jdrgb-tray.exe not found at $traySource. Build it first: cargo build --release"
-        }
         # A running tray holds a lock on its own image, so an upgrade has to
         # stop it first. Matched on the full path so a development copy running
         # from target\release is left alone. taskkill without /F posts WM_CLOSE,
@@ -239,19 +284,8 @@ try {
         Write-Host "Installed binary: $trayTarget"
     }
 
-    $haTarget = Join-Path $InstallDir "jdrgb-ha.exe"
     if ($Ha) {
-        $haSource = Join-Path $PSScriptRoot "target\release\jdrgb-ha.exe"
-        if (-not (Test-Path $haSource)) {
-            throw "jdrgb-ha.exe not found at $haSource. Build it first: cargo build --release"
-        }
-        # An upgrade has to stop the running bridge to replace its image. It has
-        # no window to close, so it is ended outright; its kill-on-close job
-        # takes any jdrgb.exe it was running with it. Matched on the full path so
-        # a development copy is left alone.
-        Get-Process -Name "jdrgb-ha" -ErrorAction SilentlyContinue |
-            Where-Object { $_.Path -eq $haTarget } |
-            ForEach-Object { $_.Kill(); $_.WaitForExit(5000) | Out-Null }
+        # The running bridge, if any, was ended above, with its children.
         Copy-Item -Path $haSource -Destination $haTarget -Force
         Write-Host "Installed binary: $haTarget"
     }
@@ -330,15 +364,9 @@ try {
         # on every boot behind your back, and keep overwriting whatever you last
         # set — the exact thing that made this opt-in.
         #
-        # A run in progress is stopped and waited out first: unregistering alone
-        # would leave its jdrgb.exe writing — and with -Ha, racing the bridge.
-        if ((Get-ScheduledTask -TaskName $TaskName).State -eq "Running") {
-            Stop-ScheduledTask -TaskName $TaskName
-            $deadline = (Get-Date).AddSeconds(90)
-            while ((Get-ScheduledTask -TaskName $TaskName).State -eq "Running" -and (Get-Date) -lt $deadline) {
-                Start-Sleep -Milliseconds 500
-            }
-        }
+        # It was disabled and any run waited out above, before anything was
+        # replaced, so nothing of it is still writing — which with -Ha would race
+        # the bridge.
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
         Write-Host "Removed the existing boot task '$TaskName' (no -Boot)."
     }
@@ -401,6 +429,17 @@ try {
             -Description "jdrgb Home Assistant bridge: the LEDs as an HA light over MQTT." | Out-Null
         Write-Host "Registered task '$HaTaskName' to start at logon for $who."
 
+        # The same rule as the bridge's own (config.rs, machine_id): the computer
+        # name lowercased, anything but letters, digits and '-' as '_'. The
+        # bridge logs these lines too, at every start.
+        $machine = ($env:COMPUTERNAME.ToLowerInvariant() -replace '[^a-z0-9-]', '_')
+        Write-Host ""
+        Write-Host "The broker needs this ACL entry for the bridge:"
+        Write-Host "    topic readwrite jdrgb/jdrgb_$machine/#"
+        Write-Host "    topic write     homeassistant/light/jdrgb_$machine/#"
+        Write-Host "    topic read      homeassistant/status"
+        Write-Host ""
+
         if ($haConf -and -not (Test-Path $haConf)) {
             Write-Warning "No bridge config yet at $haConf. Create it with:"
             Write-Host "    host=<the broker's LAN address>"
@@ -416,6 +455,13 @@ try {
                 Write-Warning "The bridge task started but the process isn't running — see $haLog"
             }
         }
+    }
+
+    # The bridge was ended so jdrgb.exe could be replaced. If this run didn't
+    # reinstall it, its task is still there — start it again.
+    if ($script:bridgeStopped -and -not $Ha -and (Get-ScheduledTask -TaskName $HaTaskName -ErrorAction SilentlyContinue)) {
+        Start-ScheduledTask -TaskName $HaTaskName
+        Write-Host "Restarted the Home Assistant bridge."
     }
 
     if (-not $Boot) {
@@ -454,6 +500,17 @@ catch {
     Write-Host "INSTALL FAILED: $($_.Exception.Message)" -ForegroundColor Red
     Write-Host $_.ScriptStackTrace
     $failed = $true
+    # Put back what was stopped to replace the binaries, so a failed upgrade
+    # leaves the old install running rather than half-stopped. A boot task the
+    # run meant to keep is re-armed; one it meant to remove stays disabled.
+    if ($script:bootDisabled -and $Boot -and (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue)) {
+        Enable-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue | Out-Null
+        Write-Host "Re-enabled the boot task."
+    }
+    if ($script:bridgeStopped -and (Get-ScheduledTask -TaskName $HaTaskName -ErrorAction SilentlyContinue)) {
+        Start-ScheduledTask -TaskName $HaTaskName -ErrorAction SilentlyContinue
+        Write-Host "Restarted the Home Assistant bridge."
+    }
 }
 finally {
     try { Stop-Transcript | Out-Null } catch {}

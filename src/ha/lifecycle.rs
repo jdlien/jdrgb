@@ -12,6 +12,10 @@ use crate::model::Ms;
 
 /// How long the echo may take to come back.
 pub const ECHO_TIMEOUT: Ms = 10_000;
+/// How long to wait for a SUBACK before subscribing again. A broker answers in
+/// milliseconds; waiting this long means the SUBSCRIBE — or our record of its
+/// packet id — was lost, and waiting forever would strand the connection.
+pub const SUBACK_TIMEOUT: Ms = 30_000;
 /// How long before a refused subscription or a missing echo is tried again.
 pub const RETRY: Ms = 5 * 60_000;
 
@@ -37,7 +41,7 @@ enum Stage {
     /// Connected; working through the startup steps.
     Offline,
     Subscribe,
-    AwaitSubAck { pkid: Option<u16> },
+    AwaitSubAck { pkid: Option<u16>, since: Ms },
     Echo,
     AwaitEcho { sent: Ms },
     Discovery,
@@ -117,7 +121,7 @@ impl Lifecycle {
         }
         self.stage = match std::mem::replace(&mut self.stage, Stage::Down) {
             Stage::Offline => Stage::Subscribe,
-            Stage::Subscribe => Stage::AwaitSubAck { pkid: None },
+            Stage::Subscribe => Stage::AwaitSubAck { pkid: None, since: now },
             Stage::Echo => Stage::AwaitEcho { sent: now },
             Stage::Discovery => Stage::Online,
             Stage::Online => Stage::State,
@@ -128,7 +132,7 @@ impl Lifecycle {
 
     /// `rumqttc` reports the SUBSCRIBE's packet id as it goes out.
     pub fn on_outgoing_subscribe(&mut self, pkid: u16) {
-        if let Stage::AwaitSubAck { pkid: p @ None } = &mut self.stage {
+        if let Stage::AwaitSubAck { pkid: p @ None, .. } = &mut self.stage {
             *p = Some(pkid);
         }
     }
@@ -141,7 +145,7 @@ impl Lifecycle {
     /// an ACL-denied subscription and enforces the ACL at delivery instead,
     /// which is what the echo is for.
     pub fn on_suback(&mut self, pkid: u16, granted: &[bool], now: Ms) -> Option<String> {
-        let Stage::AwaitSubAck { pkid: Some(p) } = self.stage else { return None };
+        let Stage::AwaitSubAck { pkid: Some(p), .. } = self.stage else { return None };
         if p != pkid {
             return None;
         }
@@ -184,6 +188,10 @@ impl Lifecycle {
     /// normally well within the keepalive.
     pub fn tick(&mut self, now: Ms) -> Option<String> {
         match &self.stage {
+            Stage::AwaitSubAck { since, .. } if now.saturating_sub(*since) >= SUBACK_TIMEOUT => {
+                self.stage = Stage::Subscribe;
+                Some("no SUBACK for the subscription; subscribing again".into())
+            }
             Stage::AwaitEcho { sent } if now.saturating_sub(*sent) >= ECHO_TIMEOUT => {
                 self.stage = Stage::Retry { step: Box::new(Stage::Echo), at: now + RETRY };
                 Some(
@@ -283,6 +291,24 @@ mod tests {
         assert_eq!(lc.pending(), None, "not before the retry");
         lc.tick(100 + RETRY);
         assert_eq!(lc.pending(), Some(Request::Subscribe));
+    }
+
+    /// A SUBACK that never comes — the SUBSCRIBE lost, or a stale packet id
+    /// taken for ours — must not strand the connection: subscribe again.
+    #[test]
+    fn a_missing_suback_times_out_and_subscribes_again() {
+        let mut lc = Lifecycle::new("t".into());
+        lc.on_connack();
+        drain(&mut lc, 1_000);
+        lc.on_outgoing_subscribe(99); // a stale id from a dead connection
+        assert_eq!(lc.on_suback(5, &[true, true, true], 1_500), None, "the real SUBACK, for the real id");
+        assert_eq!(lc.tick(1_000 + SUBACK_TIMEOUT - 1), None);
+        assert!(lc.tick(1_000 + SUBACK_TIMEOUT).is_some());
+        assert_eq!(lc.pending(), Some(Request::Subscribe));
+        lc.accepted(40_000);
+        lc.on_outgoing_subscribe(6);
+        assert_eq!(lc.on_suback(6, &[true, true, true], 40_000), None);
+        assert!(matches!(lc.pending(), Some(Request::Echo(_))), "recovered");
     }
 
     #[test]
