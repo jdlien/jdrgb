@@ -1,34 +1,42 @@
 <#
 .SYNOPSIS
-  Install jdrgb to run at Windows startup (as SYSTEM, no login required).
+  Install the jdrgb tray, and optionally a boot task that reasserts the color.
 .DESCRIPTION
-  Copies jdrgb.exe to Program Files and registers a Scheduled Task that runs at
-  boot (and, if possible, on resume-from-sleep), setting the LEDs to a static
-  color. Writes a log to install.log next to this script.
-.PARAMETER Color
-  Optional color to set at boot: a preset name (e.g. warmwhite) or RRGGBB hex.
-  Defaults to jdrgb's built-in default color (coolwhite).
-.PARAMETER InstallDir
-  Where to place the binary. Defaults to "C:\Program Files\jdrgb".
-.PARAMETER NoWake
-  Skip the resume-from-sleep trigger (register the startup trigger only).
-.PARAMETER Gpu
-  Set the GPU LEDs instead of the motherboard strip.
-.PARAMETER All
-  Set both the motherboard strip and the GPU LEDs.
-.PARAMETER Tray
-  Also install jdrgb-tray.exe and start it at logon: a notification-area menu
-  for picking a preset colour. This is a second, separate task — the boot task
-  runs as SYSTEM in session 0 and cannot show a tray icon.
-.PARAMETER TrayOnly
-  Install the tray and skip the boot task entirely. Implies -Tray.
+  Copies jdrgb.exe (and jdrgb-tray.exe, with -Tray) to Program Files and
+  registers the Scheduled Tasks you ask for. Writes a log to install.log next to
+  this script.
 
-  jdrgb commits to the controller's flash on every solid set, so the color
-  already survives a cold boot without anything running. That makes the boot
-  task insurance rather than a requirement — and it isn't free, since it fires
-  at startup, at logon and on resume, writing flash each time to reassert a
-  color that was already there. If you don't need the insurance, don't pay for
-  it. See "GPU persistence" in the README.
+  Nothing is installed unless you pass -Tray, -Boot, or both. Run it bare to
+  print the usage.
+.PARAMETER Tray
+  Install jdrgb-tray.exe and start it at logon: a notification-area menu for
+  picking a preset colour. Runs as you, unelevated — the boot task runs as
+  SYSTEM in session 0 and cannot show a tray icon, so they are separate tasks.
+.PARAMETER Boot
+  Register the boot task: run as SYSTEM at startup, at logon and on resume from
+  sleep, setting the LEDs to a static color before anyone logs in.
+
+  Opt-in, because it is usually redundant. jdrgb commits to the controller's
+  flash on every solid set, so the color already survives a cold boot without
+  anything running — and the task isn't free, since it fires three ways, writing
+  flash each time to reassert a color that was already there. Take it as cover
+  for a BIOS update, a CMOS reset, or reinstalling vendor software. See "GPU
+  persistence" in the README.
+
+  Running without -Boot removes an existing boot task.
+.PARAMETER Color
+  Boot task only: the color to set at boot, a preset name (e.g. warmwhite) or
+  RRGGBB hex. Defaults to jdrgb's built-in default color (coolwhite).
+.PARAMETER Config
+  Boot task only: a per-LED config file to load at boot instead of one color.
+.PARAMETER InstallDir
+  Where to place the binaries. Defaults to "C:\Program Files\jdrgb".
+.PARAMETER NoWake
+  Boot task only: skip the resume-from-sleep trigger.
+.PARAMETER Gpu
+  Boot task only: set the GPU LEDs instead of the motherboard strip.
+.PARAMETER All
+  Boot task only: set both the motherboard strip and the GPU LEDs.
 .PARAMETER TrayUser
   Internal. The SID of the user the tray task belongs to, captured before
   elevation. Not meant to be passed by hand.
@@ -42,7 +50,7 @@ param(
     [switch]$Gpu,
     [switch]$All,
     [switch]$Tray,
-    [switch]$TrayOnly,
+    [switch]$Boot,
     [string]$TrayUser = ""
 )
 
@@ -50,17 +58,62 @@ $ErrorActionPreference = "Stop"
 $TaskName = "jdrgb"
 $TrayTaskName = "jdrgb-tray"
 
-if ($TrayOnly) { $Tray = $true }
+# --- Nothing is installed by default -----------------------------------------
+# Installing the boot task unasked is how this machine ended up with one quietly
+# overwriting the tray's colour at every startup, logon and resume — for a colour
+# that was already latched in flash. Both halves are opt-in now, and a bare run
+# says so instead of guessing. Printed before elevation, so asking for the usage
+# never raises a UAC prompt.
+function Show-Usage {
+    Write-Host @"
+jdrgb install - pick what to install; nothing happens without one of these.
+
+  .\install.ps1 -Tray              the notification-area menu, at logon
+  .\install.ps1 -Boot              the SYSTEM boot task, default colour
+  .\install.ps1 -Tray -Boot        both
+
+Boot task options (each requires -Boot):
+  -Color <name|RRGGBB>   colour to set at boot (default: coolwhite)
+  -Config <path>         per-LED config file to load instead of one colour
+  -Gpu | -All            target the GPU, or the strip and the GPU
+  -NoWake                skip the resume-from-sleep trigger
+
+Other:
+  -InstallDir <path>     where the binaries go (default: $env:ProgramFiles\jdrgb)
+
+-Tray is usually all you want. jdrgb commits the colour to the controllers'
+flash on every set, so it already survives a cold boot with nothing running.
+-Boot is insurance for a BIOS update or a CMOS reset, paid for in flash writes
+at every startup, logon and resume. Running without -Boot removes an existing
+boot task.
+
+Remove everything with .\uninstall.ps1.
+"@
+}
+
+if (-not $Tray -and -not $Boot) {
+    Show-Usage
+    return
+}
 
 # --- Reject combinations that would install a permanently failing task -------
 if ($Gpu -and $All) {
     throw "-Gpu and -All are mutually exclusive."
 }
-# -Color and -Config only ever configured the boot task. Silently ignoring them
-# would look like the color had been set up when nothing was listening.
-if ($TrayOnly -and ($Color -or $Config)) {
-    throw ("-TrayOnly registers no boot task, so -Color/-Config would have nothing to configure. " +
-           "Set the color once by hand — it persists — e.g. `"jdrgb $Color --all`".")
+# These only ever configured the boot task. Silently ignoring them would look
+# like the color had been set up when nothing was listening.
+if (-not $Boot) {
+    $bootOnly = @()
+    if ($Color)  { $bootOnly += "-Color" }
+    if ($Config) { $bootOnly += "-Config" }
+    if ($Gpu)    { $bootOnly += "-Gpu" }
+    if ($All)    { $bootOnly += "-All" }
+    if ($NoWake) { $bootOnly += "-NoWake" }
+    if ($bootOnly) {
+        $eg = if ($Color) { $Color } else { "warmwhite" }
+        throw ("$($bootOnly -join ', ') configure the boot task, so they need -Boot. " +
+               "To set a color without one, do it by hand — it persists — e.g. `"jdrgb $eg --all`".")
+    }
 }
 # -Config combined with -Gpu/-All is fine: a config can carry a `gpu:` line, so
 # one file describes the whole machine. If it has no `gpu:` line, jdrgb says so
@@ -86,7 +139,7 @@ if (-not $admin) {
         $sid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
         $argList += @("-Tray", "-TrayUser", $sid)
     }
-    if ($TrayOnly) { $argList += "-TrayOnly" }
+    if ($Boot)   { $argList += "-Boot" }
     if ($PSBoundParameters.ContainsKey("InstallDir")) { $argList += @("-InstallDir", "`"$InstallDir`"") }
     Start-Process -FilePath (Get-Process -Id $PID).Path -Verb RunAs -ArgumentList $argList
     return
@@ -153,14 +206,14 @@ try {
         Write-Host "Installed binary: $trayTarget"
     }
 
-    # --- The boot task, which -TrayOnly skips entirely -----------------------
-    # Optional, and genuinely so: jdrgb commits to the controller's flash on
+    # --- The boot task, which only -Boot installs ----------------------------
+    # Opt-in, and genuinely optional: jdrgb commits to the controller's flash on
     # every solid set, so the color already survives a cold boot with nothing
     # running. This is insurance for the cases that clear the controllers — a
     # BIOS update, a CMOS reset, reinstalling vendor software — and it is paid
     # for in flash writes, once per trigger, reasserting a color that was
     # already there.
-    if (-not $TrayOnly) {
+    if ($Boot) {
         # Task components. A config file wins over a single color.
         $targetFlag = if ($Gpu) { " --gpu" } elseif ($All) { " --all" } else { "" }
         $taskArgs = "--wait$targetFlag"
@@ -224,9 +277,10 @@ try {
     }
     elseif (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
         # Upgrading an install that had one. Leaving it would keep writing flash
-        # on every boot behind your back, which is the thing -TrayOnly avoids.
+        # on every boot behind your back, and keep overwriting whatever you last
+        # set — the exact thing that made this opt-in.
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-        Write-Host "Removed the existing boot task '$TaskName' (-TrayOnly)."
+        Write-Host "Removed the existing boot task '$TaskName' (no -Boot)."
     }
 
     # --- The tray, which needs a task of its own ----------------------------
@@ -265,7 +319,7 @@ try {
         }
     }
 
-    if ($TrayOnly) {
+    if (-not $Boot) {
         Write-Host ""
         Write-Host "SUCCESS. The tray will start at logon."
         Write-Host "No boot task: the color is already held in the controllers' flash, so it"

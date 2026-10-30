@@ -475,8 +475,20 @@ controllers: a BIOS update, a CMOS reset, or reinstalling vendor software.
 
 ## Run at boot (optional — see GPU persistence above)
 
-`install.ps1` registers a Scheduled Task that runs as the `SYSTEM` account — so
-the color is set during boot, before anyone logs in. It copies the binary to
+`install.ps1` installs nothing by default. Run it bare and it prints its usage:
+`-Tray` gets you the menu, `-Boot` gets you the boot task, and you can ask for
+both. Nothing is elevated until you've named one, so reading the usage never
+raises a UAC prompt.
+
+**Why opt-in.** A boot task that reasserts a color is the wrong default once the
+color is already latched in flash. Worse, it's invisible: it runs as `SYSTEM`, so
+an unelevated `Get-ScheduledTask` won't even list it, and the only symptom is
+that the strip quietly reverts on every startup — while the GPU, which the task
+wasn't pointed at, keeps whatever you last set. That is a genuinely confusing
+afternoon, and it's avoided by not installing the thing unasked.
+
+`-Boot` registers a Scheduled Task that runs as the `SYSTEM` account — so the
+color is set during boot, before anyone logs in. It copies the binary to
 `C:\Program Files\jdrgb` and uses `--wait` (retry up to ~60s) to tolerate the
 USB controller not being enumerated yet.
 
@@ -486,12 +498,17 @@ resume from sleep**.
 
 ```powershell
 # from an elevated PowerShell (the script self-elevates if needed)
-.\install.ps1                      # boots to the default (coolwhite)
-.\install.ps1 -Color warmwhite     # boot to a preset name (or an RRGGBB hex)
-.\install.ps1 -Config leds.conf    # boot to a saved per-LED pattern
-.\install.ps1 -All -Color warmwhite  # motherboard strip + GPU
-.\install.ps1 -Gpu -Color warmwhite  # GPU only
+.\install.ps1 -Boot                        # boots to the default (coolwhite)
+.\install.ps1 -Boot -Color warmwhite       # boot to a preset name (or an RRGGBB hex)
+.\install.ps1 -Boot -Config leds.conf      # boot to a saved per-LED pattern
+.\install.ps1 -Boot -All -Color warmwhite  # motherboard strip + GPU
+.\install.ps1 -Boot -Gpu -Color warmwhite  # GPU only
 ```
+
+`-Color`, `-Config`, `-Gpu`, `-All` and `-NoWake` all configure the boot task, so
+each one requires `-Boot`. Passing one without it is an error rather than a
+silent no-op, which would otherwise look like the color had been set up when
+nothing was listening.
 
 `-Config` copies your file to `C:\Program Files\jdrgb\leds.conf` and points the
 boot task at it (`jdrgb load … --wait`). It combines with `-Gpu`/`-All`, since a
@@ -499,6 +516,10 @@ config's `gpu:` line can carry the card's colors — if the file has no `gpu:`
 line, jdrgb says so rather than failing silently.
 
 It also adds a resume-from-sleep trigger so the color reasserts after waking.
+
+**Running without `-Boot` removes an existing boot task.** That's how you back
+out of one: `.\install.ps1 -Tray` leaves you the menu and nothing writing flash
+behind your back.
 
 Remove everything with:
 
@@ -513,21 +534,18 @@ opening a terminal. The icon *is* the current color — a filled dot, or a hollo
 ring when the LEDs are off.
 
 ```powershell
-.\install.ps1 -TrayOnly          # the tray at logon, no boot task
-.\install.ps1 -Tray -All -Color warmwhite   # both, if you want the insurance
+.\install.ps1 -Tray                               # the tray at logon, no boot task
+.\install.ps1 -Tray -Boot -All -Color warmwhite   # both, if you want the insurance
 ```
 
-**`-TrayOnly` is usually the one you want.** The color is already held in the
-controllers' flash (see [GPU persistence](#gpu-persistence)), so it survives a
-cold boot with nothing running — which makes the boot task insurance rather
+**`-Tray` on its own is usually the one you want.** The color is already held in
+the controllers' flash (see [GPU persistence](#gpu-persistence)), so it survives
+a cold boot with nothing running — which makes the boot task insurance rather
 than a requirement, and it isn't free: it fires at startup, at logon *and* on
-resume, writing flash each time to reassert a color that was already there.
-Keep it if you want cover for a BIOS update or a CMOS reset. Otherwise the tray
-is the only thing that actually needs to persist, because unlike a color, a
-menu can't be latched into hardware.
-
-`-TrayOnly` refuses `-Color`/`-Config`, which only ever configured the boot
-task, and removes an existing boot task if you're switching over.
+resume, writing flash each time to reassert a color that was already there. Add
+`-Boot` if you want cover for a BIOS update or a CMOS reset. Otherwise the tray
+is the only thing that actually needs to persist, because unlike a color, a menu
+can't be latched into hardware.
 
 The menu carries a shortlist of colors inline and the full palette under
 **All Colors**. Edit `FAVOURITES` in `src/tray/main.rs` to change the
@@ -541,8 +559,8 @@ eye shows up in both without a second edit.
 
 Two tasks because the boot task runs as `SYSTEM` in session 0, which has no
 interactive desktop and therefore no notification area. The tray gets its own
-per-user logon task, unelevated. The boot task is untouched, and still fires
-before anyone logs in.
+per-user logon task, unelevated. Ask for both and they coexist — the boot task
+still fires before anyone logs in.
 
 The tray never touches the hardware. Every click spawns `jdrgb.exe`, which
 means a wedged controller can't take the menu down with it, and any error you'd
