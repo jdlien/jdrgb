@@ -335,6 +335,14 @@ Two rules carry it, and both were got wrong by hand first:
   tray mid-outage and that's your new normal — restoring over it afterwards
   would stomp on a deliberate choice.
 
+Every `--stash` also stamps the stash with a fresh `# stash-id:` comment —
+including one that keeps an existing snapshot, which keeps its colors and gets
+only the new id. `restore` checks that id again before each device it puts back,
+while holding that device: if the stash was removed, replaced or re-stamped since
+it was read, someone has borrowed the lights again (or chosen a color) in the
+meantime, so it stops and leaves the stash for them. The id is what makes that
+check possible at all — the same lighting stashed twice is the same bytes.
+
 `restore` with nothing stashed is a silent success, so a hook that fires twice,
 or on a machine that never stashed, leaves the lights alone rather than failing.
 `jdrgb restore coolwhite` gives it something to fall back on instead.
@@ -446,6 +454,19 @@ gpu.lit.pattern=FF560A,FF5400,FF560A,FF5400
 That record is written only on the way into off, and nothing else clears it.
 `on` only reads it for a device that is off, so a stale one on a lit device is
 never used.
+
+The file also carries `rev=N`, a count of writes. Every write bumps it, even one
+that changes no value, so anything watching the file can tell that *someone
+wrote* when they wrote the same values again — which the values alone can't
+show.
+
+Writes go through a lock on a sidecar file, `state.lock`, so two processes
+recording at once can't lose each other's update, and each one replaces the file
+by writing `last.tmp` and renaming it over `last`, so a reader sees the old file
+or the new one and never a half-written one. A reader in another language has to
+open `last` with delete sharing (`FileShare.Delete` in .NET) or it blocks the
+rename. If a record can't be written, the command says so on stderr: the lights
+changed, but nothing reading the file will know.
 
 The split matters because the same look is a *different* RGB on each (see the
 calibration table above). A shared slot would hand `jdrgb --gpu tune` the strip's
@@ -671,6 +692,15 @@ The rules that came out of it:
   fails rather than interleaving. Repaints *within* one `tune` or `preview`
   session use a 100ms floor instead, because a second and a half per keypress
   would make live tuning useless; that session holds the mutex until it exits.
+- **The strip is serialised too.** A second named mutex, `Global\jdrgb-hid`, is
+  taken before the controller is opened — reading its config table already sends
+  a request — and held until the change is recorded, so two processes can't
+  interleave their reports or record in the wrong order. Unlike the GPU's, it
+  fails closed: if it can't be created, the command refuses rather than write
+  unserialised. Busy is an error that `--wait` retries, after a 10 s wait.
+  Between processes of one user this is guaranteed; between the SYSTEM boot task
+  and a user it isn't (the mutex inherits its creator's DACL), which is why the
+  Home Assistant bridge refuses to be installed alongside the boot task.
 
 Two environment variables:
 

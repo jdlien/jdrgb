@@ -35,19 +35,102 @@ use windows_sys::Win32::Devices::HumanInterfaceDevice::{
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, GENERIC_READ, GENERIC_WRITE,
-    GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_ABANDONED, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
     WriteFile,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
-use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSingleObject};
+use windows_sys::Win32::System::Threading::{
+    CreateEventW, CreateMutexW, ReleaseMutex, ResetEvent, WaitForSingleObject,
+};
 
 /// How long a single report write may take before we give up on it. Generous:
 /// the controller answers in about 4ms, and a stall here means something is
 /// wrong rather than slow.
 const WRITE_TIMEOUT_MS: u32 = 1000;
+
+// ---------------------------------------------------------------------------
+// The cross-process lock
+// ---------------------------------------------------------------------------
+
+/// Serialises the Aura controller across every process on the machine.
+///
+/// The tray queues its own clicks, but the tray, a Home Assistant bridge, a UPS
+/// hook and a hand-run command are four processes that have never heard of each
+/// other, and two of them writing the controller at once is a race with no
+/// winner worth having. `gpu.rs` has had the same lock for the card's I2C bus;
+/// this is its twin for the strip.
+///
+/// Three differences from `gpu.rs`'s `BusLock`, all deliberate:
+///
+///   * **It is taken before the first device operation**, not around the write:
+///     `Interface::open` takes it before `CreateFileW`, and the `Device` owns it
+///     until it is dropped. Discovery is not read-only here — reading the config
+///     table sends a request report — so locking only the paint would leave two
+///     processes interleaving their requests and replies.
+///   * **It fails closed.** `BusLock` carries on unserialised if its mutex can't
+///     be created. This one refuses instead, as a transient error, so `--wait`
+///     retries and the tray says why. Proceeding unlocked is exactly the race the
+///     lock exists to stop.
+///   * **Busy is transient** after the same 10 s wait, so a `tune` or `preview`
+///     session — which holds it for its whole life — makes other commands fail
+///     with a reason rather than interleave with it.
+///
+/// The cross-account caveat is `BusLock`'s, word for word: a mutex created by
+/// the SYSTEM boot task carries that token's default DACL, which an ordinary
+/// user's `CreateMutexW` may be refused. Between processes of one user it is
+/// guaranteed; between the boot task and a user it is not, which is why the
+/// Home Assistant bridge and the boot task are never installed together.
+const HID_MUTEX: &str = "Global\\jdrgb-hid";
+const LOCK_TIMEOUT_MS: u32 = 10_000;
+
+/// A held `HID_MUTEX`, released on drop. The mutex is recursive for the thread
+/// that holds it, so a process opening a second interface while it holds one
+/// (`probe` walks them all) doesn't deadlock itself.
+struct HidLock(HANDLE);
+
+impl HidLock {
+    fn acquire() -> Result<HidLock, String> {
+        Self::acquire_named(HID_MUTEX, LOCK_TIMEOUT_MS)
+    }
+
+    /// Split out so tests can use a mutex of their own and a short wait, rather
+    /// than contend with a real jdrgb for ten seconds.
+    fn acquire_named(name: &str, timeout_ms: u32) -> Result<HidLock, String> {
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        let h = unsafe { CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
+        if h.is_null() {
+            let e = unsafe { GetLastError() };
+            return Err(format!(
+                "could not create or open the controller lock {name} (error {e}) — refusing \
+                 to write unserialised"
+            ));
+        }
+        // WAIT_ABANDONED means the last holder died without releasing. The mutex
+        // is ours now; the controller holds whatever that process last latched,
+        // which is no worse than any other interrupted write.
+        match unsafe { WaitForSingleObject(h, timeout_ms) } {
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(HidLock(h)),
+            _ => {
+                unsafe { CloseHandle(h) };
+                Err("another jdrgb is using the Aura controller (a `tune` or `preview` session \
+                     holds it until it exits)"
+                    .into())
+            }
+        }
+    }
+}
+
+impl Drop for HidLock {
+    fn drop(&mut self) {
+        unsafe {
+            ReleaseMutex(self.0);
+            CloseHandle(self.0);
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Discovery — reads the PnP database, opens nothing
@@ -161,6 +244,9 @@ pub struct Device {
     /// `OutputReportByteLength` as the device reports it. 0 if the driver
     /// wouldn't say, in which case `write` sends what it is given.
     output_report_len: usize,
+    /// Held for as long as the device is open. Declared last so it drops after
+    /// `Device::drop` has closed the handles.
+    _lock: HidLock,
 }
 
 impl Interface {
@@ -177,7 +263,11 @@ impl Interface {
     /// to *write to*. The check costs one local call on a handle we already
     /// hold, and it is free of the hazard this module exists to avoid, because
     /// by this point the device is ours.
+    ///
+    /// The controller lock (`HID_MUTEX`) is taken first, before anything touches
+    /// the device, and travels with the returned `Device`.
     pub fn open(&self) -> Result<Device, String> {
+        let lock = HidLock::acquire()?;
         unsafe {
             let handle = CreateFileW(
                 self.path.as_ptr(),
@@ -230,6 +320,7 @@ impl Interface {
                 handle,
                 event,
                 output_report_len: caps.OutputReportByteLength as usize,
+                _lock: lock,
             })
         }
     }
@@ -445,6 +536,49 @@ mod tests {
         assert_eq!(iface(r"\\?\hid#vid_0b05&pid_19af&mi_02#7&abc&0&0000#{guid}").interface_number(), Some(2));
         assert_eq!(iface(r"\\?\HID#VID_0B05&PID_19AF&MI_02#c&384&0&0000#{guid}").interface_number(), Some(2));
         assert_eq!(iface(r"\\?\HID#VID_0B05&PID_19AF&MI_0A#c&384&0&0000#{guid}").interface_number(), Some(10));
+    }
+
+    /// A mutex name of the test's own, so a real jdrgb running alongside the
+    /// suite is never contended with.
+    fn test_mutex(tag: &str) -> String {
+        format!("Global\\jdrgb-hid-test-{}-{tag}", std::process::id())
+    }
+
+    /// The property the lock exists for: while one holder has it, nobody else
+    /// gets in — they get a transient error that names the reason.
+    #[test]
+    fn a_held_lock_turns_others_away() {
+        let name = test_mutex("held");
+        let held = HidLock::acquire_named(&name, 0).expect("first acquire");
+        let other = {
+            let name = name.clone();
+            // Mutex ownership is per thread, so a second thread stands in for a
+            // second process.
+            std::thread::spawn(move || HidLock::acquire_named(&name, 50).map(|_| ())).join().unwrap()
+        };
+        let e = other.expect_err("a second holder got in while the lock was held");
+        assert!(e.contains("another jdrgb"), "{e}");
+        drop(held);
+    }
+
+    #[test]
+    fn dropping_the_lock_lets_the_next_holder_in() {
+        let name = test_mutex("drop");
+        drop(HidLock::acquire_named(&name, 0).expect("first acquire"));
+        let name2 = name.clone();
+        let next = std::thread::spawn(move || HidLock::acquire_named(&name2, 50).map(|_| ())).join();
+        assert!(next.unwrap().is_ok(), "the lock was not released on drop");
+    }
+
+    /// `probe` opens interfaces while it already holds one; the same thread must
+    /// be able to take the lock again rather than wait ten seconds on itself.
+    #[test]
+    fn the_holding_thread_can_take_it_again() {
+        let name = test_mutex("recursive");
+        let a = HidLock::acquire_named(&name, 0).expect("first acquire");
+        let b = HidLock::acquire_named(&name, 0).expect("the holder was refused its own lock");
+        drop(b);
+        drop(a);
     }
 
     #[test]

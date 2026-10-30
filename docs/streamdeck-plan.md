@@ -131,6 +131,13 @@ the README:
 Adding `status --json` stays open if a consumer ever turns up that cannot watch
 a file. Nothing needs it today.
 
+*Added 2026-10-29, from the Home Assistant work:* the file is now replaced by
+writing `last.tmp` and renaming it over `last`, so the C# reader must open it
+with `FileShare.Delete` (as well as read/write sharing), or it blocks the rename.
+A `FileSystemWatcher` will see the rename rather than a modification, so watch
+for both. The file also carries `rev=N`, bumped on every write — the cheap way to
+tell that something wrote, even when the values didn't change.
+
 ## Traps the consumer will hit
 
 1. **A preset name resolves per device; an explicit hex is literal.** If the

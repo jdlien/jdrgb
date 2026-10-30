@@ -9,6 +9,8 @@
 //! Deliberately excludes `Target` and the effect-mode constants: those describe
 //! a command, not a color, and the tray builds its commands as CLI arguments.
 
+use std::path::Path;
+
 // ---------------------------------------------------------------------------
 // Tables
 // ---------------------------------------------------------------------------
@@ -380,6 +382,12 @@ impl Last {
 ///
 /// The `*_lit` fields are what `jdrgb on` brings back. Without them `off` was
 /// one-way: it overwrote the only record of what had been showing.
+///
+/// `rev` counts writes. Every `update` bumps it, whether or not any value
+/// changed, so a reader can tell that *someone wrote* even when they wrote
+/// identical values — which values alone can't show. A counter rather than the
+/// modification time because file timestamps come from a clock that can tick as
+/// coarsely as ~15 ms, so two writes could share one.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct State {
     pub mb: Option<Last>,
@@ -388,6 +396,7 @@ pub struct State {
     pub gpu_pattern: Option<Vec<(u8, u8, u8)>>,
     pub mb_lit: Option<Lit>,
     pub gpu_lit: Option<Lit>,
+    pub rev: u64,
 }
 
 /// What a device was showing the last time it went from lit to off.
@@ -398,7 +407,7 @@ pub struct State {
 /// It is written only on the way *into* off, and survives everything else on
 /// purpose. A second `off` must not trade the colour for "nothing", and a
 /// borrowed colour painted over a dark room must not become what `on` brings
-/// back (see `keep_lit_from`).
+/// back (see `keep_lit_records`).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Lit {
     Color((u8, u8, u8)),
@@ -421,7 +430,17 @@ impl Lit {
 impl State {
     /// `record`'s edit, without the file I/O.
     pub fn record(&mut self, gpu: bool, last: Last) {
-        if last == Last::Off && self.slot(gpu) != Some(Last::Off) {
+        self.record_with(gpu, last, true);
+    }
+
+    /// `record`'s edit in keep-lit mode: the slot changes, the lit record
+    /// doesn't. See `keep_lit_records`.
+    pub fn record_keeping_lit(&mut self, gpu: bool, last: Last) {
+        self.record_with(gpu, last, false);
+    }
+
+    fn record_with(&mut self, gpu: bool, last: Last, lit_transition: bool) {
+        if lit_transition && last == Last::Off && self.slot(gpu) != Some(Last::Off) {
             let showing = self.replayable(gpu);
             *self.lit_mut(gpu) = showing;
         }
@@ -435,18 +454,6 @@ impl State {
         let (slot, pattern) = self.slot_mut(gpu);
         *slot = Some(Last::Multi);
         *pattern = Some(colors.to_vec());
-    }
-
-    /// Put back the lit records from `before`, undoing what an apply in
-    /// between did to them.
-    ///
-    /// For `restore`. Lights off, a UPS hook paints them amber with `--stash`,
-    /// mains restores them to off — and that restore is a move from lit into
-    /// off, which on its own would record *amber* as what to bring back. The
-    /// stash put the room back; it should put this back too.
-    pub fn keep_lit_from(&mut self, before: &State) {
-        self.mb_lit = before.mb_lit.clone();
-        self.gpu_lit = before.gpu_lit.clone();
     }
 
     pub fn lit(&self, gpu: bool) -> Option<&Lit> {
@@ -524,6 +531,7 @@ pub fn parse_state(text: &str) -> State {
             "gpu.lit" => gpu_lit = Last::decode(value),
             "mb.lit.pattern" => mb_lit_pattern = decode_pattern(value),
             "gpu.lit.pattern" => gpu_lit_pattern = decode_pattern(value),
+            "rev" => s.rev = value.parse().unwrap_or(0),
             _ => {}
         }
     }
@@ -552,6 +560,9 @@ fn encode_pattern(colors: &[(u8, u8, u8)]) -> String {
 
 pub fn encode_state(s: &State) -> String {
     let mut out = String::new();
+    if s.rev != 0 {
+        out.push_str(&format!("rev={}\n", s.rev));
+    }
     if let Some(v) = s.mb {
         out.push_str(&format!("mb={}\n", v.encode()));
     }
@@ -577,9 +588,16 @@ pub fn encode_state(s: &State) -> String {
 }
 
 pub fn load_state_full() -> State {
-    match state_path().and_then(|p| std::fs::read_to_string(p).ok()) {
-        Some(text) => parse_state(&text),
+    match state_path() {
+        Some(p) => load_state_at(&p),
         None => State::default(),
+    }
+}
+
+fn load_state_at(path: &Path) -> State {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse_state(&text),
+        Err(_) => State::default(),
     }
 }
 
@@ -590,18 +608,203 @@ pub fn load_state() -> (Option<Last>, Option<Last>) {
     (s.mb, s.gpu)
 }
 
-/// Read-modify-write the state file. Best-effort; failures are ignored.
+// ---------------------------------------------------------------------------
+// Writing the state file: one writer at a time, readers never see half a file
+// ---------------------------------------------------------------------------
+
+/// How long a writer waits for another to finish with the state file before
+/// giving up on its record. A write takes microseconds; this only matters when
+/// something is badly stuck.
+const STATE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Exclusive use of the state file and the stash beside it, for one
+/// read-modify-write. Released on drop.
 ///
-/// Only the process that actually wrote to a device calls this — which is always
-/// `jdrgb.exe`. The tray reads this file but never writes it.
-fn update(edit: impl FnOnce(&mut State)) {
-    let Some(path) = state_path() else { return };
+/// A lock on a sidecar file rather than on the state file itself, because the
+/// state file is replaced by rename (see `write_atomic`) and a lock on a file
+/// that is about to be replaced protects nothing. Per-file, so it is naturally
+/// scoped to the user whose file it is — the SYSTEM boot task has its own.
+///
+/// **Not re-entrant.** It is a `LockFileEx` lock, held per handle, so a holder
+/// that calls `update` (directly, or through `record`) waits on itself and
+/// gives up after `STATE_LOCK_WAIT`. Take it only around reads and direct
+/// writes, never around anything that records.
+pub struct StateLock(std::fs::File);
+
+impl Drop for StateLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+/// Take the state lock for this user, or `None` if it couldn't be had in time.
+pub fn lock_state() -> Option<StateLock> {
+    lock_at(&state_path()?.with_file_name("state.lock"))
+}
+
+fn lock_at(path: &Path) -> Option<StateLock> {
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let mut s = load_state_full();
+    let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path).ok()?;
+    let deadline = std::time::Instant::now() + STATE_LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Some(StateLock(file)),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Replace `path` with `text` so that a reader sees the old file or the new
+/// one, never a truncated one.
+///
+/// `std::fs::write` truncates and then writes, and the tray — and now a bridge
+/// polling once a second — can read between the two. Writing a temporary file
+/// and renaming it over the original closes that window: `rename` is
+/// `MoveFileExW` with replace on Windows. Rust's `File::open` shares delete
+/// access, so a Rust reader holding the file open doesn't block the rename.
+///
+/// Something else can — a virus scanner opening a fresh file, say — so the
+/// rename is retried briefly, and if it still won't go the file is written in
+/// place: a torn read is a better outcome than a lost record. Returns whether
+/// anything was written.
+pub fn write_atomic(path: &Path, text: &str) -> bool {
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, text).is_err() {
+        return false;
+    }
+    for _ in 0..10 {
+        if std::fs::rename(&tmp, path).is_ok() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::write(path, text).is_ok()
+}
+
+/// Read-modify-write the state file, under the state lock, bumping `rev`.
+///
+/// Best-effort, as it always was: a record that can't be written is not worth
+/// failing the command over, since the lights already changed. But a skipped
+/// record makes every reader wrong about what's showing, so it is noted
+/// (`record_failed`) for `jdrgb.exe` to say so on stderr — which the tray and
+/// the bridge both surface. This module itself never prints.
+///
+/// Only the process that actually wrote to a device calls this — which is always
+/// `jdrgb.exe`. The tray and the bridge read this file but never write it.
+fn update(edit: impl FnOnce(&mut State)) {
+    let Some(path) = state_path() else { return };
+    if !update_at(&path, edit) {
+        RECORD_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+static RECORD_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether any record in this process failed to land.
+pub fn record_failed() -> bool {
+    RECORD_FAILED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn update_at(path: &Path, edit: impl FnOnce(&mut State)) -> bool {
+    let Some(_lock) = lock_at(&path.with_file_name("state.lock")) else { return false };
+    let mut s = load_state_at(path);
     edit(&mut s);
-    let _ = std::fs::write(path, encode_state(&s));
+    s.rev = s.rev.wrapping_add(1);
+    write_atomic(path, &encode_state(&s))
+}
+
+/// Keep-lit mode, process-wide: `record` changes slots but not lit records.
+///
+/// For `restore`. Lights off, a UPS hook paints them amber with `--stash`, mains
+/// restores them to off — and that restore is a move from lit into off, which
+/// on its own would record *amber* as what `on` brings back. The stash put the
+/// room back; it must put this back too, which here means leaving it alone.
+///
+/// Process-wide is safe because `restore` is the whole of that process's work.
+/// It replaced an earlier approach that snapshotted both lit records and wrote
+/// the snapshot back afterwards, which could overwrite a lit record another
+/// process had recorded in between.
+static KEEP_LIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn keep_lit_records() {
+    KEEP_LIT.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn keeping_lit() -> bool {
+    KEEP_LIT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
+// The stash's identity
+// ---------------------------------------------------------------------------
+
+/// Where `--stash` keeps its snapshot, beside the state file.
+pub fn stash_path() -> Option<std::path::PathBuf> {
+    state_path().map(|p| p.with_file_name("stash.conf"))
+}
+
+/// The comment line that names one borrow. Every `--stash` writes a fresh one,
+/// including a `--stash` that keeps an existing snapshot, so that "is this still
+/// the stash I read?" has an answer. Contents can't give one: the same lighting
+/// stashed twice is the same bytes, and a reused snapshot is the same bytes by
+/// definition. A comment, so the config grammar `load` reads is unchanged.
+pub const STASH_ID_PREFIX: &str = "# stash-id:";
+
+/// A fresh stash id: milliseconds since the epoch and the process id, which is
+/// unique enough for something written a few times a day.
+pub fn new_stash_id() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("{ms}-{}", std::process::id())
+}
+
+/// What identifies a stash's text: its id line, or — for one written before
+/// stashes had ids — the whole text, which is the best a legacy stash offers.
+pub fn stash_identity(text: &str) -> String {
+    text.lines()
+        .find_map(|l| l.strip_prefix(STASH_ID_PREFIX).map(|id| id.trim().to_string()))
+        .unwrap_or_else(|| text.to_string())
+}
+
+/// The stash on disk's identity, or `None` when there isn't one. The bridge
+/// watches this; `restore` compares against it before each leg.
+///
+/// This reads what's there, whatever its age — judging a stash stale is the
+/// CLI's job (`read_stash` in `main.rs`), and it deletes one on sight.
+pub fn current_stash_identity() -> Option<String> {
+    std::fs::read_to_string(stash_path()?).ok().map(|t| stash_identity(&t))
+}
+
+/// Give a stash a new id, keeping everything else — the colors it holds are the
+/// first snapshot's, which is the point of keeping it.
+pub fn restamp_stash(text: &str, id: &str) -> String {
+    let line = format!("{STASH_ID_PREFIX} {id}");
+    let mut found = false;
+    let mut out: Vec<String> = text
+        .lines()
+        .map(|l| {
+            if l.starts_with(STASH_ID_PREFIX) {
+                found = true;
+                line.clone()
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    if !found {
+        out.insert(0, line);
+    }
+    let mut joined = out.join("\n");
+    joined.push('\n');
+    joined
 }
 
 /// Record what one device was just set to, leaving the other's slot untouched.
@@ -614,24 +817,23 @@ fn update(edit: impl FnOnce(&mut State)) {
 /// describing a frame we could replay, so any frame on file is from an older
 /// state and must go.
 ///
-/// Recording `Off` over something lit keeps what was lit, for `jdrgb on`.
+/// Recording `Off` over something lit keeps what was lit, for `jdrgb on` —
+/// except in keep-lit mode (`keep_lit_records`), where lit records stay put.
 pub fn record(gpu: bool, last: Last) {
-    update(|s| s.record(gpu, last));
+    let keep = keeping_lit();
+    update(|s| {
+        if keep {
+            s.record_keeping_lit(gpu, last)
+        } else {
+            s.record(gpu, last)
+        }
+    });
 }
 
 /// Record a per-LED frame: `Multi` for anything reading the colour slot, plus
 /// the colours themselves so `jdrgb state` can reproduce it.
 pub fn record_pattern(gpu: bool, colors: &[(u8, u8, u8)]) {
     update(|s| s.record_pattern(gpu, colors));
-}
-
-/// Run an apply without letting it change what `on` will bring back. See
-/// `State::keep_lit_from` for why `restore` needs this.
-pub fn keeping_lit<T>(apply: impl FnOnce() -> T) -> T {
-    let before = load_state_full();
-    let out = apply();
-    update(|s| s.keep_lit_from(&before));
-    out
 }
 
 /// The last solid color set on one device, if there is one to resume from.
@@ -976,12 +1178,141 @@ mod tests {
         let mut s = slots(Some(Last::Color(WARM)), None);
         s.record(false, Last::Off);
         s.record(false, Last::Color(AMBER)); // borrowed
-        let before = s.clone();
-        s.record(false, Last::Off); // the stash, put back
-        assert_eq!(s.lit(false), Some(&Lit::Color(AMBER)), "precondition: off alone records the borrow");
-        s.keep_lit_from(&before);
+
+        let mut plain = s.clone();
+        plain.record(false, Last::Off);
+        assert_eq!(plain.lit(false), Some(&Lit::Color(AMBER)), "precondition: off alone records the borrow");
+
+        s.record_keeping_lit(false, Last::Off); // the stash, put back by `restore`
         assert_eq!(s.lit(false), Some(&Lit::Color(WARM)));
         assert_eq!(s.mb, Some(Last::Off));
+    }
+
+    // ---- the state file on disk ------------------------------------------
+
+    /// A directory of the test's own, so nothing here touches the real
+    /// `%LOCALAPPDATA%\jdrgb`.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("jdrgb-test-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("last")
+    }
+
+    #[test]
+    fn rev_round_trips_and_a_fresh_state_writes_none() {
+        assert!(!encode_state(&State::default()).contains("rev="));
+        let s = State { rev: 42, ..slots(Some(Last::Off), None) };
+        assert_eq!(parse_state(&encode_state(&s)).rev, 42);
+        assert_eq!(parse_state("rev=nonsense\nmb=off\n").rev, 0, "garbage reads as never written");
+    }
+
+    /// The reason `rev` exists: a write that repeats the same values is still
+    /// a write, and someone watching for "anyone acted" must see it.
+    #[test]
+    fn every_update_bumps_rev_even_when_nothing_changed() {
+        let path = scratch("rev");
+        for _ in 0..3 {
+            assert!(update_at(&path, |s| s.record(false, Last::Color(WARM))));
+        }
+        let s = load_state_at(&path);
+        assert_eq!(s.rev, 3);
+        assert_eq!(s.mb, Some(Last::Color(WARM)));
+    }
+
+    /// Two processes recording different devices used to be able to lose one
+    /// another's update: both read, both edited, the second write won. Under
+    /// the lock, every write lands — which `rev` counts exactly.
+    #[test]
+    fn concurrent_records_lose_nothing() {
+        let path = scratch("concurrent");
+        let writers: Vec<_> = (0..4)
+            .map(|t| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    for i in 0..25u8 {
+                        let gpu = t % 2 == 1;
+                        assert!(update_at(&path, |s| s.record(gpu, Last::Color((t as u8, i, 0)))));
+                    }
+                })
+            })
+            .collect();
+        for w in writers {
+            w.join().unwrap();
+        }
+        let s = load_state_at(&path);
+        assert_eq!(s.rev, 100, "an update was lost");
+        assert!(s.mb.is_some() && s.gpu.is_some(), "a device's record was lost: {s:?}");
+    }
+
+    /// A reader polling while writes land must only ever see a whole file. The
+    /// old truncate-then-write could hand it an empty one, which reads as
+    /// "nothing recorded" — the bridge would have published unknown.
+    #[test]
+    fn a_reader_never_sees_a_torn_file() {
+        let path = scratch("torn");
+        assert!(update_at(&path, |s| s.record(false, Last::Color(WARM))));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let (path, stop) = (path.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut reads = 0;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Ok(text) = std::fs::read_to_string(&path) {
+                        let s = parse_state(&text);
+                        assert!(s.rev > 0 && s.mb.is_some(), "read a partial file: {text:?}");
+                        reads += 1;
+                    }
+                }
+                reads
+            })
+        };
+        for i in 0..200u8 {
+            assert!(update_at(&path, |s| s.record(false, Last::Color((i, 0x95, 0x36)))));
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(reader.join().unwrap() > 0, "the reader never got a read in");
+    }
+
+    #[test]
+    fn a_held_state_lock_turns_a_writer_away_rather_than_hanging() {
+        let path = scratch("held");
+        let held = lock_at(&path.with_file_name("state.lock")).expect("lock");
+        let started = std::time::Instant::now();
+        assert!(!update_at(&path, |s| s.record(false, Last::Off)), "wrote through a held lock");
+        assert!(started.elapsed() < STATE_LOCK_WAIT * 3, "waited far longer than the bound");
+        drop(held);
+        assert!(update_at(&path, |s| s.record(false, Last::Off)), "the lock wasn't released");
+    }
+
+    // ---- stash identity ---------------------------------------------------
+
+    #[test]
+    fn restamping_keeps_the_snapshot_and_replaces_only_the_id() {
+        let stash = "# jdrgb stash\n# stash-id: 1-1\n\nmb: FA9536   # warmwhite\ngpu: off\n";
+        let again = restamp_stash(stash, "2-2");
+        assert_eq!(stash_identity(&again), "2-2");
+        assert!(again.contains("mb: FA9536") && again.contains("gpu: off"), "{again}");
+        assert_eq!(again.matches(STASH_ID_PREFIX).count(), 1, "{again}");
+    }
+
+    /// A stash written before ids existed gets one on its first re-stamp, and
+    /// until then is identified by its whole text.
+    #[test]
+    fn a_legacy_stash_is_identified_by_its_contents_until_stamped() {
+        let legacy = "# jdrgb stash\n\nmb: off\n";
+        assert_eq!(stash_identity(legacy), legacy);
+        let stamped = restamp_stash(legacy, "3-3");
+        assert_eq!(stash_identity(&stamped), "3-3");
+        assert!(stamped.contains("mb: off"));
+    }
+
+    #[test]
+    fn identical_lighting_stashed_twice_is_two_identities() {
+        let body = "mb: FA9536\n";
+        let a = restamp_stash(body, "10-1");
+        let b = restamp_stash(body, "11-1");
+        assert_ne!(stash_identity(&a), stash_identity(&b));
     }
 
     /// A lit record that can't be replayed is no record. `on` falls back to the

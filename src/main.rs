@@ -189,9 +189,9 @@ fn main() -> ExitCode {
         Command::Load(path) => read_led_config(&path)
             .and_then(|conf| {
                 let mut done = Landed::default();
-                with_retry(wait, || apply_config(&conf, &path, target, &mut done))
+                with_retry(wait, || apply_config(&conf, &path, target, &mut done, &|| true))
             })
-            .map(|()| println!("jdrgb: loaded {path}")),
+            .map(|_| println!("jdrgb: loaded {path}")),
         Command::Template(path) => write_template(&path, force).map(|()| {
             println!("jdrgb: wrote {path} ({STRIP_LEDS} LEDs) — edit it, then `jdrgb load {path}`");
         }),
@@ -212,6 +212,16 @@ fn main() -> ExitCode {
             tune(target, rgb)
         }
     };
+
+    // A record that didn't land leaves every reader of the state file wrong
+    // about what's showing. The lights did change, so it isn't a failure, but
+    // the tray and the bridge both surface this line.
+    if record_failed() {
+        eprintln!(
+            "jdrgb: warning: couldn't record this change in the state file — the lights \
+             changed, but the tray and anything else reading it won't know"
+        );
+    }
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -400,7 +410,6 @@ fn set_solid_targets(target: Target, wait: bool, mode: u8, paint: Paint) -> Resu
             match apply_gpu_solid(mode, color) {
                 Ok(()) => {
                     report(labelled.then_some("gpu"), mode, color);
-                    record(true, last_for(mode, color));
                     gpu_ok = true;
                 }
                 Err(e) => {
@@ -447,16 +456,114 @@ fn last_for(mode: u8, color: (u8, u8, u8)) -> Last {
     }
 }
 
-/// Discover, validate, and write the GPU exactly once.
+/// Discover, validate, write and record the GPU exactly once.
 fn apply_gpu_solid(mode: u8, color: (u8, u8, u8)) -> Result<(), gpu::Error> {
-    apply_gpu_colors(mode, &[color])
+    gpu_leg(|| Decision::Apply(Zone::Solid { mode, rgb: color })).map(|_| ())
 }
 
-/// As above, but driving the card's LEDs individually.
-fn apply_gpu_colors(mode: u8, colors: &[(u8, u8, u8)]) -> Result<(), gpu::Error> {
+// ---------------------------------------------------------------------------
+// Device legs: decide, write and record while holding the device
+// ---------------------------------------------------------------------------
+//
+// Every device write goes through one of the two functions below, which hold
+// the device — and so its cross-process lock — from the first operation to the
+// record. Two things depend on that:
+//
+//   * **Recording inside the lock.** Two processes could otherwise finish their
+//     writes in one order and record them in the other, leaving the state file
+//     naming the color that lost.
+//   * **Deciding inside the lock.** `on` and `restore` act on what the record
+//     says; reading it before taking the device lets another process change it
+//     in between. So the decision is a closure run once the device is held.
+
+/// What one device leg should do, decided while holding that device.
+enum Decision {
+    Apply(Zone),
+    /// Nothing to do — `on` for a device that isn't off.
+    Skip,
+    /// Someone else acted since this command started — `restore` found its
+    /// stash replaced. The leg stops without writing.
+    Superseded,
+}
+
+/// What a leg did. `Applied` carries the zone as it went out, padding included.
+#[derive(Debug, PartialEq)]
+enum Leg {
+    Applied(Zone),
+    Skipped,
+    Superseded,
+}
+
+/// The strip: open (which takes the controller lock), decide, write, record.
+fn strip_leg(decide: impl FnOnce() -> Decision) -> Result<Leg, String> {
+    let (dev, cfg) = open_controller()?;
+    let headers = header_count(&cfg);
+    if headers == 0 {
+        return Err("config table reported no addressable headers".into());
+    }
+    let zone = match decide() {
+        Decision::Apply(zone) => zone,
+        Decision::Skip => return Ok(Leg::Skipped),
+        Decision::Superseded => return Ok(Leg::Superseded),
+    };
+    match zone {
+        Zone::Solid { mode, rgb } => {
+            apply_solid(&dev, headers, mode, rgb, true)?;
+            record(false, last_for(mode, rgb));
+            Ok(Leg::Applied(Zone::Solid { mode, rgb }))
+        }
+        Zone::Frame(frame) => {
+            // Padded to the strip's full length with "off" so every LED is
+            // defined — and the padded frame is what gets recorded, because the
+            // padding is part of what the strip is now showing.
+            let mut colors = frame;
+            if colors.len() < STRIP_LEDS {
+                colors.resize(STRIP_LEDS, (0, 0, 0));
+            }
+            for ch in 0..headers {
+                send_direct(&dev, ch, &colors)?;
+            }
+            record_pattern(false, &colors);
+            Ok(Leg::Applied(Zone::Frame(colors)))
+        }
+    }
+}
+
+/// The card: detect (which takes the bus lock), decide, then — only if there is
+/// something to write — prepare, write, record. Deciding before `prepare` means
+/// a leg with nothing to do costs no I2C at all.
+fn gpu_leg(decide: impl FnOnce() -> Decision) -> Result<Leg, gpu::Error> {
     let mut card = gpu::detect()?;
+    let zone = match decide() {
+        Decision::Apply(zone) => zone,
+        Decision::Skip => return Ok(Leg::Skipped),
+        Decision::Superseded => return Ok(Leg::Superseded),
+    };
     card.prepare()?;
-    card.apply_colors(mode, colors)
+    match &zone {
+        Zone::Solid { mode, rgb } => {
+            card.apply_colors(*mode, &[*rgb])?;
+            record(true, last_for(*mode, *rgb));
+        }
+        Zone::Frame(colors) => {
+            card.apply_colors(MODE_STATIC, colors)?;
+            record_pattern(true, colors);
+        }
+    }
+    Ok(Leg::Applied(zone))
+}
+
+/// Say what a leg did, the way each path always has: a solid names its color,
+/// a card frame lists its LEDs, and a strip frame is quiet (38 values is noise).
+fn report_zone(label: &str, zone: &Zone) {
+    match zone {
+        Zone::Solid { mode, rgb } => report(Some(label), *mode, *rgb),
+        Zone::Frame(colors) if label == "gpu" => {
+            let hex: Vec<String> = colors.iter().map(|&(r, g, b)| format!("#{r:02X}{g:02X}{b:02X}")).collect();
+            println!("jdrgb: gpu: set {}", hex.join(" "));
+        }
+        Zone::Frame(_) => {}
+    }
 }
 
 fn report(label: Option<&str>, mode: u8, (r, g, b): (u8, u8, u8)) {
@@ -581,14 +688,7 @@ fn header_count(cfg: &[u8; 60]) -> u8 {
 }
 
 fn set_solid(mode: u8, color: (u8, u8, u8)) -> Result<(), String> {
-    let (dev, cfg) = open_controller()?;
-    let headers = header_count(&cfg);
-    if headers == 0 {
-        return Err("config table reported no addressable headers".into());
-    }
-    apply_solid(&dev, headers, mode, color, true)?;
-    record(false, last_for(mode, color));
-    Ok(())
+    strip_leg(|| Decision::Apply(Zone::Solid { mode, rgb: color })).map(|_| ())
 }
 
 /// Set every header to one color. Each header is one effect "channel" of a
@@ -716,15 +816,34 @@ struct Landed {
     gpu: bool,
 }
 
-/// Paint an already-parsed config via direct mode.
-/// The strip is padded to its full length with "off" so every LED is defined.
+/// How an `apply_config` sequence ended. `Superseded` is not a failure: it means
+/// the caller's `still_current` check said someone else had acted, and the
+/// remaining legs were left alone.
+#[derive(Debug, PartialEq)]
+enum Flow {
+    Done,
+    Superseded,
+}
+
+/// Paint an already-parsed config. The strip is padded to its full length with
+/// "off" so every LED is defined.
 ///
 /// Parsing happens in the caller, outside the `--wait` retry loop: a missing or
 /// malformed file will never become valid by waiting, and re-reading it 120
 /// times just delays the error by a minute. Only the device work belongs in a
 /// retry, since that genuinely can start succeeding once the controller
 /// enumerates.
-fn apply_config(conf: &LedConfig, path: &str, target: Target, done: &mut Landed) -> Result<(), String> {
+///
+/// `still_current` runs inside each device leg, while that device is held, just
+/// before its write. `load` passes `|| true`; `restore` passes a check that its
+/// stash is still the one it read.
+fn apply_config(
+    conf: &LedConfig,
+    path: &str,
+    target: Target,
+    done: &mut Landed,
+    still_current: &dyn Fn() -> bool,
+) -> Result<Flow, String> {
     let mut failures = Vec::new();
     // A file may legitimately describe only one device — `jdrgb state` writes
     // exactly that when only one slot is recorded. So a zone the file doesn't
@@ -735,58 +854,41 @@ fn apply_config(conf: &LedConfig, path: &str, target: Target, done: &mut Landed)
     // "describes nothing" check below stays right across a retry.
     let mut applied = usize::from(done.mb) + usize::from(done.gpu);
     let mut missing = Vec::new();
+    let decide = |zone: &Zone| {
+        if still_current() {
+            Decision::Apply(zone.clone())
+        } else {
+            Decision::Superseded
+        }
+    };
 
     if target.mb() && !done.mb {
         match &conf.mb {
             None => missing.push("mb"),
-            Some(Zone::Solid { mode, rgb }) => match set_solid(*mode, *rgb) {
-                Ok(()) => {
-                    report(Some("mb"), *mode, *rgb);
+            Some(zone) => match strip_leg(|| decide(zone)) {
+                Ok(Leg::Applied(z)) => {
+                    report_zone("mb", &z);
                     done.mb = true;
                     applied += 1;
                 }
+                Ok(Leg::Superseded) => return Ok(Flow::Superseded),
+                Ok(Leg::Skipped) => {}
                 Err(e) => failures.push(format!("mb: {e}")),
             },
-            Some(Zone::Frame(frame)) => {
-                let mut colors = frame.clone();
-                if colors.len() < STRIP_LEDS {
-                    colors.resize(STRIP_LEDS, (0, 0, 0));
-                }
-                match paint_strip(&colors) {
-                    // The padded frame, not the file's, because the padding is
-                    // part of what the strip is now showing.
-                    Ok(()) => {
-                        record_pattern(false, &colors);
-                        done.mb = true;
-                        applied += 1;
-                    }
-                    Err(e) => failures.push(format!("mb: {e}")),
-                }
-            }
         }
     }
 
     if target.gpu() && !done.gpu {
         match &conf.gpu {
             None => missing.push("gpu"),
-            Some(Zone::Solid { mode, rgb }) => match apply_gpu_solid(*mode, *rgb) {
-                Ok(()) => {
-                    report(Some("gpu"), *mode, *rgb);
-                    record(true, last_for(*mode, *rgb));
+            Some(zone) => match gpu_leg(|| decide(zone)) {
+                Ok(Leg::Applied(z)) => {
+                    report_zone("gpu", &z);
                     done.gpu = true;
                     applied += 1;
                 }
-                Err(e) => failures.push(format!("gpu: {}", e.msg)),
-            },
-            Some(Zone::Frame(colors)) => match apply_gpu_colors(MODE_STATIC, colors) {
-                Ok(()) => {
-                    let hex: Vec<String> =
-                        colors.iter().map(|&(r, g, b)| format!("#{r:02X}{g:02X}{b:02X}")).collect();
-                    println!("jdrgb: gpu: set {}", hex.join(" "));
-                    record_pattern(true, colors);
-                    done.gpu = true;
-                    applied += 1;
-                }
+                Ok(Leg::Superseded) => return Ok(Flow::Superseded),
+                Ok(Leg::Skipped) => {}
                 Err(e) => failures.push(format!("gpu: {}", e.msg)),
             },
         }
@@ -797,18 +899,10 @@ fn apply_config(conf: &LedConfig, path: &str, target: Target, done: &mut Landed)
         return Err(format!("{path} describes nothing for {what}"));
     }
     if failures.is_empty() {
-        Ok(())
+        Ok(Flow::Done)
     } else {
         Err(failures.join("; "))
     }
-}
-
-fn paint_strip(colors: &[(u8, u8, u8)]) -> Result<(), String> {
-    let (dev, cfg) = open_controller()?;
-    for ch in 0..header_count(&cfg) {
-        send_direct(&dev, ch, colors)?;
-    }
-    Ok(())
 }
 
 /// What a config asks of one device.
@@ -816,7 +910,7 @@ fn paint_strip(colors: &[(u8, u8, u8)]) -> Result<(), String> {
 /// The two variants are the two apply paths the controller actually has, so
 /// this maps one-to-one onto them rather than describing a third thing that has
 /// to be translated.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Zone {
     /// Effect mode: one color across the whole zone, or the controller's own
     /// off mode. `off` is not `black` — they put the same bytes on the wire and
@@ -1109,10 +1203,6 @@ fn state_body(st: &State, target: Target) -> (String, Vec<&'static str>) {
 /// being sampled at the same instant.
 const STASH_SLACK: std::time::Duration = std::time::Duration::from_secs(5);
 
-fn stash_path() -> Option<std::path::PathBuf> {
-    state_path().map(|p| p.with_file_name("stash.conf"))
-}
-
 /// Milliseconds since this machine booted.
 fn uptime() -> std::time::Duration {
     use windows_sys::Win32::System::SystemInformation::GetTickCount64;
@@ -1154,31 +1244,41 @@ fn read_stash(path: &std::path::Path) -> Option<String> {
 /// Snapshot the whole recorded state — both devices, whatever `--gpu`/`--all`
 /// says, because "put the room back" is inherently whole-machine.
 ///
+/// Under the state lock, so two hooks firing together can't both decide there's
+/// no stash yet. Every call stamps a fresh `stash-id`, *including* one that
+/// keeps an existing snapshot under the first-snapshot-wins rule: that is what
+/// lets a `restore` already in flight see that someone has borrowed the lights
+/// again since it read the stash (see `restore`).
+///
 /// Silent no-ops on purpose: a stash is a convenience, and a hook that can't
 /// write one should still get on with setting the color.
 fn stash_now() {
     let Some(path) = stash_path() else { return };
-    if read_stash(&path).is_some() {
-        return; // an earlier hook already saved the original; keep it
+    let Some(_lock) = lock_state() else { return };
+    let id = new_stash_id();
+    if let Some(text) = read_stash(&path) {
+        // An earlier hook already saved the original: keep its colors, stamp
+        // this borrow.
+        write_atomic(&path, &restamp_stash(&text, &id));
+        return;
     }
     let (body, _) = state_body(&load_state_full(), Target::All);
     if body.is_empty() {
         return; // nothing recorded, so nothing to put back
     }
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let _ = std::fs::write(
+    write_atomic(
         &path,
-        format!(
+        &format!(
             "# jdrgb stash — what was showing before something borrowed the lights.\n\
-             # Written by --stash; `jdrgb restore` applies this and deletes it.\n\n{body}"
+             # Written by --stash; `jdrgb restore` applies this and deletes it.\n\
+             {STASH_ID_PREFIX} {id}\n\n{body}"
         ),
     );
 }
 
 fn clear_stash() {
     if let Some(p) = stash_path() {
+        let _lock = lock_state();
         let _ = std::fs::remove_file(p);
     }
 }
@@ -1190,19 +1290,42 @@ fn clear_stash() {
 /// alone rather than fail a hook. `fallback` covers the one case where doing
 /// nothing is unhelpful — a boot-task-only machine, whose apply recorded to
 /// SYSTEM's profile, so the user's session has no state to have stashed.
+///
+/// The stash is checked again before each device leg, while that device is
+/// held: if it was removed, replaced or re-stamped since it was read, someone
+/// has borrowed the lights again — or chosen a color — since this restore
+/// started, and putting the old snapshot back would undo their decision. So it
+/// stops there and leaves the stash for whoever owns it now.
 fn restore(target: Target, fallback: Option<Paint>, wait: bool) -> Result<(), String> {
     let path = stash_path().ok_or("no LOCALAPPDATA, so no stash")?;
     let shown = path.display().to_string();
-    match read_stash(&path) {
+    let snapshot = {
+        let _lock = lock_state();
+        read_stash(&path)
+    };
+    match snapshot {
         Some(text) => {
+            let ours = stash_identity(&text);
             let conf = parse_led_config(&text, &shown)?;
+            // A stash that says `off` would otherwise record the borrowed color
+            // as what `on` brings back.
+            keep_lit_records();
+            let still_ours = || current_stash_identity().as_deref() == Some(ours.as_str());
             let mut done = Landed::default();
-            // A stash that says `off` would otherwise record the borrowed
-            // color as what `on` brings back. See `State::keep_lit_from`.
-            keeping_lit(|| with_retry(wait, || apply_config(&conf, &shown, target, &mut done)))?;
-            // Only once it actually landed: a failed restore that dropped the
-            // stash would leave nothing to try again with.
-            let _ = std::fs::remove_file(&path);
+            match with_retry(wait, || apply_config(&conf, &shown, target, &mut done, &still_ours))? {
+                Flow::Superseded => {
+                    println!("jdrgb: the stash changed while restoring — stopped, and left it in place");
+                    return Ok(());
+                }
+                Flow::Done => {}
+            }
+            // Only once it actually landed — a failed restore that dropped the
+            // stash would leave nothing to try again with — and only if it is
+            // still the stash this restored, not a newer borrow's.
+            let _lock = lock_state();
+            if current_stash_identity().as_deref() == Some(ours.as_str()) {
+                let _ = std::fs::remove_file(&path);
+            }
             Ok(())
         }
         None => match fallback {
@@ -1234,47 +1357,66 @@ fn is_apply(command: &Command) -> bool {
 // Off, and back on
 // ---------------------------------------------------------------------------
 
-/// What `on` would put back, as a recorded state for `state_body` to turn into
-/// a config: each targeted device that is off, holding what it showed before
-/// it went dark — or `fallback` where nothing was kept.
+/// What `on` would put on one device: what it showed before it went dark, or
+/// `fallback` where nothing was kept — or `None` if it isn't off.
 ///
-/// A device that's lit is left out, so `on` never repaints what's already
-/// showing, or spends a flash write on the strip to do nothing. So is one never
-/// recorded: nothing says it's off, and a machine set only by the boot task is
-/// usually lit.
-fn on_state(st: &State, target: Target, fallback: Paint) -> State {
-    let mut out = State::default();
-    for gpu in [false, true] {
-        let wanted = if gpu { target.gpu() } else { target.mb() };
-        if !wanted || st.slot(gpu) != Some(Last::Off) {
-            continue;
-        }
-        match st.lit(gpu) {
-            Some(Lit::Color(rgb)) => out.record(gpu, Last::Color(*rgb)),
-            Some(Lit::Frame(frame)) => out.record_pattern(gpu, frame),
-            None => out.record(gpu, Last::Color(fallback.rgb(gpu))),
-        }
+/// A device that's lit gets `None`, so `on` never repaints what's already
+/// showing, or spends a flash write on the strip to do nothing. So does one
+/// never recorded: nothing says it's off, and a machine set only by the boot
+/// task is usually lit.
+fn on_zone(st: &State, gpu: bool, fallback: Paint) -> Option<Zone> {
+    if st.slot(gpu) != Some(Last::Off) {
+        return None;
     }
-    out
+    Some(match st.lit(gpu) {
+        Some(Lit::Color(rgb)) => Zone::Solid { mode: MODE_STATIC, rgb: *rgb },
+        Some(Lit::Frame(frame)) => Zone::Frame(frame.clone()),
+        None => Zone::Solid { mode: MODE_STATIC, rgb: fallback.rgb(gpu) },
+    })
 }
 
 /// Bring back whatever `off` turned off.
 ///
-/// It goes out through the same config path as `restore`, so a per-LED frame
-/// comes back as a frame and each device gets its own recorded value — the
-/// GPU's calibrated warmwhite, not the strip's. With nothing off it touches no
-/// hardware, which is what makes it safe to bind to a button.
+/// Each device gets its own recorded value — the GPU's calibrated warmwhite, not
+/// the strip's — and a per-LED frame comes back as a frame.
+///
+/// Two looks at the record, on purpose. The first, unlocked, decides whether
+/// there is anything to do at all: with nothing off, `on` opens no device and
+/// puts nothing on any wire, which is what makes it safe to bind to a button.
+/// The second happens inside each device's leg, with the device held, so the
+/// decision can't be overtaken by another process between reading the record
+/// and writing the lights.
 fn turn_on(target: Target, fallback: Option<Paint>, wait: bool) -> Result<(), String> {
     let fallback = fallback.unwrap_or(Paint::Preset(DEFAULT_PRESET));
-    let (body, _) = state_body(&on_state(&load_state_full(), target, fallback), target);
-    if body.is_empty() {
+    let first = load_state_full();
+    let mb = target.mb() && on_zone(&first, false, fallback).is_some();
+    let gpu = target.gpu() && on_zone(&first, true, fallback).is_some();
+    if !mb && !gpu {
         println!("jdrgb: nothing recorded as off, leaving the lights alone");
         return Ok(());
     }
-    let what = "the record of what was lit";
-    let conf = parse_led_config(&body, what)?;
-    let mut done = Landed::default();
-    with_retry(wait, || apply_config(&conf, what, target, &mut done))
+    let decide = |gpu: bool| move || on_zone(&load_state_full(), gpu, fallback).map_or(Decision::Skip, Decision::Apply);
+
+    let mut failures = Vec::new();
+    if mb {
+        match with_retry(wait, || strip_leg(decide(false))) {
+            Ok(Leg::Applied(z)) => report_zone("mb", &z),
+            Ok(_) => {}
+            Err(e) => failures.push(format!("mb: {e}")),
+        }
+    }
+    if gpu {
+        match with_retry(wait, || gpu_leg(decide(true))) {
+            Ok(Leg::Applied(z)) => report_zone("gpu", &z),
+            Ok(_) => {}
+            Err(e) => failures.push(format!("gpu: {e}")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
 /// A `dev:` line, naming the preset in a trailing comment when the value is one.
@@ -2187,11 +2329,12 @@ mod tests {
         assert!(parse(&["restore", "nonsense"]).is_err());
     }
 
-    /// What `on` would apply, read back the way `turn_on` reads it.
+    /// What `on` would apply to each targeted device — the decision `turn_on`
+    /// makes per device, gathered up so a test can look at both at once.
     fn on_config(st: &State, target: Target, fallback: Paint) -> Option<LedConfig> {
-        let (body, omitted) = state_body(&on_state(st, target, fallback), target);
-        assert!(omitted.is_empty(), "dropped a device: {omitted:?}");
-        (!body.is_empty()).then(|| parse_led_config(&body, "on").expect("on wrote a config it cannot read"))
+        let mb = if target.mb() { on_zone(st, false, fallback) } else { None };
+        let gpu = if target.gpu() { on_zone(st, true, fallback) } else { None };
+        (mb.is_some() || gpu.is_some()).then_some(LedConfig { mb, gpu })
     }
 
     /// The regression, end to end: `off` then `on` puts back what was showing,
